@@ -82,11 +82,12 @@ HEADING_RE = re.compile(r"^\s{0,3}(#{1,4})\s+(.+?)\s*#*\s*$")
 
 
 def chunk(text):
-    """Yield (heading, body). Heading is the nearest preceding markdown header."""
+    """Yield (heading, body). Heading is the nearest preceding markdown header, prefixed with the
+    document's top-level (#) title when it is a subsection, e.g. "Recitation 12 › Page 4"."""
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     paras = [p.strip() for p in text.split("\n\n") if p.strip()]
-    heading, buf, size = "", [], 0
+    heading, title, buf, size = "", "", [], 0
     for p in paras:
         m = HEADING_RE.match(p.splitlines()[0]) if p else None
         if m:
@@ -96,7 +97,13 @@ def chunk(text):
                 body = "\n\n".join(buf)
                 if len(body) >= MIN_CHUNK:
                     yield heading, body
-            heading, buf, size = m.group(2)[:200], [], 0
+            text_ = m.group(2).strip()
+            if len(m.group(1)) == 1:
+                title = text_
+                heading = text_[:200]
+            else:
+                heading = (f"{title[:80]} › {text_}" if title else text_)[:200]
+            buf, size = [], 0
         if size + len(p) > CHUNK_CHARS and buf:
             body = "\n\n".join(buf)
             if len(body) >= MIN_CHUNK:

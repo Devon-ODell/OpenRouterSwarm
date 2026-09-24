@@ -42,6 +42,10 @@
   "notify": true,
   "corpus_db": "~/.flint/corpus.db",
   "corpus_k": 4,
+  "mit_experiment": {
+    "enabled": true,
+    "share_on": 0.5
+  },
   "tick": 90,
   "plan_batch": 5,
   "plan_cooldown": 600,

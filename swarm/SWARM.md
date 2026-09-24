@@ -21,8 +21,10 @@ edits the current directory directly. The swarm never edits your checkout.
 2. **Branch** a fresh worktree from `swarm/trunk`, which already holds every
    change the swarm has accepted, so later work builds on earlier work.
 3. **Implement** with a model drawn by Thompson sampling. The prompt carries
-   the goal, the task, earlier failure notes, the playbook of lessons and
-   pitfalls, and study-corpus excerpts; agents can also call the `study` tool.
+   the goal, the task, earlier failure notes and the playbook of lessons and
+   pitfalls. On the corpus side of the MIT experiment (below) it also carries
+   MIT lecture-card excerpts when a lecture card matches the task, and every
+   role in the attempt can call the `study` tool.
 4. **Gate**: the test command must pass and no existing assertion may be removed.
 5. **Adversary**: a different model tries to break the change and must end
    with exactly `APPROVE: …`. A rejection leaves its failing test on the branch.
@@ -82,6 +84,28 @@ The judge only ranks work that external checks already accepted; it cannot
 land anything. Model outages rest the model (30 min, doubling) without
 lowering its score.
 
+## MIT corpus experiment
+
+Does the MIT OpenCourseWare material make these models better? Each attempt is
+randomly assigned, before its implementer runs, to one of two arms
+(`mit_experiment.share_on`, default 0.5). The **with** arm gets excerpts in its
+prompt and the `study` tool for every role. The **without** arm gets neither:
+the tool is hidden from flint. Everything else is shared, so the difference
+between arms estimates the corpus's effect. `swarm report` (and the Cursor
+panel) shows landed rate with 95% Wilson intervals, the difference with its
+interval and a Fisher exact p-value, mean reward, judge scores, study calls per
+attempt, and a per-model table. Below 30 attempts per arm it says the numbers
+are anecdotes. The raw rows are the `attempt` events in `journal.jsonl`;
+`python3 swarm/experiment.py <journal>` prints the table. Set
+`"enabled": false` to give every attempt the corpus.
+
+Retrieval (`swarm/mit_corpus.py`) puts lecture cards first. A card condenses
+one lecture and links the exact source pages. Source pages follow, labelled
+with course, lecture and page. Every hit carries an absolute path, so an agent
+can `read_file` the page a card cites. Raw OCW site pages fill in only when
+nothing better matched. Excerpts are injected into a prompt unasked only when a
+lecture card matches the task. The `study` tool returns whatever matches.
+
 ## Review and merge
 
 ```sh
@@ -94,6 +118,22 @@ New commits on `main` are merged into trunk automatically when they merge
 cleanly and keep the tests green. Rejected attempts stay on `swarm/<task>-<id>`
 branches, committed as "not accepted"; worktrees are removed after each attempt
 (`keep_worktrees: true` keeps them).
+
+## Cursor / VS Code extension
+
+`cursor-extension/install.sh` tests, packages and installs the Flint Swarm
+extension into Cursor. From the editor you can:
+
+- ask several free models about the selection, or the function under the cursor, in parallel, with a merged and checked answer;
+- queue a swarm task for the selection, with file and lines attached;
+- look up MIT lectures;
+- start, stop and read reports on the swarm for the current repository.
+
+It talks to `swarm/bridge.py`, a JSON CLI you can also use directly (see its
+docstring). Asking uses read-only agents in the sandbox. It spends the day's
+free requests but not the swarm's reserve. 👍/👎 on an answer trains a
+separate bandit (`swarm/state/consult/learn.json`) that picks which models
+answer next time.
 
 ## Budget
 
@@ -123,7 +163,7 @@ Mac stays awake unless the lid is closed on battery.
 Per target repository: `swarm/state/<repo>-<hash>/` holds the queue, journal,
 `learn.json` (bandits, playbook, history), `BREAKTHROUGHS.md` and `REPORT.md`;
 `swarm/logs/<repo>-<hash>/` holds per-role logs. The study corpus is
-`~/.flint/corpus.db`; rebuild it with
+`~/.flint/corpus.db` (`FLINT_CORPUS_ROOT` if it was built from another folder); rebuild it with
 `.venv/bin/python swarm/corpus_index.py build --root ~/Documents/flint-training --prune`
 (add `--budget 150` and rerun if it stops early). The MIT OpenCourseWare index lives in
 `~/Documents/flint-training/MIT OCW Courses/agent-skills/`: start at `FLINT-INDEX.md`

@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,15 @@ class Stream:
 
     def close(self):
         self.closed = True
+
+
+def approve(prompt):
+    """A well-formed approving review of the tree named in the reviewer prompt."""
+    tree = re.search(r"GIT TREE TO REVIEW: (\w+)", prompt).group(1)
+    ids = dict.fromkeys(re.findall(r'"id": "(C\d+)"', prompt))
+    return json.dumps({"verdict": "approve", "tree": tree, "summary": "checked",
+                       "checks": [{"criterion": i, "passed": True, "evidence": "gate log"} for i in ids],
+                       "findings": []})
 
 
 def chunk(content="", finish=None, calls=None):
@@ -208,7 +218,7 @@ class SwarmTests(unittest.TestCase):
             if role == "implementer":
                 (cwd / "app.txt").write_text("worker change\n")
                 return "implemented"
-            return "APPROVE: checked"
+            return approve(prompt) if role == "adversary" else "judged"
         with patch.object(swarmd, "flint", side_effect=fake_flint):
             ok, note = worker.do_task({"id": "task", "title": "improve", "detail": "change app"}, "goal")
         self.assertTrue(ok, note)

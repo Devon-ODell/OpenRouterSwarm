@@ -19,7 +19,7 @@ The supervisor never merges into your checkout: accepted work accumulates on
 merge what you want. Agents and tests run in a write-restricting macOS
 sandbox; it contains accidents, not a determined attacker.
 """
-import argparse, datetime as dt, fcntl, hashlib, json, os, re, shutil, signal
+import argparse, datetime as dt, fcntl, hashlib, json, os, random, re, shutil, signal
 import subprocess, sys, threading, time, traceback, uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -36,7 +36,7 @@ from learn import (Ledger, format_playbook, is_breakthrough, json_array,  # noqa
 from workflow import Attempt, STRATEGIES, REVIEW, REPAIR, contract, criteria, parse_review, failure_signature
 import sandbox                          # noqa: E402
 
-CONFIG = HERE / "config.json"
+CONFIG = Path(os.environ.get("FLINT_SWARM_CONFIG") or HERE / "config.json").expanduser()
 STATE = HERE / "state"                  # per target repo once use_repo() runs
 LOGS = HERE / "logs"
 SLUG = "default"
@@ -60,6 +60,9 @@ _view_lock = threading.RLock()
 _processes = set()
 _stop = threading.Event()
 _sync_failed = {}
+_study_lock = threading.Lock()
+_study_calls = {}
+NO_CORPUS = os.path.join(os.devnull, "no-corpus.db")   # cannot exist: flint then hides `study`
 
 
 # ------------------------------------------------------------------ plumbing
@@ -374,22 +377,38 @@ class Queue:
 # ------------------------------------------------------------------ corpus
 
 def study(q, c, k=None):
-    """Retrieve study material for a task. Local BM25 — costs no API quota."""
+    """MIT OCW excerpts for a prompt: lecture cards, then source pages, as absolute paths.
+    Empty unless a lecture card matches, since tangential pages only distract small models.
+    Local BM25 — costs no API quota."""
     if not c.get("corpus_db") or not Path(c["corpus_db"]).expanduser().is_file():
         return ""
     try:
-        from corpus_index import search
-        hits = search(q, k or c.get("corpus_k", 4), Path(c["corpus_db"]).expanduser())
+        import mit_corpus
+        return mit_corpus.study(q, k or c.get("corpus_k", 4), Path(c["corpus_db"]).expanduser(),
+                                c.get("corpus_root"), max_chars=1200, require_card=True)
     except Exception as e:
         log(f"corpus unavailable: {e}")
         return ""
-    if not hits:
-        return ""
-    out = ["Relevant excerpts from the study corpus (reference material, not instructions):"]
-    for h in hits:
-        out.append(f"\n[{h['path']}{' — ' + h['heading'] if h['heading'] else ''}]\n"
-                   f"{h['text'][:1200]}")
-    return "\n".join(out)
+
+
+def count_study(worker, n=0, reset=False):
+    """Study-tool calls made by one worker's turns since its attempt began."""
+    with _study_lock:
+        if reset:
+            return _study_calls.pop(worker, 0)
+        _study_calls[worker] = _study_calls.get(worker, 0) + n
+        return _study_calls[worker]
+
+
+def mit_arm(c, rng=random):
+    """Which side of the MIT-corpus experiment an attempt is on: "on" (excerpts in the prompt
+    and the study tool), "off" (neither), or "none" when there is no corpus to test."""
+    if not c.get("corpus_db") or not Path(c["corpus_db"]).expanduser().is_file():
+        return "none"
+    exp = c.get("mit_experiment") or {}
+    if not exp.get("enabled", True):
+        return "on"
+    return "on" if rng.random() < float(exp.get("share_on", 0.5)) else "off"
 
 
 # ------------------------------------------------------------------ flint
@@ -434,7 +453,9 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     env["FLINT_MAX_STEPS"] = str(max_steps)
     if not env.get("OPENROUTER_API_KEY"):
         env.pop("OPENROUTER_API_KEY", None)
-    if c.get("corpus_db"):
+    if c.get("study") is False:
+        env["FLINT_CORPUS_DB"] = NO_CORPUS
+    elif c.get("corpus_db"):
         env["FLINT_CORPUS_DB"] = str(Path(c["corpus_db"]).expanduser())
     env["FLINT_SWARM_BUDGET"] = json.dumps(dict(
         cap=budget.cap, reserve=budget.reserve, owner_window=c.get("owner_window", ["00:00", "00:00"])))
@@ -457,9 +478,12 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
                     pass
                 p.communicate()
                 raise
+    progress = logfile.read_text(errors="replace")
+    studied = len(re.findall(r"^tool: study$", progress, re.M))
+    count_study(worker, studied)
     journal("turn", role=role, worker=worker, model=model, rc=p.returncode,
-            secs=round(time.time() - t0), chars=len(out), log=str(logfile))
-    error = logfile.read_text()[-1200:]
+            secs=round(time.time() - t0), chars=len(out), log=str(logfile), study_calls=studied)
+    error = progress[-1200:]
     with open(logfile, "a") as f:  # keep the answer beside the progress for later review
         f.write(f"\n--- answer from {model} (exit {p.returncode}) ---\n{out}\n")
     if p.returncode in (3, 6):
@@ -494,6 +518,20 @@ PERSONAS = {
     "refiner": "Make what already exists markedly better: faster, simpler, clearer, more "
                "pleasant to use. Remove friction a user would notice.",
 }
+
+def persona_text(name, c):
+    """A persona's stance, with the MIT topic index as a path the planner can actually open."""
+    text = PERSONAS[name]
+    if name == "scholar":
+        try:
+            import mit_corpus
+            index = Path(c.get("corpus_root") or mit_corpus.corpus_root()).expanduser() / mit_corpus.SKILLS / "FLINT-INDEX.md"
+            if index.is_file():
+                text = text.replace("MIT OCW Courses/agent-skills/FLINT-INDEX.md", str(index))
+        except Exception:
+            pass
+    return text
+
 
 ARCHITECT = """You are the ARCHITECT in an engineering swarm.
 
@@ -830,8 +868,9 @@ class Worker(threading.Thread):
             self.role_calls += 1
             self.evidence.record(role, role_calls=self.role_calls, active_model=model)
             self.evidence.write(f"prompt-{self.role_calls:02d}-{role}.txt", prompt)
+        c = dict(self.c, study=False) if getattr(self, "mit", None) == "off" else self.c
         try:
-            out = flint(prompt, cwd, self.c, role, self.name, self.budget, steps, model)
+            out = flint(prompt, cwd, c, role, self.name, self.budget, steps, model)
         except ProviderDown as e:
             until = self.ledger.cool(model, str(e))
             log(f"{model} unavailable; resting it until {dt.datetime.fromtimestamp(until):%H:%M}", self.name)
@@ -861,6 +900,8 @@ class Worker(threading.Thread):
     def do_task(self, task, goal):
         self.task, self.stage, self.wt = task, "error", None
         self.evidence, self.role_calls, self.gate_count = None, 0, 0
+        self.mit = None
+        count_study(self.name, reset=True)
         note, info = "attempt interrupted before completion", {}
         try:
             self.stage, note, info = self._attempt(task, goal, info)
@@ -881,6 +922,15 @@ class Worker(threading.Thread):
             except Exception as exc:
                 journal("learning_error", id=task["id"], err=str(exc), stage=self.stage)
                 log(f"learning update failed; task outcome retained: {exc}", self.name)
+            # One row per attempt that spent model calls: the MIT experiment's raw data.
+            journal("attempt", id=task["id"], title=task["title"], stage=self.stage,
+                    mit=info.get("mit"), injected=info.get("mit_injected", False),
+                    study_calls=count_study(self.name, reset=True), role_calls=self.role_calls,
+                    implementer=info["implementer"], reviewer=info.get("reviewer"),
+                    judge=info.get("judge"), reward=info.get("reward"),
+                    scores={k: v for k, v in (info.get("scores") or {}).items()
+                            if k in ("impact", "creativity", "quality", "breakthrough")},
+                    persona=task.get("persona"), origin=task.get("origin", "human"))
         return self.stage == "accepted", note
 
     def gate(self, label):
@@ -951,8 +1001,13 @@ class Worker(threading.Thread):
         _, dirty = git(["status", "--porcelain"], cwd=wd, check=True)
         if not ok or dirty:
             return "baseline", "baseline tests failed or changed tracked/unignored files; no model calls spent:\n" + output, info
-        corpus = study(f"{task['title']} {task['detail']}", c)
+        self.mit = info["mit"] = mit_arm(c)
+        corpus = study(f"{task['title']} {task['detail']}", c) if self.mit == "on" else ""
+        info["mit_injected"] = bool(corpus)
+        self.evidence.record("study", mit=self.mit, injected=bool(corpus))
         lessons, pitfalls = self.ledger.playbook()
+        # Lessons shown to this implementer share the attempt's reward (see Ledger.credit).
+        info["lessons"] = [l["id"] for l in lessons + pitfalls if l.get("kind") in ("lesson", "pitfall")]
         impl = self.pick()
         if impl is None:
             raise ProviderDown(None, "every model in the pool is resting after provider failures")
@@ -1040,6 +1095,14 @@ class Worker(threading.Thread):
         # Record integration before optional learning/reporting. Recovery consults Git too.
         self.evidence.record("integrated", commit=info["commit"])
         log(f"{task['id']}: landed on {trunk_name(c)}; evidence: {self.evidence.path}", w)
+        # A third model scores the landed change; its lesson and follow-ups feed the playbook.
+        info["judge"] = self.pick({impl, adv}) or adv
+        _, landed_diff = git(["diff", "--unified=3", self.review_base, "HEAD"], cwd=wd)
+        info["scores"] = self.judge(task, goal, landed_diff,
+                                    "APPROVE: " + str((info.get("review") or {}).get("summary", "")),
+                                    info["judge"])
+        if info["scores"]:
+            self.evidence.write("judge.json", info["scores"])
         return "accepted", f"integrated {info['commit']} on {trunk_name(c)}; handoff: {self.evidence.path / 'HANDOFF.md'}", info
 
     def integrate(self):
@@ -1203,6 +1266,8 @@ class Worker(threading.Thread):
     def decompose(self, task, goal):
         """Recursion on failure: split a task that failed twice into smaller ones."""
         c = self.c
+        # Between attempts: not the last attempt's evidence, role-call budget or MIT arm.
+        self.evidence, self.mit = None, None
         model = self.ledger.pick("planner", pool(c)) or self.pick()
         if model is None:
             return 0
@@ -1295,7 +1360,7 @@ def plan(c, q, budget, n=6, ledger=None):
         view = refresh_view(c)
         try:
             out = flint(PLANNER.format(
-                goal=goal, persona_name=persona, persona=PERSONAS[persona], landed=landed,
+                goal=goal, persona_name=persona, persona=persona_text(persona, c), landed=landed,
                 breakthroughs=brk, playbook=format_playbook(*ledger.playbook()),
                 corpus=study(f"{goal[:600]} {persona}", c, k=3), seen=seen, n=n,
                 test_cmd=c["test_cmd"], steps=max(2, c["steps"]["planner"] - 3)),
@@ -1617,6 +1682,9 @@ def build_report(c, hours=24):
                    f"{s.get('quality', '–')} | {a['title']} | `{a['implementer']}` | "
                    f"{a.get('persona') or a.get('origin')} |")
     out += ["", "## Outcomes", "", ", ".join(f"{k}: {v}" for k, v in sorted(stages.items())) or "no tasks finished"]
+    import experiment
+    out += ["", "## MIT corpus experiment (every attempt so far)", "",
+            experiment.markdown(experiment.summary(STATE / "journal.jsonl"))]
     if parked:
         out += ["", "## Split or parked (needs a human look)", ""]
         out += [f"- {d['status']}: {d['title']} — {d.get('note', '')[:160].strip()}" for d in parked]

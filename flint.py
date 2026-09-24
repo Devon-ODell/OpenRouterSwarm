@@ -199,16 +199,14 @@ def bash(command, timeout=120):
 
 
 def study(query, k=5):
-    """Search the local study corpus. Local BM25 lookup; costs no API quota."""
+    """Search the local study corpus: MIT OCW lecture cards first, then source pages, with
+    absolute paths a read_file call can open. Local BM25 lookup; costs no API quota."""
     try:
-        from swarm.corpus_index import search as corpus_search
-        hits = corpus_search(query, max(1, min(int(k), 10)), CORPUS_DB)
+        from swarm import mit_corpus
+        text = mit_corpus.study(query, max(1, min(int(k), 10)), db=CORPUS_DB)
     except Exception as e:
         return f"Error: study corpus unavailable ({type(e).__name__}: {e})"
-    if not hits:
-        return "No matches in the study corpus. Try different or more specific terms."
-    return "\n\n".join(f"[{h['path']}{' — ' + h['heading'] if h['heading'] else ''}]\n{h['text'][:1400]}"
-                       for h in hits)
+    return text or "No matches in the study corpus. Try different or more specific terms."
 
 
 TOOLS = {"read_file": read_file, "write_file": write_file, "edit_file": edit_file,
@@ -319,7 +317,9 @@ class StepLimitReached(Exception):
 
 
 class IncompleteResponse(Exception):
-    pass
+    def __init__(self, msg, finish_reason=None):
+        super().__init__(msg)
+        self.finish_reason = finish_reason
 
 
 class BudgetPaused(Exception):
@@ -505,6 +505,8 @@ class Agent:
                    and (t["function"]["name"] != "study" or getattr(self, "corpus", False))]
         kw = dict(model=self.model, messages=self.messages, tools=schemas,
                   stream=True, stream_options={"include_usage": True})
+        if getattr(self, "final_answer", False):
+            kw["tool_choice"] = "none"
         if FALLBACKS:
             kw["extra_body"] = {"models": [self.model] + [m for m in FALLBACKS if m != self.model]}
         return kw
@@ -521,6 +523,19 @@ class Agent:
                 f"[dim]pacing: {RPM_LIMIT}/min budget used, waiting {s:.0f}s[/]"))
             try:
                 return self._stream_once()
+            except IncompleteResponse as e:
+                # finish_reason "error" means the upstream provider failed mid-reply; the model
+                # did not answer badly. Retry briefly, then report the provider as unavailable
+                # (exit 7), which rests the model instead of scoring it.
+                if e.finish_reason != "error":
+                    raise
+                provider_retries += 1
+                if provider_retries > 2:
+                    raise ProviderUnavailable(f"{self.model}: provider kept failing mid-reply: {e}") from e
+                wait = 5 * 2 ** (provider_retries - 1)
+                self._note(f"[yellow]provider failed mid-reply — retry {provider_retries}/2 in {wait}s[/]")
+                time.sleep(wait)
+                continue
             except APIError as e:
                 body = e.body if isinstance(e.body, dict) else {}
                 body = body.get("error", body)
@@ -609,7 +624,8 @@ class Agent:
                 live.stop()
         self.last_reasoning = reasoning
         if finish_reason not in ("stop", "tool_calls"):
-            raise IncompleteResponse(f"Model response incomplete (finish_reason={finish_reason!r}); no tools executed.")
+            raise IncompleteResponse(f"Model response incomplete (finish_reason={finish_reason!r}); no tools executed.",
+                                     finish_reason)
         if not content.strip() and not calls:
             raise IncompleteResponse("Model returned an empty response.")
         return content, [calls[k] for k in sorted(calls)]
@@ -728,9 +744,36 @@ class Agent:
                 self.messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
                 self.save_checkpoint()
         else:
-            raise StepLimitReached(f"Stopped after {MAX_STEPS} rounds; task is incomplete. Changes may already exist.")
+            content = self._final_answer()
         if self.last_prompt_tokens > CONTEXT_WARN_TOKENS:
             self._note("[yellow]context is getting large — consider /clear[/]")
+        return content
+
+    FINAL_NUDGE = ("You have used every tool round this turn allows. Do not call any tools. "
+                   "Give your final answer now, in exactly the format the task asked for.")
+
+    def _final_answer(self):
+        """After the step limit, a headless turn gets one tool-free round to answer, so the
+        rounds already spent are not wasted (a reviewer that read everything but never wrote
+        its verdict). Interactive turns stop as before."""
+        limit = StepLimitReached(f"Stopped after {MAX_STEPS} rounds; task is incomplete. Changes may already exist.")
+        if not self.headless:
+            raise limit
+        print(f"step limit: asking {self.model} for a final answer without tools", file=sys.stderr, flush=True)
+        self.messages.append({"role": "user", "content": self.FINAL_NUDGE})
+        self.final_answer = True
+        try:
+            content, calls = self.complete()
+        except (DailyCapReached, OutOfCredits, BudgetPaused, ProviderUnavailable, KeyboardInterrupt):
+            raise
+        except Exception as e:
+            raise limit from e
+        finally:
+            self.final_answer = False
+        if calls or not content.strip():   # still reaching for tools: no answer, and none run
+            raise limit
+        self.messages.append({"role": "assistant", "content": content})
+        self.save_checkpoint()
         return content
 
     def repair_after_interrupt(self):

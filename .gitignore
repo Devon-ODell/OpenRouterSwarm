@@ -8,3 +8,5 @@ swarm/state/
 .env
 .env.*
 !.env.example
+cursor-extension/flint-root.txt
+cursor-extension/*.vsix

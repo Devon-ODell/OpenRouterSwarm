@@ -216,15 +216,29 @@ def parse_scores(text):
 
 
 def json_array(text):
-    """First-to-last bracket JSON array in a model reply, or None if there is none."""
+    """The JSON array in a model reply, or None if there is none. Tries the first-to-last
+    bracket span, then every '[' in turn, so prose with brackets or markdown links before the
+    array does not hide it. Prefers a non-empty array of objects; an empty one means "nothing"."""
     s, e = text.find("["), text.rfind("]")
     if s < 0 or e <= s:
         return None
     try:
         v = json.loads(text[s:e + 1])
+        if isinstance(v, list):
+            return v
     except json.JSONDecodeError:
-        return None
-    return v if isinstance(v, list) else None
+        pass
+    decoder, empty = json.JSONDecoder(), None
+    for m in re.finditer(r"\[", text):
+        try:
+            v, _ = decoder.raw_decode(text, m.start())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+            return v
+        if v == [] and empty is None:
+            empty = v
+    return empty
 
 
 class Ledger:

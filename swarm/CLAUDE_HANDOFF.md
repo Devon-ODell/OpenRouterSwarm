@@ -83,3 +83,39 @@ leave those and flint's CLI/interactive command handling to them.
   (swarm rests the model, no penalty), headless bash strips secret env vars.
 - Corpus built: 2760 files / 37160 chunks, skipping OCW static_shared JS.
 - Tests: tests/test_swarm_learning.py (24) plus existing suites.
+
+# Update 2026-09-24 (afternoon): MIT corpus, experiment, judge, Cursor extension
+
+- Corpus: `~/.flint/corpus.db` was half built (FLINT-INDEX.md and all 20
+  `flint/cards/*.md` missing). Rebuilt incrementally: 5,064 files, 129,739
+  chunks, nothing unindexed. `pdftotext` is not installed, so raw PDFs index
+  empty; the agent-skills `references/documents/*.md` extractions cover them.
+- `swarm/mit_corpus.py` (new): lecture cards first (a card must score at
+  least 45% of the best hit's BM25), then source pages. Hits are labelled with
+  course, lecture and page and carry absolute paths, and card links are
+  rewritten to absolute paths. flint's `study` tool and the swarm's prompt
+  excerpts both use it. Prompt excerpts appear only when a lecture card matches.
+- Judge was never called after the workflow.py restructure: landed work got a
+  flat 0.6 reward, no lessons, no follow-ups, no judged breakthroughs. It is
+  now called after landing with a model other than the implementer and the reviewer.
+  Lessons shown to an implementer now receive credit.
+- MIT experiment: `mit_arm()` randomizes each attempt on/off
+  (`mit_experiment` in config); off hides `study` via `FLINT_CORPUS_DB`
+  pointing at an impossible path. `attempt` journal rows plus
+  `swarm/experiment.py` (Wilson CIs, Fisher exact) feed a report section.
+- flint: a provider failing mid-reply (`finish_reason: error`) is retried
+  twice, then exits 7 (model rested, not scored). Headless turns that hit the
+  step limit get one tool-free round (`tool_choice: none`) to answer; a
+  reply that still calls tools stays a step-limit failure (exit 5).
+- workflow.parse_review accepts fenced/prose-wrapped JSON, verdict casing,
+  an abbreviated or missing tree echo, and digit-string lines; a different
+  tree or a contradictory approval is still refused. learn.json_array scans
+  past bracketed prose.
+- `swarm/bridge.py` + `cursor-extension/` (installed in Cursor as
+  devon-odell.flint-swarm 0.1.0). `FLINT_SWARM_CONFIG` selects another
+  config file (used for the scratch end-to-end run).
+- Test pitfall: bridge.py imports `swarmd` as a top-level module, a different
+  object from `swarm.swarmd`. Patch `bridge.swarmd` in tests, or state leaks
+  into the real `swarm/state/`.
+- Tests: 89 Python (`python -m unittest discover -s tests`) and 8 extension
+  (`node cursor-extension/test/extension.test.js`).

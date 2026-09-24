@@ -34,16 +34,51 @@ def contract(task, goal, base, strategy):
             "depth": task.get("depth", 0), "depends_on": task.get("depends_on", [])}
 
 
-def parse_review(text, tree, acceptance):
-    """A malformed, stale or unsupported approval is never usable."""
+def review_object(text):
+    """The review in a reply: bare JSON, a ```json fence, or the object amid prose."""
+    text = (text or "").strip()
     try:
-        review = json.loads(text.strip())
+        return json.loads(text)
+    except ValueError:
+        pass
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            value, _ = decoder.raw_decode(text, match.start())
+        except ValueError:
+            continue
+        if isinstance(value, dict) and "verdict" in value:
+            return value
+    raise ValueError("no JSON object with a verdict")
+
+
+def parse_review(text, tree, acceptance):
+    """A malformed, stale or unsupported approval is never usable.
+
+    Formatting slips are forgiven (fences, prose around the object, "APPROVE" casing, a line
+    number as a string, an abbreviated or omitted tree): the supervisor names the tree it asked
+    about and verifies afterwards that the reviewer did not change it. A different tree is not."""
+    try:
+        review = review_object(text)
     except (ValueError, TypeError) as exc:
-        raise ValueError("review must be a JSON object without prose/fences") from exc
+        raise ValueError("review must be a JSON object with a verdict") from exc
+    if isinstance(review, dict) and isinstance(review.get("verdict"), str):
+        review["verdict"] = review["verdict"].strip().lower()
     if not isinstance(review, dict) or review.get("verdict") not in ("approve", "request_changes"):
         raise ValueError("review verdict must be approve or request_changes")
-    if review.get("tree") != tree:
+    echoed = review.get("tree")
+    if echoed in (None, ""):
+        review["tree"] = tree
+    elif isinstance(echoed, str) and len(echoed.strip()) >= 7 and tree.startswith(echoed.strip()):
+        review["tree"] = tree
+    else:
         raise ValueError("review refers to a different Git tree")
+    for row in review.get("checks") or []:
+        if isinstance(row, dict) and isinstance(row.get("passed"), str) and row["passed"].lower() in ("true", "false"):
+            row["passed"] = row["passed"].lower() == "true"
+    for finding in review.get("findings") or []:
+        if isinstance(finding, dict) and isinstance(finding.get("line"), str) and finding["line"].strip().isdigit():
+            finding["line"] = int(finding["line"])
     if not isinstance(review.get("summary"), str) or not review["summary"].strip():
         raise ValueError("review needs a summary")
     checks, findings = review.get("checks"), review.get("findings")

@@ -1,0 +1,152 @@
+{
+  "name": "flint-swarm",
+  "displayName": "Flint Swarm",
+  "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers with a merged verdict, swarm tasks for the selection, and MIT OpenCourseWare lookups.",
+  "version": "0.1.0",
+  "publisher": "devon-odell",
+  "license": "UNLICENSED",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Devon-ODell/OpenRouterSwarm"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "flintSwarm",
+          "title": "Flint Swarm",
+          "icon": "media/swarm.svg"
+        }
+      ]
+    },
+    "views": {
+      "flintSwarm": [
+        {
+          "type": "webview",
+          "id": "flintSwarm.panel",
+          "name": "Swarm"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "flintSwarm.askSelection",
+        "title": "Ask the Swarm About This Code",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.queueTask",
+        "title": "Queue a Swarm Task for This Code",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.studySelection",
+        "title": "Find MIT Lectures for This Code",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.startGrind",
+        "title": "Start the Swarm on This Repository",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.stopGrind",
+        "title": "Stop the Swarm",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showReport",
+        "title": "Show Swarm Report",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.refresh",
+        "title": "Refresh Swarm Status",
+        "category": "Flint Swarm",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "flintSwarm.askSelection",
+          "group": "flintSwarm@1"
+        },
+        {
+          "command": "flintSwarm.queueTask",
+          "group": "flintSwarm@2"
+        },
+        {
+          "command": "flintSwarm.studySelection",
+          "group": "flintSwarm@3"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "flintSwarm.refresh",
+          "when": "view == flintSwarm.panel",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "flintSwarm.askSelection",
+        "key": "ctrl+alt+a",
+        "mac": "ctrl+alt+a",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "Flint Swarm",
+      "properties": {
+        "flintSwarm.flintPath": {
+          "type": "string",
+          "default": "",
+          "description": "Folder that contains flint.py and swarm/ (your LingAI-Trader checkout). Leave empty to use the folder recorded at install time."
+        },
+        "flintSwarm.python": {
+          "type": "string",
+          "default": "",
+          "description": "Python interpreter for the swarm. Leave empty to use <flintPath>/.venv/bin/python."
+        },
+        "flintSwarm.models": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 6,
+          "description": "How many free models answer each question in parallel. Each model spends up to 'stepsPerModel' free requests."
+        },
+        "flintSwarm.stepsPerModel": {
+          "type": "number",
+          "default": 8,
+          "minimum": 2,
+          "maximum": 20,
+          "description": "Tool rounds (requests) each answering model may use to read your code and the MIT corpus."
+        },
+        "flintSwarm.synthesize": {
+          "type": "boolean",
+          "default": true,
+          "description": "Have one more model check the answers against the code and merge them."
+        },
+        "flintSwarm.useStudy": {
+          "type": "boolean",
+          "default": true,
+          "description": "Let answering models search the MIT OpenCourseWare corpus with the study tool."
+        }
+      }
+    }
+  }
+}
