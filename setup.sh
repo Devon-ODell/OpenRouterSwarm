@@ -46,7 +46,15 @@ else
   echo "==> .env has OPENROUTER_API_KEY"
 fi
 
-# ---------------------------------------------------------------- 3. commands
+# ---------------------------------------------------------------- 3. config
+if [ ! -f "$ROOT/swarm/config.json" ]; then
+  cp "$ROOT/swarm/config.example.json" "$ROOT/swarm/config.json"
+  echo "==> created swarm/config.json from the template (it is not tracked by git)"
+else
+  echo "==> keeping your swarm/config.json"
+fi
+
+# ---------------------------------------------------------------- 3b. commands
 mkdir -p "$HOME/.local/bin"
 printf '#!/bin/sh\nexec "%s" "%s/flint.py" "$@"\n' "$PY" "$ROOT" > "$HOME/.local/bin/flint"
 printf '#!/bin/sh\nexec "%s" "%s/swarm/swarmd.py" "$@"\n' "$PY" "$ROOT" > "$HOME/.local/bin/swarm"

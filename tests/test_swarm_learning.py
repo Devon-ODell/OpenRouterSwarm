@@ -632,6 +632,36 @@ class GuardTests(SwarmBase):
                 patch.object(swarmd, "free_tool_models", return_value={"a:free": {}}):
             swarmd.preflight(self.cfg(repo, models=["a:free"], test_cmd="true"))
 
+    def test_the_runner_up_test_command_is_offered_when_the_first_fails(self):
+        """A Go service with Python beside it: the wrong guess must name the right one."""
+        repo, _ = self.repo()
+        (repo / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+        (repo / "engine").mkdir()
+        (repo / "engine" / "go.mod").write_text("module x\n")
+        chosen = swarmd.detect_test_cmd(repo)
+        self.assertIn("python3 -m", chosen)                       # what it picked at the top
+        other = swarmd.other_test_cmds(repo, chosen)
+        self.assertIn("--test-cmd 'cd engine && go test ./...'", other)
+        self.assertIn("(found engine/)", other)
+        (repo / "go.mod").write_text("module x\n")                # now Go at the top level too
+        self.assertIn("--test-cmd 'go test ./...'", swarmd.other_test_cmds(repo, chosen))
+        self.assertEqual(swarmd.other_test_cmds(self.root / "empty", "true"), "")
+
+    def test_config_is_seeded_from_the_template_and_not_tracked(self):
+        """The swarm rewrites config.json every run, so git must not own it."""
+        root = self.root / "checkout" / "swarm"
+        root.mkdir(parents=True)
+        (root / "config.example.json").write_text(json.dumps({"models": ["a:free"], "workers": 1}))
+        with patch.object(swarmd, "CONFIG", root / "config.json"), \
+                patch.object(swarmd, "EXAMPLE", root / "config.example.json"):
+            self.assertEqual(swarmd.load_cfg()["models"], ["a:free"])
+            self.assertTrue((root / "config.json").exists())
+            (root / "config.json").write_text(json.dumps({"models": ["b:free"]}))
+            self.assertEqual(swarmd.load_cfg()["models"], ["b:free"])   # never re-seeded over
+        tracked = subprocess.run(["git", "ls-files", "--error-unmatch", "swarm/config.json"],
+                                 cwd=Path(__file__).resolve().parent.parent, capture_output=True)
+        self.assertNotEqual(tracked.returncode, 0, "swarm/config.json must not be tracked")
+
     def test_an_unrunnable_test_command_is_diagnosed_from_the_command(self):
         """Output only ever says "not found": the command itself says which problem it is."""
         installed = {"python3", "go", "true", "echo"}          # a Mac: python3, no python

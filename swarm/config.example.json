@@ -1,5 +1,5 @@
 {
-  "_comment": "`swarm grind /path/to/repo` fills repo/test_cmd/python/base_branch. Edit freely; swarmd reads it on every command.",
+  "_comment": "Template. `swarm grind /path/to/repo` copies this to config.json and fills in repo/test_cmd/python/base_branch. Edit config.json, not this file.",
   "repo": "__REPO__",
   "base_branch": "main",
   "trunk": "swarm/trunk",
@@ -14,9 +14,7 @@
     "nvidia/nemotron-3-super-120b-a12b:free",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "poolside/laguna-s-2.1:free",
-    "cohere/north-mini-code:free",
-    "thinkingmachines/inkling:free",
-    "google/gemma-4-31b-it:free"
+    "cohere/north-mini-code:free"
   ],
   "allow_paid": false,
   "workers": 1,

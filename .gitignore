@@ -10,3 +10,4 @@ swarm/state/
 !.env.example
 cursor-extension/flint-root.txt
 cursor-extension/*.vsix
+swarm/config.json

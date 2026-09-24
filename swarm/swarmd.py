@@ -83,7 +83,16 @@ def journal(event, **kw):
             f.write(json.dumps(rec) + "\n")
 
 
+EXAMPLE = HERE / "config.example.json"
+
+
 def load_cfg():
+    """The live config, seeded from the committed template the first time. config.json is not
+    tracked: the swarm rewrites it on every run, and a tracked file it rewrites cannot be
+    updated with `git pull`."""
+    if not CONFIG.exists() and EXAMPLE.is_file() and CONFIG.parent == EXAMPLE.parent:
+        CONFIG.write_text(EXAMPLE.read_text())
+        log(f"created {CONFIG} from {EXAMPLE.name}")
     return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
 
 
@@ -94,9 +103,9 @@ def save_cfg(c):
 
 
 def cfg():
-    if not CONFIG.exists():
+    c = load_cfg()
+    if not c:
         sys.exit(f"missing {CONFIG} — run `swarm grind /path/to/repo` first")
-    c = json.loads(CONFIG.read_text())
     if any(str(c.get(k, "")).startswith("__") or not c.get(k) for k in ("repo", "test_cmd")):
         sys.exit("swarm is not configured — run `swarm grind /path/to/repo` first")
     c["repo"] = str(Path(c["repo"]).expanduser())
@@ -1566,12 +1575,17 @@ def test_cmd_hint(repo):
     return "\n".join(lines)
 
 
-def project_test_cmd(repo):
-    repo = Path(repo)
+def test_cmds(repo):
+    """Every way this directory could be tested, best guess first: [(what found it, command)].
+
+    A repository with code in two languages matches more than once — a Go service with a
+    Python notebook beside it — so the runner-up is worth showing when the first choice
+    turns out to be the wrong one."""
+    repo, out = Path(repo), []
     if (repo / "go.mod").exists():
-        return "go test ./..."
+        out.append(("go.mod", "go test ./..."))
     if (repo / "Cargo.toml").exists():
-        return "cargo test -q"
+        out.append(("Cargo.toml", "cargo test -q"))
     pkg = repo / "package.json"
     if pkg.exists():
         try:
@@ -1580,18 +1594,41 @@ def project_test_cmd(repo):
             test = ""
         if test and "no test specified" not in test:
             if (repo / "pnpm-lock.yaml").exists():
-                return "pnpm install --frozen-lockfile --silent && pnpm test"
-            if (repo / "yarn.lock").exists():
-                return "yarn install --frozen-lockfile --silent && yarn test"
-            if (repo / "package-lock.json").exists():
-                return "npm ci --silent --no-audit --no-fund && npm test --silent"
-            return "npm install --silent --no-audit --no-fund && npm test --silent"
-    if any((repo / f).exists() for f in ("pyproject.toml", "pytest.ini", "setup.cfg", "tests")):
+                out.append(("package.json", "pnpm install --frozen-lockfile --silent && pnpm test"))
+            elif (repo / "yarn.lock").exists():
+                out.append(("package.json", "yarn install --frozen-lockfile --silent && yarn test"))
+            elif (repo / "package-lock.json").exists():
+                out.append(("package.json", "npm ci --silent --no-audit --no-fund && npm test --silent"))
+            else:
+                out.append(("package.json", "npm install --silent --no-audit --no-fund && npm test --silent"))
+    found = next((f for f in ("pyproject.toml", "pytest.ini", "setup.cfg", "tests")
+                  if (repo / f).exists()), None)
+    if found:
         r = subprocess.run(["python3", "-c", "import pytest"], capture_output=True)
-        return "python3 -m pytest -q" if r.returncode == 0 else "python3 -m unittest discover -q"
-    if (repo / "Makefile").exists() and re.search(r"^test:", (repo / "Makefile").read_text(), re.M):
-        return "make test"
-    return None
+        out.append((found, "python3 -m pytest -q" if r.returncode == 0
+                    else "python3 -m unittest discover -q"))
+    mk = repo / "Makefile"
+    if mk.exists() and re.search(r"^test:", mk.read_text(errors="replace"), re.M):
+        out.append(("Makefile", "make test"))
+    return out
+
+
+def project_test_cmd(repo):
+    cmds = test_cmds(repo)
+    return cmds[0][1] if cmds else None
+
+
+def other_test_cmds(repo, current):
+    """Ways to test this repository other than the one that just failed, as printable lines."""
+    repo = Path(repo)
+    rows = [(what, cmd) for what, cmd in test_cmds(repo) if cmd != current]
+    rows += [(f"{name}/", f"cd {shlex.quote(name)} && {cmd}") for name, cmd in sub_projects(repo)
+             if f"cd {shlex.quote(name)} && {cmd}" != current]
+    if not rows:
+        return ""
+    lines = ["\n  Other ways this repository could be tested:"]
+    lines += [f"    --test-cmd {shlex.quote(cmd)}   (found {what})" for what, cmd in rows]
+    return "\n".join(lines)
 
 
 def scaffold(path, goal):
@@ -1713,7 +1750,8 @@ def preflight(c):
         ok, output = run_gate(view, c)
     if not ok:
         sys.exit(f"`{c['test_cmd']}` fails on {trunk_name(c)} before any work, so every task "
-                 f"would be rejected. Fix the tests or pass --test-cmd.{why_unrunnable(c['test_cmd'])}"
+                 f"would be rejected. Fix the tests or pass --test-cmd."
+                 f"{why_unrunnable(c['test_cmd'])}{other_test_cmds(c['repo'], c['test_cmd'])}"
                  f"\n{output[-1500:]}")
     log(f"baseline green on {trunk_name(c)}")
 
