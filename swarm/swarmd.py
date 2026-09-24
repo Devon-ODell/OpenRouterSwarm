@@ -45,7 +45,7 @@ LOGS.mkdir(exist_ok=True)
 
 DEFAULT_MODEL = "inclusionai/ling-3.0-flash-fin:free"
 KINDS = ("feature", "bugfix", "test", "refactor")
-META = ("persona", "planner_model", "priority", "depth", "parent", "origin", "acceptance", "depends_on", "root", "strategy")
+META = ("persona", "planner_model", "priority", "depth", "parent", "origin", "acceptance", "depends_on", "root", "strategy", "domain")
 READ_ONLY_ROLES = {"planner", "architect", "judge", "decomposer", "adversary"}
 MAX_ATTEMPTS = 2
 SECRET_ENV = re.compile(r"API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL", re.I)
@@ -373,13 +373,21 @@ class Queue:
 
 # ------------------------------------------------------------------ corpus
 
-def study(q, c, k=None):
-    """Retrieve study material for a task. Local BM25 — costs no API quota."""
+def study(q, c, k=None, domain=None):
+    """Retrieve study material for a task. Local BM25 — costs no API quota.
+
+    `domain` (or the corpus_domain config key) restricts retrieval to one subtree,
+    which matters when the corpus spans unrelated subjects: without it an OR-ed
+    query matches something in every subject and the weakest hits still get
+    injected as context.
+    """
     if not c.get("corpus_db") or not Path(c["corpus_db"]).expanduser().is_file():
         return ""
     try:
         from corpus_index import search
-        hits = search(q, k or c.get("corpus_k", 4), Path(c["corpus_db"]).expanduser())
+        hits = search(q, k or c.get("corpus_k", 4), Path(c["corpus_db"]).expanduser(),
+                      prefix=domain or c.get("corpus_domain"),
+                      floor=c.get("corpus_floor", 0.5))
     except Exception as e:
         log(f"corpus unavailable: {e}")
         return ""
@@ -951,7 +959,7 @@ class Worker(threading.Thread):
         _, dirty = git(["status", "--porcelain"], cwd=wd, check=True)
         if not ok or dirty:
             return "baseline", "baseline tests failed or changed tracked/unignored files; no model calls spent:\n" + output, info
-        corpus = study(f"{task['title']} {task['detail']}", c)
+        corpus = study(f"{task['title']} {task['detail']}", c, domain=task.get("domain"))
         lessons, pitfalls = self.ledger.playbook()
         impl = self.pick()
         if impl is None:

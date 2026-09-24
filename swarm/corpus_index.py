@@ -27,7 +27,17 @@ ALL_EXT = TEXT_EXT | CODE_EXT | HTML_EXT | PDF_EXT | CAPTION_EXT
 SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv",
              "dist", "build", ".next", "site-packages",
              # OCW offline exports: site JS bundles and MathJax would drown BM25 results.
-             "static_shared", "mathjax"}
+             "static_shared", "mathjax", "static", "_static", "assets",
+             "fonts", "images", "img"}
+
+# Hashed or conventionally-named build artifacts that survive outside those dirs.
+BUNDLE_RE = re.compile(r"\.[0-9a-f]{6,}\.(?:js|css)$"
+                       r"|^(?:runtime|vendor|main|chunk|polyfill|bundle)[.\-]",
+                       re.I)
+class MissingExtractor(RuntimeError):
+    """A required external extractor is not installed."""
+
+
 MAX_BYTES = 2_000_000   # larger text/code files are generated bundles, not study material
 
 CHUNK_CHARS = 1400
@@ -63,8 +73,14 @@ def extract(path):
     ext = path.suffix.lower()
     try:
         if ext in PDF_EXT:
-            r = subprocess.run(["pdftotext", "-q", "-nopgbrk", str(path), "-"],
-                               capture_output=True, timeout=60)
+            try:
+                r = subprocess.run(["pdftotext", "-q", "-nopgbrk", str(path), "-"],
+                                   capture_output=True, timeout=60)
+            except FileNotFoundError:
+                # Every PDF would otherwise index as zero chunks with no warning.
+                raise MissingExtractor(
+                    "pdftotext not found; install poppler (brew install poppler) "
+                    "or PDFs will be silently skipped") from None
             return r.stdout.decode("utf-8", "replace")
         raw = path.read_text("utf-8", "replace")
         if ext in HTML_EXT:
@@ -72,6 +88,8 @@ def extract(path):
         if ext in CAPTION_EXT:
             return _strip_captions(raw)
         return raw
+    except MissingExtractor:
+        raise                      # a missing extractor is a setup error, not a bad file
     except Exception:
         return ""
 
@@ -136,7 +154,8 @@ def walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
         for fn in filenames:
             p = Path(dirpath) / fn
-            if p.suffix.lower() not in ALL_EXT or fn.startswith(".") or ".min." in fn:
+            if (p.suffix.lower() not in ALL_EXT or fn.startswith(".")
+                    or ".min." in fn or BUNDLE_RE.search(fn)):
                 continue
             try:
                 if p.suffix.lower() not in PDF_EXT and p.stat().st_size > MAX_BYTES:
@@ -225,15 +244,35 @@ def _fts_query(q):
     return " OR ".join(f'"{t}"' for t in terms[:24])
 
 
-def search(q, k=6, db=DEFAULT_DB, max_chars=1800):
+def search(q, k=6, db=DEFAULT_DB, max_chars=1800, prefix=None, floor=0.5):
+    """Rank chunks by BM25, keeping only those close enough to the best match.
+
+    Terms are OR-ed, so in a corpus spanning several subjects a query will always
+    match *something* in every subject. Returning a fixed k then pads the result
+    with weak, off-topic hits that read as endorsed context downstream. `floor`
+    drops any hit weaker than that fraction of the best score; `prefix` restricts
+    the search to one course or domain subtree.
+
+    SQLite's bm25() is negative, with better matches more negative.
+    """
     fq = _fts_query(q)
     if not fq:
         return []
+    sql = ["SELECT path, heading, body, bm25(chunks) AS score FROM chunks WHERE chunks MATCH ?"]
+    params = [fq]
+    if prefix:
+        sql.append("AND path LIKE ?")
+        params.append(prefix.rstrip("/") + "/%")
+    sql.append("ORDER BY score LIMIT ?")
+    params.append(k)
     con = connect(db)
-    rows = con.execute(
-        "SELECT path, heading, body, bm25(chunks) AS score FROM chunks "
-        "WHERE chunks MATCH ? ORDER BY score LIMIT ?", (fq, k)).fetchall()
+    rows = con.execute(" ".join(sql), params).fetchall()
     con.close()
+    if not rows:
+        return []
+    best = rows[0][3]
+    if floor and best < 0:
+        rows = [r for r in rows if r[3] <= best * floor]
     return [{"path": p, "heading": h, "text": b[:max_chars], "score": round(s, 3)}
             for p, h, b, s in rows]
 

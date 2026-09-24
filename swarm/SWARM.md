@@ -129,6 +129,22 @@ Per target repository: `swarm/state/<repo>-<hash>/` holds the queue, journal,
 `~/Documents/flint-training` and may be any folder of study material; set
 `FLINT_CORPUS_DB` to relocate the index itself.
 
+Retrieval is local BM25 over that index. Query terms are OR-ed, so in a corpus
+spanning unrelated subjects a query matches *something* everywhere; returning a
+fixed `corpus_k` would then pad the prompt with weak, off-topic excerpts that
+read as endorsed context. Two keys control this:
+
+- `corpus_floor` (default `0.5`) drops any hit weaker than that fraction of the
+  best score for the query. Lower it to admit more material, set `0` to disable.
+- `corpus_domain` restricts retrieval to one subtree of the corpus, e.g.
+  `agent-skills`. A task may override it per task with a `domain` field.
+
+Web exports (hashed or conventionally-named JS/CSS bundles, and `static/`,
+`assets/`, `fonts/` and `images/` directories) are excluded from indexing; in a
+course export these are site chrome, not study material. PDF extraction needs
+`pdftotext` (`brew install poppler`); if it is missing the build now fails
+loudly rather than indexing every PDF as zero chunks.
+
 Exit codes from flint turns: 1 error, 3 provider daily cap, 4 credit/account
 limit, 5 step limit, 6 local budget pause, 7 provider unavailable, 130 Ctrl-C.
 

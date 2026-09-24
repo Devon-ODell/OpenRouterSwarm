@@ -42,6 +42,8 @@
   "notify": true,
   "corpus_db": "~/.flint/corpus.db",
   "corpus_k": 4,
+  "corpus_floor": 0.5,
+  "corpus_domain": "",
   "tick": 90,
   "plan_batch": 5,
   "plan_cooldown": 600,
