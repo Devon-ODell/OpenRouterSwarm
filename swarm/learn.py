@@ -31,7 +31,9 @@ from pathlib import Path
 PRIOR = 1.0
 DISCOUNT = 0.97          # per pull of an arm: evidence half-life ≈ 23 pulls
 COOLDOWN_BASE = 1800     # seconds a model rests after provider failure; doubles per strike
-COOLDOWN_MAX = 12 * 3600
+COOLDOWN_MAX = 12 * 3600 # also: strikes older than this are forgotten
+BUSY_COOLDOWN = 120      # rate-limited upstream ("busy"): a short rest, doubling per busy spell
+BUSY_MAX = 1800
 
 # Failure stages and their reward. None means "not the implementer's doing": no update.
 # Faulty code earns nothing; how hard it hurts is set by PENALTY_WEIGHT below.
@@ -292,14 +294,34 @@ class Ledger:
             s["total"] += r
             s["last"] = time.time()
 
-    def cool(self, model, reason=""):
-        """Rest a model whose provider is failing. Not a quality judgement."""
+    def cool(self, model, reason="", busy=False):
+        """Rest a model whose provider is failing. Not a quality judgement.
+
+        busy: rate-limited upstream, which clears in minutes; it rests the model briefly and
+        leaves its outage strikes alone. Failures older than COOLDOWN_MAX (e.g. from an earlier
+        run, since the ledger persists) are forgotten rather than escalating a new rest."""
+        now = time.time()
         with self.txn() as d:
             c = d["cooldown"].setdefault(model, {"strikes": 0})
-            c["strikes"] += 1
-            c["until"] = time.time() + min(COOLDOWN_MAX, COOLDOWN_BASE * 2 ** (c["strikes"] - 1))
+            if now - c.get("last", c.get("until", 0)) > COOLDOWN_MAX:
+                c["strikes"], c["busy"] = 0, 0
+            c["last"] = now
+            if busy:
+                c["busy"] = c.get("busy", 0) + 1
+                rest = min(BUSY_MAX, BUSY_COOLDOWN * 2 ** (c["busy"] - 1))
+            else:
+                c["strikes"] = c.get("strikes", 0) + 1
+                rest = min(COOLDOWN_MAX, COOLDOWN_BASE * 2 ** (c["strikes"] - 1))
+            c["until"] = max(c.get("until", 0), now + rest)
             c["reason"] = reason[:200]
             return c["until"]
+
+    def resting(self):
+        """Models still resting, soonest back first: [(model, until, reason)]."""
+        now = time.time()
+        with self.txn(write=False) as d:
+            rows = [(m, c.get("until", 0), c.get("reason", "")) for m, c in d["cooldown"].items()]
+        return sorted((r for r in rows if r[1] > now), key=lambda r: r[1])
 
     def warm(self, model):
         with self.txn(write=False) as d:

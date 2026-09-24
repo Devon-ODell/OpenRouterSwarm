@@ -81,8 +81,26 @@ to two follow-ups jump the queue, it is appended to `BREAKTHROUGHS.md`, and a
 macOS notification is posted.
 
 The judge only ranks work that external checks already accepted; it cannot
-land anything. Model outages rest the model (30 min, doubling) without
-lowering its score.
+land anything.
+
+## Busy and resting models
+
+Free models are often **busy**: OpenRouter answers 429 "Provider returned
+error" because the upstream provider's free capacity is taken ("temporarily
+rate-limited upstream"). flint retries three times, honouring `Retry-After`,
+then exits 8. The swarm rests that model for 2 minutes (doubling per busy
+spell, at most 30) and **hands the turn to another model**, so a busy reviewer
+or judge no longer sinks an attempt that already has an implementation. A
+role that edits files is handed over only while it has changed nothing;
+reviewers and judges are never the implementer. Handoffs are `handoff` rows in
+`journal.jsonl`, and the model that actually answered gets the credit.
+
+A model that is **down** (404, repeated 5xx or dropped streams; exit 7) rests
+30 minutes, doubling up to 12 hours. Neither lowers its score. Rests are saved
+in `learn.json`, so they survive restarts: startup lists resting models,
+`swarm status` shows them under `resting`, strikes older than 12 hours are
+forgotten, and `swarm wake` ends every rest now. When every model is resting,
+the log says which is back first and when.
 
 ## MIT corpus experiment
 
@@ -172,7 +190,8 @@ Per target repository: `swarm/state/<repo>-<hash>/` holds the queue, journal,
 `scripts/sync_to_flint.sh` after rebuilding the course skills.
 
 Exit codes from flint turns: 1 error, 3 provider daily cap, 4 credit/account
-limit, 5 step limit, 6 local budget pause, 7 provider unavailable, 130 Ctrl-C.
+limit, 5 step limit, 6 local budget pause, 7 provider unavailable, 8 model busy
+(rate-limited upstream), 130 Ctrl-C.
 
 ```sh
 .venv/bin/python -m unittest discover -s tests -v

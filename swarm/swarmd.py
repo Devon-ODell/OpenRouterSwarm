@@ -12,7 +12,7 @@ accepted change leaves a lesson for the agents that come after it.
     swarm grind                                  # resume the configured target
     swarm run --hours 8                          # bounded run
     swarm report                                 # what happened while you were away
-    swarm status | add | plan | models
+    swarm status | add | plan | models | wake
 
 The supervisor never merges into your checkout: accepted work accumulates on
 `trunk` (default swarm/trunk). Review with `git log main..swarm/trunk` and
@@ -437,6 +437,32 @@ class ProviderDown(Exception):
         self.model = model
 
 
+class ProviderBusy(ProviderDown):
+    """The model is rate-limited upstream: it works, but another model should take this turn."""
+
+
+def rest(ledger, e):
+    """Rest the model behind a ProviderDown; returns a phrase for the log."""
+    busy = isinstance(e, ProviderBusy)
+    lines = str(e).strip().splitlines()
+    until = ledger.cool(e.model, lines[-1] if lines else "", busy=busy)
+    return (f"{e.model} {'is busy (rate-limited upstream)' if busy else 'is unavailable'}; "
+            f"resting it until {dt.datetime.fromtimestamp(until):%H:%M:%S}")
+
+
+def next_wake(ledger, c):
+    """(model, until) for the pool model that stops resting first, or (None, 0)."""
+    live = set(pool(c))
+    return next(((m, until) for m, until, _ in ledger.resting() if m in live), (None, 0))
+
+
+def all_resting(ledger, c):
+    model, until = next_wake(ledger, c)
+    if not model:
+        return "every model is resting"
+    return f"every model is resting; {model} is back at {dt.datetime.fromtimestamp(until):%H:%M:%S} (`swarm wake` ends the rest now)"
+
+
 def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     """One headless flint turn, paced against the daily allowance."""
     model = model or (pool(c) or [DEFAULT_MODEL])[0]
@@ -494,6 +520,8 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         raise StepLimit(error)
     if p.returncode == 7:
         raise ProviderDown(model, error)
+    if p.returncode == 8:
+        raise ProviderBusy(model, error)
     if p.returncode != 0:
         raise ModelError(f"{role} turn failed (rc={p.returncode}); log: {logfile}\n{error}")
     return out.strip()
@@ -853,6 +881,7 @@ class Worker(threading.Thread):
         self.wt = None
         self.stage = None
         self.task = None
+        self.last_model = None
 
     # -- helpers -----------------------------------------------------------
 
@@ -861,7 +890,13 @@ class Worker(threading.Thread):
         same posterior, excluding the implementer so nobody grades their own work."""
         return self.ledger.pick("implementer", pool(self.c), exclude=exclude)
 
-    def call(self, role, prompt, cwd, steps, model):
+    def call(self, role, prompt, cwd, steps, model, avoid=()):
+        """One role turn. If the model is busy or down, the turn goes to another model (never
+        one in `avoid`, so nobody grades their own work) instead of abandoning the attempt.
+        A role that edits files is handed over only while it has changed nothing, so partial
+        work is never finished by a different author. self.last_model names the model that
+        took the turn last, whether or not it succeeded."""
+        self.last_model = model
         if self.evidence:
             if self.role_calls >= self.c.get("max_role_calls", 10):
                 raise ModelError("per-attempt role-call budget exhausted")
@@ -869,12 +904,27 @@ class Worker(threading.Thread):
             self.evidence.record(role, role_calls=self.role_calls, active_model=model)
             self.evidence.write(f"prompt-{self.role_calls:02d}-{role}.txt", prompt)
         c = dict(self.c, study=False) if getattr(self, "mit", None) == "off" else self.c
-        try:
-            out = flint(prompt, cwd, c, role, self.name, self.budget, steps, model)
-        except ProviderDown as e:
-            until = self.ledger.cool(model, str(e))
-            log(f"{model} unavailable; resting it until {dt.datetime.fromtimestamp(until):%H:%M}", self.name)
-            raise
+        editing = role not in READ_ONLY_ROLES and self.wt is not None and Path(cwd) == Path(self.wt)
+        before = self.snapshot()[0] if editing else None
+        tried = set()
+        while True:
+            try:
+                out = flint(prompt, cwd, c, role, self.name, self.budget, steps, model)
+                break
+            except ProviderDown as e:
+                log(rest(self.ledger, e), self.name)
+                tried.add(model)
+                if editing and self.snapshot()[0] != before:
+                    raise
+                nxt = self.pick(set(avoid) | tried)
+                if nxt is None:
+                    raise
+                log(f"handing {role} to {nxt}", self.name)
+                journal("handoff", role=role, worker=self.name, model=model, to=nxt,
+                        busy=isinstance(e, ProviderBusy))
+                if self.evidence:
+                    self.evidence.record(role, role_calls=self.role_calls, active_model=nxt, handoff_from=model)
+                model = self.last_model = nxt
         self.ledger.warm(model)
         if self.evidence:
             self.evidence.write(f"response-{self.role_calls:02d}-{role}.txt", out)
@@ -963,12 +1013,12 @@ class Worker(threading.Thread):
         _, diff = git(["diff", "--cached", "--unified=3", self.review_base], cwd=self.wt, check=True)
         return tree, diff
 
-    def review(self, tree, diff, tests, model):
+    def review(self, tree, diff, tests, model, avoid=()):
         self.evidence.record("reviewing", reviewed_tree=tree, reviewer=model)
         prompt = REVIEW.format(contract=json.dumps(self.contract, indent=2), tree=tree,
                                tests=tests, diff=diff[:self.c.get("max_diff", 24000)])
         try:
-            raw = self.call("adversary", prompt, self.wt, self.c["steps"]["adversary"], model)
+            raw = self.call("adversary", prompt, self.wt, self.c["steps"]["adversary"], model, avoid)
             review = parse_review(raw, tree, self.contract["acceptance"])
         except ValueError as exc:
             self.evidence.write(f"review-{self.role_calls:02d}-invalid.txt", raw)
@@ -1016,7 +1066,8 @@ class Worker(threading.Thread):
         if c["steps"].get("architect", 0):
             spec += "\nARCHITECT NOTES (the contract still controls scope):\n" + self.call(
                 "architect", ARCHITECT.format(goal=goal, title=task["title"], detail=task["detail"],
-                 corpus=corpus, test_cmd=c["test_cmd"]), wd, c["steps"]["architect"], self.pick({impl}) or impl)
+                 corpus=corpus, test_cmd=c["test_cmd"]), wd, c["steps"]["architect"], self.pick({impl}) or impl,
+                avoid={impl})
         previous = "\nEARLIER ATTEMPTS:\n" + "\n---\n".join(task.get("notes", []))
         # Parent handoffs are artifacts, not mutable model memory.
         relevant = {task["id"], task.get("parent"), *task.get("depends_on", [])}
@@ -1035,7 +1086,10 @@ class Worker(threading.Thread):
         except StepLimit:
             self.evidence.record("step_limit", note="verify the partial implementation before continuing")
         except ModelError as exc:
+            info["implementer"] = self.last_model or impl
             return "model_error", str(exc), info
+        # After a handoff the model that actually wrote the code is its author.
+        impl = info["implementer"] = self.last_model or impl
         adv = self.pick({impl}) or impl
         info["reviewer"] = adv
         info["same_model_review"] = adv == impl
@@ -1058,9 +1112,12 @@ class Worker(threading.Thread):
             review = None
             if ok:
                 try:
-                    review = self.review(tree, diff, tests, adv)
+                    review = self.review(tree, diff, tests, adv, avoid={impl})
                 except (ModelError, StepLimit) as exc:
+                    info["reviewer"] = self.last_model or adv   # the model that failed to deliver
                     return "review_error", str(exc), info
+                adv = info["reviewer"] = self.last_model or adv
+                info["same_model_review"] = adv == impl
                 if review["verdict"] == "approve":
                     info["review"] = review
                     break
@@ -1076,7 +1133,7 @@ class Worker(threading.Thread):
             try:
                 handoff = self.call("repair", REPAIR.format(contract=json.dumps(self.contract, indent=2),
                                     failure=failure, test_cmd=c["test_cmd"]), wd,
-                                    c["steps"].get("repair", c["steps"]["implementer"]), impl)
+                                    c["steps"].get("repair", c["steps"]["implementer"]), impl, avoid={adv})
                 self.evidence.write(f"repair-{cycle + 1}.txt", handoff)
             except StepLimit:
                 pass
@@ -1085,7 +1142,7 @@ class Worker(threading.Thread):
         git(["commit", "-q", "--no-verify", "-m",
              f"swarm: {task['title']}\n\nSwarm-Task: {task['id']}\n"
              f"Swarm-Implementer: {impl}\nSwarm-Reviewer: {adv}\nSwarm-Strategy: {strategy}"], cwd=wd, check=True)
-        self._review_model = adv
+        self._review_model, self._author = adv, impl
         landed, why = self.integrate()
         if not landed:
             return "conflict", why, info
@@ -1100,7 +1157,8 @@ class Worker(threading.Thread):
         _, landed_diff = git(["diff", "--unified=3", self.review_base, "HEAD"], cwd=wd)
         info["scores"] = self.judge(task, goal, landed_diff,
                                     "APPROVE: " + str((info.get("review") or {}).get("summary", "")),
-                                    info["judge"])
+                                    info["judge"], avoid={impl, adv})
+        info["judge"] = self.last_model or info["judge"]
         if info["scores"]:
             self.evidence.write("judge.json", info["scores"])
         return "accepted", f"integrated {info['commit']} on {trunk_name(c)}; handoff: {self.evidence.path / 'HANDOFF.md'}", info
@@ -1122,7 +1180,7 @@ class Worker(threading.Thread):
                 after, _ = self.snapshot()
                 if not ok or after != tree or weakened_tests(diff):
                     return False, "rebased candidate failed verification or changed during tests"
-                review = self.review(tree, diff, output, self._review_model)
+                review = self.review(tree, diff, output, self._review_model, avoid={self._author})
                 if review["verdict"] != "approve":
                     return False, "rebased candidate needs changes; fresh review saved in artifacts"
             with trunk_locked():
@@ -1140,12 +1198,12 @@ class Worker(threading.Thread):
                     return True, ""
         return False, "trunk kept moving; retained candidate for a later attempt"
 
-    def judge(self, task, goal, diff, verdict, model):
+    def judge(self, task, goal, diff, verdict, model, avoid=()):
         try:
             out = self.call("judge", JUDGE.format(
                 goal=goal, title=task["title"], detail=task["detail"], verdict=verdict,
                 diff=diff[:self.c.get("max_diff", 24000)]),
-                self.wt, self.c["steps"].get("judge", 4), model)
+                self.wt, self.c["steps"].get("judge", 4), model, avoid)
         except Exception as e:  # the change already landed; never lose it to a judge failure
             log(f"judge unavailable ({type(e).__name__}); using a neutral score", self.name)
             return None
@@ -1322,7 +1380,15 @@ class Worker(threading.Thread):
                 self.stop.wait(600)
             except ProviderDown as e:
                 self.q.release(task["id"], False, f"provider unavailable: {str(e)[:200]}", defer=30)
-                self.stop.wait(30 if e.model else 300)
+                if self.pick() is None:
+                    # No model can take a turn. Sleep until the first one is back, not blindly.
+                    _, until = next_wake(self.ledger, self.c)
+                    wait = max(30, min(300, until - time.time()))
+                    log(f"{all_resting(self.ledger, self.c)}; task deferred, next try in {wait:.0f}s", self.name)
+                else:
+                    wait = 30
+                    log(f"no other model could take over from {e.model}; task deferred, next try in 30s", self.name)
+                self.stop.wait(wait)
             except NoCredits as e:
                 log(f"out of credits: {e}", self.name)
                 self.q.release(task["id"], False, "no credits")
@@ -1347,7 +1413,7 @@ def plan(c, q, budget, n=6, ledger=None):
     persona = ledger.pick("persona", list(PERSONAS)) or "builder"
     model = ledger.pick("planner", pool(c))
     if model is None:
-        log("planner: every model is resting; will retry")
+        log(f"planner: {all_resting(ledger, c)}; will retry")
         return 0
     base, t = c.get("base_branch", "main"), trunk_name(c)
     _, landed = git(["log", "--format=- %s", "-n", "25", f"{base}..{t}"], cwd=c["repo"])
@@ -1580,6 +1646,11 @@ def run_daemon(c, max_tasks=None):
     q.recover()
     log(f"swarm up — repo={repo.name} trunk={trunk_name(c)} workers={c['workers']}")
     log(json.dumps(budget.snapshot()))
+    # Rests persist in learn.json across runs; say so, or a fresh start looks stuck.
+    live = set(pool(c))
+    for model, until, why in ledger.resting():
+        if model in live:
+            log(f"{model} is resting until {dt.datetime.fromtimestamp(until):%H:%M:%S} ({why[:120]})")
 
     workers = [Worker(i, c, q, budget, stop, ledger, tally) for i in range(c["workers"])]
     for w in workers:
@@ -1626,8 +1697,7 @@ def run_daemon(c, max_tasks=None):
                     log("cap reached while planning — sleeping")
                     stop.wait(60)
                 except ProviderDown as e:
-                    ledger.cool(e.model, str(e))
-                    log(f"planner model {e.model} unavailable; resting it")
+                    log(f"planner: {rest(ledger, e)}; redrawing another model")
                     last_plan = 0.0
                 except NoCredits as e:
                     log(f"out of credits: {e}")
@@ -1753,6 +1823,8 @@ def cmd_status(a):
         "split": sum(1 for t in done if t.get("status") == "split"),
         "parked": sum(1 for t in done if t.get("status") == "parked"),
         "top_arms": Ledger(STATE / "learn.json").leaderboard()[:8],
+        "resting": [{"model": m, "until": dt.datetime.fromtimestamp(u).isoformat(timespec="seconds"),
+                     "reason": why} for m, u, why in Ledger(STATE / "learn.json").resting()],
     }, indent=2))
     for t in _read(STATE / "journal.jsonl")[-8:]:
         print(f"  {t['iso']}  {t['event']:<8} {t.get('stage') or t.get('role') or ''} "
@@ -1774,6 +1846,16 @@ def cmd_plan(a):
     b = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                owner_window=c.get("owner_window", ["00:00", "00:00"]))
     plan(c, Queue(c.get("max_depth", 1)), b, a.n)
+
+
+def cmd_wake(a):
+    """End every model's rest now (e.g. after a provider outage is over)."""
+    _setup()
+    L = Ledger(STATE / "learn.json")
+    rows = L.resting()
+    for model, _, _ in rows:
+        L.warm(model)
+    print(f"woke {len(rows)} model(s): {', '.join(m for m, _, _ in rows)}" if rows else "no model is resting")
 
 
 def cmd_models(a):
@@ -1822,6 +1904,7 @@ def main():
     p2 = sub.add_parser("plan")
     p2.add_argument("-n", type=int, default=5)
     p2.set_defaults(fn=cmd_plan)
+    sub.add_parser("wake", help="end every model's rest now").set_defaults(fn=cmd_wake)
     m = sub.add_parser("models", help="list free tool-capable models; --write sets the pool")
     m.add_argument("--write", action="store_true")
     m.set_defaults(fn=cmd_models)
