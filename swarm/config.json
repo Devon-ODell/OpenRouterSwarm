@@ -5,7 +5,7 @@
   "trunk": "swarm/trunk",
   "goal_file": "GOAL.md",
   "test_cmd": "__TEST_CMD__",
-  "python": "/Users/devonodell/Desktop/LingAI-Trader/.venv/bin/python",
+  "python": "__PYTHON__",
   "models": [
     "inclusionai/ling-3.0-flash-fin:free",
     "qwen/qwen3.8-27b:free",

@@ -5,6 +5,7 @@ __pycache__/
 swarm/wt/
 swarm/logs/
 swarm/state/
-.env
 .env.*
 !.env.example
+.DS_Store
+*.bak

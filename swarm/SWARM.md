@@ -124,12 +124,10 @@ Per target repository: `swarm/state/<repo>-<hash>/` holds the queue, journal,
 `learn.json` (bandits, playbook, history), `BREAKTHROUGHS.md` and `REPORT.md`;
 `swarm/logs/<repo>-<hash>/` holds per-role logs. The study corpus is
 `~/.flint/corpus.db`; rebuild it with
-`.venv/bin/python swarm/corpus_index.py build --root ~/Documents/flint-training --prune`
-(add `--budget 150` and rerun if it stops early). The MIT OpenCourseWare index lives in
-`~/Documents/flint-training/MIT OCW Courses/agent-skills/`: start at `FLINT-INDEX.md`
-(domain -> topic -> lecture card -> source page). It is a copy of
-`~/Desktop/college/MIT OCW Courses/agent-skills/`; refresh it with that folder's
-`scripts/sync_to_flint.sh` after rebuilding the course skills.
+`.venv/bin/python swarm/corpus_index.py build --root <corpus-dir> --prune`
+(add `--budget 150` and rerun if it stops early). The corpus root defaults to
+`~/Documents/flint-training` and may be any folder of study material; set
+`FLINT_CORPUS_DB` to relocate the index itself.
 
 Exit codes from flint turns: 1 error, 3 provider daily cap, 4 credit/account
 limit, 5 step limit, 6 local budget pause, 7 provider unavailable, 130 Ctrl-C.
