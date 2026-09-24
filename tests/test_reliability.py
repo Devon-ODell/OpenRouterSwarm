@@ -126,6 +126,40 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(a._stream_once.call_count, 1)
         a.throttle.block.assert_called_once()
 
+    # What OpenRouter sends when a free model's upstream capacity is taken.
+    UPSTREAM = {"message": "Provider returned error", "code": 429,
+                "metadata": {"raw": "test:free is temporarily rate-limited upstream. Please retry shortly.",
+                             "provider_name": "Chutes"}}
+
+    def test_upstream_rate_limit_is_busy_not_down_and_honours_retry_after(self):
+        a = agent()
+        error = flint.APIError("Error code: 429", request=Mock(), body=self.UPSTREAM)
+        error.response = NS(headers={"Retry-After": "7"})
+        a._stream_once = Mock(side_effect=error)
+        err = io.StringIO()
+        with patch.object(flint.time, "sleep") as sleep, contextlib.redirect_stderr(err):
+            with self.assertRaises(flint.ProviderBusy):
+                a.complete()
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [7, 7, 7])
+        self.assertIn("temporarily rate-limited upstream", err.getvalue())
+        a.throttle.block.assert_not_called()
+
+    def test_an_upstream_daily_quota_does_not_block_every_model(self):
+        body = dict(self.UPSTREAM, metadata={"raw": "Quota exceeded: 50 requests per day",
+                                             "provider_name": "Google AI Studio"})
+        kind, _, msg = flint.classify_429(flint.APIError("x", request=Mock(), body=body))
+        self.assertEqual(kind, "provider")
+        self.assertIn("50 requests per day", msg)
+
+    def test_busy_model_exits_8(self):
+        a = agent()
+        a.turn = Mock(side_effect=flint.ProviderBusy("rate-limited upstream"))
+        with patch.object(flint, "Agent", return_value=a), patch.object(sys, "argv", ["flint", "-p", "task"]), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as exc:
+                flint.main()
+        self.assertEqual(exc.exception.code, 8)
+
 
 class BudgetTests(unittest.TestCase):
     def test_reserve_is_enforced_using_locked_request_state(self):

@@ -24,14 +24,19 @@ from pathlib import Path
 
 import urllib.error
 import urllib.request
-from dotenv import load_dotenv
-from openai import APIConnectionError, APIError, OpenAI, RateLimitError
-from rich.console import Console
-from rich.live import Live
-from rich.markdown import Markdown
-from rich.panel import Panel
-from rich.syntax import Syntax
-from rich.text import Text
+try:
+    from dotenv import load_dotenv
+    from openai import APIConnectionError, APIError, OpenAI, RateLimitError
+    from rich.console import Console
+    from rich.live import Live
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+    from rich.text import Text
+except ModuleNotFoundError as e:
+    sys.exit(f"flint: missing Python package '{e.name}' — run flint with the project's virtualenv:\n"
+             f"  python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt\n"
+             f"  .venv/bin/python flint.py")
 
 try:
     import readline  # noqa: F401  (arrow keys + history in input())
@@ -330,6 +335,10 @@ class ProviderUnavailable(Exception):
     """The model or its providers cannot serve requests right now (overload, 404, 5xx)."""
 
 
+class ProviderBusy(ProviderUnavailable):
+    """The model works but is rate-limited upstream (429): try another model, or this one shortly."""
+
+
 def _next_utc_midnight():
     now = datetime.datetime.now(datetime.timezone.utc)
     return (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0,
@@ -410,35 +419,58 @@ class Throttle:
         return self._txn(lambda d: d.get("count", 0))
 
 
-def classify_429(e):
-    """Return (kind, reset_at, message). kind: daily | minute | provider | unknown."""
+def _error_parts(e):
+    """(error dict, metadata dict, lower-cased headers) of an OpenRouter API error."""
     body = getattr(e, "body", None)
     err = body.get("error", body) if isinstance(body, dict) else {}
     err = err if isinstance(err, dict) else {}
-    msg = str(err.get("message") or getattr(e, "message", "") or e)
     meta = err.get("metadata") if isinstance(err.get("metadata"), dict) else {}
     headers = {k.lower(): v for k, v in (meta.get("headers") or {}).items()}
     resp = getattr(e, "response", None)
     if resp is not None:
         headers.update({k.lower(): v for k, v in resp.headers.items()})
+    return err, meta, headers
+
+
+def classify_429(e):
+    """Return (kind, reset_at, message). kind: daily | minute | provider | unknown.
+
+    OpenRouter's own limits are named in `message`. An upstream provider's throttle arrives as
+    the generic "Provider returned error" with the provider's text in metadata.raw ("… is
+    temporarily rate-limited upstream"); that text is shown but never read as the account's
+    daily cap, which would stop every model."""
+    err, meta, headers = _error_parts(e)
+    msg = str(err.get("message") or getattr(e, "message", "") or e)
     reset_at = None
     try:
         r = float(headers.get("x-ratelimit-reset", ""))
         reset_at = r / 1000 if r > 1e11 else r  # header is usually epoch milliseconds
-    except ValueError:
+    except (TypeError, ValueError):
         pass
     low = msg.lower()
+    raw = meta.get("raw")
+    raw = (raw if isinstance(raw, str) else json.dumps(raw) if raw else "").strip()
     if any(s in low for s in ("per-day", "per day", "daily", "free-models-per-day")):
         kind = "daily"
     elif any(s in low for s in ("per-min", "per minute", "free-models-per-min")):
         kind = "minute"
-    elif meta.get("provider_name") or "upstream" in low or "provider" in low:
+    elif meta.get("provider_name") or raw or "upstream" in low or "provider" in low:
         kind = "provider"
     elif reset_at and reset_at - time.time() > 600:
         kind = "daily"
     else:
         kind = "unknown"
+    if raw and raw not in msg:
+        msg = f"{msg} ({meta.get('provider_name') or 'upstream'}: {raw[:300]})"
     return kind, reset_at, msg
+
+
+def retry_after(e):
+    """Seconds the server asked us to wait (Retry-After), or None."""
+    try:
+        return max(0.0, float(_error_parts(e)[2].get("retry-after", "")))
+    except (TypeError, ValueError):
+        return None
 
 
 def _ssl_context():
@@ -563,12 +595,15 @@ class Agent:
                     self._note(f"[yellow]per-minute cap hit — waiting {wait:.0f}s[/]")
                     time.sleep(wait)
                     continue
+                # Rate-limited upstream: the model works, its free capacity is taken. Each retry
+                # costs a request, so a swarm is better off switching models (exit 8) than waiting.
                 provider_retries += 1
                 if provider_retries > 3:
-                    raise ProviderUnavailable(f"model provider is overloaded: {msg}. Try again later "
-                                              "or set FLINT_FALLBACKS to a backup model.")
-                wait = 10 * 2 ** (provider_retries - 1)
-                self._note(f"[yellow]provider busy ({kind}) — retry {provider_retries}/3 in {wait}s: {msg[:250]}[/]")
+                    raise ProviderBusy(f"{self.model} is rate-limited upstream: {msg}. Try again "
+                                       "shortly or use another model (FLINT_FALLBACKS).")
+                asked = retry_after(e)
+                wait = round(min(60, max(5, asked))) if asked is not None else 10 * 2 ** (provider_retries - 1)
+                self._note(f"[yellow]provider busy ({kind}) — retry {provider_retries}/3 in {wait}s: {msg[:400]}[/]")
                 time.sleep(wait)
         raise ProviderUnavailable("Gave up after repeated errors.")
 
@@ -980,6 +1015,9 @@ def main():
         except OutOfCredits as e:
             print(f"flint: {e}", file=sys.stderr)
             sys.exit(4)
+        except ProviderBusy as e:
+            print(f"flint: model busy: {e}", file=sys.stderr)
+            sys.exit(8)  # rate-limited upstream: the swarm hands the role to another model
         except ProviderUnavailable as e:
             print(f"flint: provider unavailable: {e}", file=sys.stderr)
             sys.exit(7)  # the model is down, not wrong: the swarm cools it down

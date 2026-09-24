@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from unittest.mock import Mock, patch
@@ -36,6 +37,22 @@ class LearnTests(unittest.TestCase):
         self.assertIsNone(self.L.pick("implementer", ["a", "b"], exclude={"b"}))
         self.L.warm("a")
         self.assertEqual(self.L.pick("implementer", ["a", "b"], exclude={"b"}), "a")
+
+    def test_busy_rest_is_short_and_leaves_outage_strikes_alone(self):
+        now = time.time()
+        self.assertAlmostEqual(self.L.cool("a", "rate-limited upstream", busy=True) - now, learn.BUSY_COOLDOWN, delta=5)
+        self.assertAlmostEqual(self.L.cool("a", "rate-limited upstream", busy=True) - now, 2 * learn.BUSY_COOLDOWN, delta=5)
+        self.assertEqual(self.L.snapshot()["cooldown"]["a"]["strikes"], 0)
+        self.assertIsNone(self.L.pick("implementer", ["a"]))
+        self.assertEqual([m for m, _, _ in self.L.resting()], ["a"])
+
+    def test_outage_strikes_from_an_earlier_run_are_forgotten(self):
+        for _ in range(4):
+            self.L.cool("a", "down")
+        with self.L.txn() as d:   # a ledger from before `last` was recorded, rest long over
+            d["cooldown"]["a"].pop("last")
+            d["cooldown"]["a"]["until"] = time.time() - learn.COOLDOWN_MAX - 60
+        self.assertAlmostEqual(self.L.cool("a", "down") - time.time(), learn.COOLDOWN_BASE, delta=5)
 
     def test_reward_orders_outcomes_and_pays_for_creativity(self):
         s = {"impact": 5, "creativity": 2, "quality": 6}
@@ -404,6 +421,82 @@ class ReinforcementTests(SwarmBase):
         self.assertIsNone(w.pick())
 
 
+class BusyModelTests(SwarmBase):
+    """A model rate-limited upstream ("busy") hands its turn over instead of sinking the attempt."""
+    MODELS = ["a:free", "b:free", "c:free"]
+
+    def test_busy_reviewer_hands_the_review_to_another_model(self):
+        repo, _ = self.repo()
+        calls = []
+
+        def fake(prompt, cwd, c, role, worker, budget, steps, model):
+            calls.append((role, model))
+            if role == "implementer":
+                (cwd / "app.txt").write_text("change\n")
+                return "done"
+            if role == "adversary" and [r for r, _ in calls].count("adversary") == 1:
+                raise swarmd.ProviderBusy(model, "flint: model busy: rate-limited upstream")
+            return review(prompt) if role == "adversary" else "{}"
+        w = self.worker(self.cfg(repo, models=self.MODELS))
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task({"id": "t1", "title": "x", "detail": ""}, "goal")
+        self.assertTrue(ok, note)
+        author = calls[0][1]
+        busy, reviewer = [m for r, m in calls if r == "adversary"]
+        self.assertEqual(len({author, busy, reviewer}), 3)   # nobody reviews their own work
+        rest = w.ledger.snapshot()["cooldown"][busy]
+        self.assertEqual((rest["busy"], rest["strikes"]), (1, 0))
+        self.assertLess(rest["until"] - time.time(), learn.BUSY_COOLDOWN + 5)
+        handoff = [j for j in swarmd._read(swarmd.STATE / "journal.jsonl") if j["event"] == "handoff"]
+        self.assertEqual([(j["role"], j["model"], j["to"], j["busy"]) for j in handoff],
+                         [("adversary", busy, reviewer, True)])
+
+    def test_busy_implementer_hands_over_before_editing_and_the_author_is_credited(self):
+        repo, _ = self.repo()
+        calls = []
+
+        def fake(prompt, cwd, c, role, worker, budget, steps, model):
+            calls.append((role, model))
+            if role == "implementer":
+                if len(calls) == 1:
+                    raise swarmd.ProviderBusy(model, "rate-limited upstream")
+                (cwd / "app.txt").write_text("change\n")
+                return "done"
+            return review(prompt) if role == "adversary" else "{}"
+        w = self.worker(self.cfg(repo, models=self.MODELS))
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task({"id": "t1", "title": "x", "detail": ""}, "goal")
+        self.assertTrue(ok, note)
+        (_, busy), (_, author) = calls[:2]
+        arms = w.ledger.snapshot()["arms"]["implementer"]
+        self.assertIn(author, arms)
+        self.assertNotIn(busy, arms)
+        self.assertNotIn(author, [m for r, m in calls if r == "adversary"])
+
+    def test_partial_work_is_never_finished_by_another_model(self):
+        repo, _ = self.repo()
+        calls = []
+
+        def fake(prompt, cwd, c, role, worker, budget, steps, model):
+            calls.append((role, model))
+            (cwd / "app.txt").write_text("half done\n")
+            raise swarmd.ProviderBusy(model, "rate-limited upstream")
+        w = self.worker(self.cfg(repo, models=self.MODELS))
+        with patch.object(swarmd, "flint", side_effect=fake), self.assertRaises(swarmd.ProviderBusy):
+            w.do_task({"id": "t1", "title": "x", "detail": ""}, "goal")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(w.stage, "deferred")
+
+    def test_when_every_model_rests_the_log_says_who_is_back_first(self):
+        L = learn.Ledger(swarmd.STATE / "learn.json")
+        L.cool("a:free", "down")
+        L.cool("b:free", "busy", busy=True)
+        L.cool("gone:free", "busy", busy=True)   # no longer in the pool: ignored
+        c = {"models": ["a:free", "b:free"]}
+        self.assertEqual(swarmd.next_wake(L, c)[0], "b:free")
+        self.assertRegex(swarmd.all_resting(L, c), r"b:free is back at \d\d:\d\d:\d\d .*swarm wake")
+
+
 class RecursionTests(SwarmBase):
     def test_task_failed_twice_splits_into_prioritised_subtasks(self):
         repo, _ = self.repo()
@@ -475,7 +568,7 @@ class GuardTests(SwarmBase):
     def test_role_exit_codes_map_to_swarm_exceptions(self):
         budget = Mock(cap=10, reserve=1)
         budget.check.return_value = (True, 0, "ok")
-        for rc, exc in ((7, swarmd.ProviderDown), (5, swarmd.StepLimit),
+        for rc, exc in ((7, swarmd.ProviderDown), (8, swarmd.ProviderBusy), (5, swarmd.StepLimit),
                         (1, swarmd.ModelError), (3, swarmd.CapReached), (4, swarmd.NoCredits)):
             p = Mock(returncode=rc)
             p.communicate.return_value = ("", None)
