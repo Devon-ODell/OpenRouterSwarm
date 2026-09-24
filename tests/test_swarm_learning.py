@@ -3,7 +3,6 @@ import json
 import os
 from pathlib import Path
 import random
-import re
 import subprocess
 import tempfile
 import threading
@@ -14,6 +13,7 @@ from unittest.mock import Mock, patch
 import flint
 from swarm import learn, sandbox, swarmd
 from swarm.learn import is_breakthrough, novelty, parse_scores, reward
+from tests.helpers import review
 
 
 class LearnTests(unittest.TestCase):
@@ -157,17 +157,6 @@ class LearnTests(unittest.TestCase):
         prior = ["Deterministic level generator with seeded RNG"]
         self.assertLess(novelty("Seeded deterministic level generator", prior), 0.5)
         self.assertGreater(novelty("Replay recorder for multiplayer matches", prior), 0.9)
-
-
-def review(prompt, verdict="approve", issue="off-by-one at the last index"):
-    """A well-formed structured review of the tree named in the reviewer prompt."""
-    tree = re.search(r"GIT TREE TO REVIEW: (\w+)", prompt).group(1)
-    ids = dict.fromkeys(re.findall(r'"id": "(C\d+)"', prompt))
-    approve = verdict == "approve"
-    return json.dumps({"verdict": verdict, "tree": tree, "summary": "reviewed",
-                       "checks": [{"criterion": i, "passed": approve, "evidence": "tests"} for i in ids],
-                       "findings": [] if approve else [{"severity": "blocker", "path": "app.txt", "line": 1,
-                                                        "issue": issue, "verification": "page 10 of 10"}]})
 
 
 class SwarmBase(unittest.TestCase):

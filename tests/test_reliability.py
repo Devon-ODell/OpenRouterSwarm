@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 import flint
 from swarm import swarmd
 from swarm.budget import Budget
+from tests.helpers import review
 
 
 def agent():
@@ -208,7 +209,7 @@ class SwarmTests(unittest.TestCase):
             if role == "implementer":
                 (cwd / "app.txt").write_text("worker change\n")
                 return "implemented"
-            return "APPROVE: checked"
+            return review(prompt) if role == "adversary" else "done"
         with patch.object(swarmd, "flint", side_effect=fake_flint):
             ok, note = worker.do_task({"id": "task", "title": "improve", "detail": "change app"}, "goal")
         self.assertTrue(ok, note)
