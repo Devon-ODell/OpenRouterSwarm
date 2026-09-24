@@ -1784,12 +1784,28 @@ def keep_awake():
 
 # ------------------------------------------------------------------ daemon
 
+def holder():
+    """Who holds this repository's daemon lock, and how to stop it. The note is only written
+    by a daemon that holds the lock, so a dead process's note is ignored."""
+    try:
+        d = json.loads((STATE / "daemon.pid").read_text())
+        os.kill(int(d["pid"]), 0)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return ""
+    return (f"\n  It started at {dt.datetime.fromtimestamp(d['started']):%H:%M:%S} with the goal: "
+            f"{str(d.get('goal', ''))[:120]}\n"
+            f"  Watch it:  swarm status\n"
+            f"  Stop it:   kill -INT {d['pid']}   (or Ctrl-C in its terminal)")
+
+
 def start(c, hours=None, max_tasks=None, awake=False):
     with open(STATE / "daemon.lock", "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            sys.exit("another swarm daemon is already running on this repository")
+            sys.exit(f"another swarm daemon is already running on this repository.{holder()}")
+        (STATE / "daemon.pid").write_text(json.dumps(
+            {"pid": os.getpid(), "started": time.time(), "goal": read_goal(c)[:200]}))
         _stop.clear()
         preflight(c)
         if awake:
@@ -1806,6 +1822,7 @@ def start(c, hours=None, max_tasks=None, awake=False):
             if timer:
                 timer.cancel()
             shutdown()
+            (STATE / "daemon.pid").unlink(missing_ok=True)
             log("stopped. `swarm report` summarises the run.")
 
 

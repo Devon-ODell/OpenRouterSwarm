@@ -634,6 +634,20 @@ class GuardTests(SwarmBase):
                 patch.object(swarmd, "free_tool_models", return_value={"a:free": {}}):
             swarmd.preflight(self.cfg(repo, models=["a:free"], test_cmd="true"))
 
+    def test_a_second_daemon_is_told_how_to_stop_the_first(self):
+        """"Already running" is useless on its own when the running one has the wrong goal."""
+        self.assertEqual(swarmd.holder(), "")                      # nothing running
+        (swarmd.STATE / "daemon.pid").write_text(json.dumps(
+            {"pid": os.getpid(), "started": time.time(), "goal": "read and execute GOAL.md"}))
+        told = swarmd.holder()
+        self.assertIn(f"kill -INT {os.getpid()}", told)
+        self.assertIn("read and execute GOAL.md", told)            # the goal it is stuck on
+        (swarmd.STATE / "daemon.pid").write_text(json.dumps(
+            {"pid": 2 ** 30, "started": time.time(), "goal": "x"}))
+        self.assertEqual(swarmd.holder(), "")                      # a dead pid says nothing
+        (swarmd.STATE / "daemon.pid").write_text("not json")
+        self.assertEqual(swarmd.holder(), "")
+
     def test_added_tasks_carry_each_acceptance_criterion_separately(self):
         """The reviewer checks criteria one by one, so one blob is worth less than a list."""
         repo, _ = self.repo()
