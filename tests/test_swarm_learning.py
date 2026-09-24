@@ -656,7 +656,9 @@ class GuardTests(SwarmBase):
         self.assertLessEqual(calls.count("gated:free"), 1)   # drawn once, then never again
         self.assertIsNone(w.ledger.pick("implementer", ["gated:free"]))
         # The log tells the owner what to do rather than promising it will come back.
-        self.assertIn("Remove it from", swarmd.rest(w.ledger, swarmd.ModelGone("gated:free", "403")))
+        told = swarmd.rest(w.ledger, swarmd.ModelGone("gated:free", "403"))
+        self.assertIn(str(swarmd.CONFIG), told)          # names the file holding the pool
+        self.assertNotIn("resting it until", told)       # never promises it will come back
 
     def test_detect_test_cmd(self):
         cases = [({"go.mod": ""}, "go test ./..."),
