@@ -462,8 +462,10 @@ def rest(ledger, e):
     why = lines[-1] if lines else ""
     until = ledger.cool(e.model, why, busy=busy, permanent=gone)
     if gone:
+        # `swarm models --write` would put it back: OpenRouter lists it as free with tools,
+        # and the refusal is particular to this key.
         return (f"{e.model} is not available to this API key — dropping it for this run. "
-                f"Remove it from {CONFIG} (`swarm models --write` rewrites the pool): {why[:200]}")
+                f"Delete it from the \"models\" list in {CONFIG}: {why[:200]}")
     return (f"{e.model} {'is busy (rate-limited upstream)' if busy else 'is unavailable'}; "
             f"resting it until {dt.datetime.fromtimestamp(until):%H:%M:%S}")
 
