@@ -22,7 +22,8 @@ The sidebar header shows whether the swarm is running here, the queue, today's f
 ## Install
 
 ```sh
-cursor-extension/install.sh     # runs the tests, packages flint-swarm.vsix, installs it into Cursor
+./setup.sh                      # first time: venv, API key, tests, then the extension
+cursor-extension/install.sh     # later: re-package and reinstall only the extension
 ```
 
 Then reload Cursor with *Developer: Reload Window*. The extension talks to `swarm/bridge.py` in

@@ -68,9 +68,7 @@ def config_for(repo=None):
     """The swarm config, pointed at `repo` when given. Only the configured repo is ground by
     a running daemon; other repos still get their own queue and state."""
     c = swarmd.load_cfg()
-    c.setdefault("python", sys.executable)
-    if str(c.get("python", "")).startswith("__"):
-        c["python"] = sys.executable
+    c["python"] = swarmd.python_for(c)
     if repo:
         repo = str(Path(repo).expanduser().resolve())
         if c.get("repo") != repo:

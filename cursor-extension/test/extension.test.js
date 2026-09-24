@@ -132,6 +132,8 @@ test('the panel script renders a streamed ask with the merged answer first', () 
 });
 
 test('a real bridge call returns MIT hits with absolute paths', async () => {
+  const db = (process.env.FLINT_CORPUS_DB || path.join(require('os').homedir(), '.flint', 'corpus.db'));
+  if (!fs.existsSync(db)) { console.log('skip  (no study corpus at ' + db + ')'); return; }
   const res = await ext._test.bridgeJson(['study', '--query', 'dijkstra priority queue', '-k', '2']);
   assert.ok(res.hits.length >= 1);
   assert.ok(path.isAbsolute(res.hits[0].path) && fs.existsSync(res.hits[0].path), res.hits[0].path);

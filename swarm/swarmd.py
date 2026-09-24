@@ -97,13 +97,23 @@ def cfg():
     if not CONFIG.exists():
         sys.exit(f"missing {CONFIG} — run `swarm grind /path/to/repo` first")
     c = json.loads(CONFIG.read_text())
-    if any(str(c.get(k, "")).startswith("__") or not c.get(k)
-           for k in ("repo", "test_cmd", "python")):
+    if any(str(c.get(k, "")).startswith("__") or not c.get(k) for k in ("repo", "test_cmd")):
         sys.exit("swarm is not configured — run `swarm grind /path/to/repo` first")
     c["repo"] = str(Path(c["repo"]).expanduser())
+    c["python"] = python_for(c)
     if c.get("workers", 1) < 1:
         sys.exit("workers must be at least 1")
     return c
+
+
+def python_for(c):
+    """The interpreter for flint turns: the configured one if it exists, else this checkout's
+    .venv, else the one running the swarm. A config copied from another checkout still works."""
+    configured = str(c.get("python") or "")
+    if configured and not configured.startswith("__") and Path(configured).expanduser().is_file():
+        return str(Path(configured).expanduser())
+    venv = ROOT / ".venv" / "bin" / "python"
+    return str(venv) if venv.is_file() else sys.executable
 
 
 def use_repo(c):
@@ -1547,8 +1557,7 @@ def configure(repo, test_cmd=None):
         c["test_cmd"] = test_cmd or detect_test_cmd(repo) or "__TEST_CMD__"
     elif test_cmd:
         c["test_cmd"] = test_cmd
-    if str(c.get("python", "__")).startswith("__"):
-        c["python"] = str(ROOT / ".venv" / "bin" / "python")
+    c["python"] = python_for(c)
     save_cfg(c)
     if c["test_cmd"].startswith("__"):
         sys.exit(f"could not detect how to test {repo}; pass --test-cmd 'your test command'")

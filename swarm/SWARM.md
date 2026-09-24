@@ -4,6 +4,14 @@ A multi-model coding swarm on free OpenRouter models that works on a codebase
 until you stop it, compounds its own accepted work, and learns which agents and
 ideas to reinforce.
 
+First time in a checkout (creates `.venv`, finds or asks for your OpenRouter
+key, installs the `flint` and `swarm` commands, runs the tests and installs the
+Cursor extension pointed at this folder):
+
+```sh
+./setup.sh
+```
+
 ```sh
 swarm grind ~/code/project --goal "what it should become"   # start nonstop
 swarm grind                                                 # resume the configured target
