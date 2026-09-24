@@ -1,0 +1,51 @@
+{
+  "_comment": "`swarm grind /path/to/repo` fills repo/test_cmd/python/base_branch. Edit freely; swarmd reads it on every command.",
+  "repo": "__REPO__",
+  "base_branch": "main",
+  "trunk": "swarm/trunk",
+  "goal_file": "GOAL.md",
+  "test_cmd": "__TEST_CMD__",
+  "python": "/Users/devonodell/Desktop/LingAI-Trader/.venv/bin/python",
+  "models": [
+    "inclusionai/ling-3.0-flash-fin:free",
+    "qwen/qwen3.8-27b:free",
+    "nex-agi/nex-n2.5-pro:free",
+    "dots-studio/dots-3-note-preview:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "poolside/laguna-s-2.1:free",
+    "cohere/north-mini-code:free",
+    "thinkingmachines/inkling:free",
+    "google/gemma-4-31b-it:free"
+  ],
+  "allow_paid": false,
+  "workers": 1,
+  "daily_cap": 1000,
+  "reserve": 100,
+  "owner_window": [
+    "00:00",
+    "00:00"
+  ],
+  "steps": {
+    "planner": 10,
+    "architect": 0,
+    "implementer": 25,
+    "adversary": 12,
+    "judge": 4,
+    "decomposer": 6
+  },
+  "max_depth": 1,
+  "max_queue": 20,
+  "sandbox": true,
+  "sandbox_write": [],
+  "keep_worktrees": false,
+  "notify": true,
+  "corpus_db": "~/.flint/corpus.db",
+  "corpus_k": 4,
+  "tick": 90,
+  "plan_batch": 5,
+  "plan_cooldown": 600,
+  "turn_timeout": 1800,
+  "test_timeout": 900,
+  "max_diff": 24000
+}
