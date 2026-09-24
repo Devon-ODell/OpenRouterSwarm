@@ -269,6 +269,27 @@ class Queue:
             fcntl.flock(lock, fcntl.LOCK_EX)
             yield
 
+    def resolve(self, refs):
+        """Task ids for a list of ids or exact titles. Titles are unique in a queue, so they
+        are a usable key, and a person writing a dependency knows the title, not the id."""
+        with self.locked():
+            rows = _read(self.path) + _read(self.done)
+        ids = {r["id"] for r in rows}
+        titles = {r["title"].strip().lower(): r["id"] for r in rows}
+        out, missing = [], []
+        for ref in refs:
+            key = str(ref).strip()
+            if key in ids:
+                out.append(key)
+            elif key.lower() in titles:
+                out.append(titles[key.lower()])
+            else:
+                missing.append(ref)
+        if missing:
+            raise ValueError(f"no queued or finished task matches {missing}; "
+                             f"depend on a task's exact title or its id")
+        return out
+
     def seen_titles(self):
         """Everything pending, done or parked — so the planner cannot loop."""
         with self.locked():
@@ -2045,10 +2066,11 @@ def cmd_report(a):
 
 def cmd_add(a):
     c = _setup()
+    q = Queue(c.get("max_depth", 1), c.get("max_queue", 20))
     try:
-        t = Queue(c.get("max_depth", 1), c.get("max_queue", 20)).add(
-            a.title, a.detail or "", a.kind, priority=a.priority, origin="human",
-            acceptance=a.acceptance or None)
+        depends = q.resolve(a.depends_on) if a.depends_on else None
+        t = q.add(a.title, a.detail or "", a.kind, priority=a.priority, origin="human",
+                  acceptance=a.acceptance or None, depends_on=depends)
     except ValueError as e:
         sys.exit(f"not queued: {e}")
     if not t:
@@ -2056,6 +2078,8 @@ def cmd_add(a):
     print(f"queued {t['id']}: {t['title']}")
     for row in criteria(t):
         print(f"  {row['id']} {row['text'][:150]}")
+    for dep in t.get("depends_on", []):
+        print(f"  waits for {dep}")
 
 
 def cmd_plan(a):
@@ -2119,6 +2143,8 @@ def main():
     p.add_argument("--priority", type=int, default=1, help="hand-added tasks jump the queue (default 1)")
     p.add_argument("--acceptance", action="append", metavar="TEXT",
                    help="one thing the reviewer must verify; repeat for each (default: the detail)")
+    p.add_argument("--depends-on", action="append", metavar="TITLE_OR_ID", dest="depends_on",
+                   help="a task that must finish first, by exact title or id; repeat for each")
     p.set_defaults(fn=cmd_add)
     p2 = sub.add_parser("plan")
     p2.add_argument("-n", type=int, default=5)

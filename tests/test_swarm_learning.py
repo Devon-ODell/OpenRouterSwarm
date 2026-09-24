@@ -634,6 +634,27 @@ class GuardTests(SwarmBase):
                 patch.object(swarmd, "free_tool_models", return_value={"a:free": {}}):
             swarmd.preflight(self.cfg(repo, models=["a:free"], test_cmd="true"))
 
+    def test_a_task_can_wait_for_another_named_by_its_title(self):
+        """Later work is queued now but must not start until its foundation is done."""
+        repo, _ = self.repo()
+        c = self.cfg(repo)
+        add = lambda **kw: swarmd.cmd_add(NS(**{"detail": "d", "kind": "feature", "priority": 1,
+                                                "acceptance": None, "depends_on": None, **kw}))
+        with patch.object(swarmd, "_setup", return_value=c), contextlib.redirect_stdout(io.StringIO()):
+            add(title="Paper-trade bots with fees and spread")
+            add(title="Dashboard of every bot", depends_on=["paper-trade bots WITH fees and spread"])
+        q = swarmd.Queue()
+        first, second = (next(t for t in q.pending() if t["title"] == x)
+                         for x in ("Paper-trade bots with fees and spread", "Dashboard of every bot"))
+        self.assertEqual(second["depends_on"], [first["id"]])       # matched by title, case-free
+        self.assertEqual(q.claim()["id"], first["id"])              # the dependent is not ready
+        self.assertIsNone(q.claim())
+        q.release(first["id"], True, "landed")
+        self.assertEqual(q.claim()["id"], second["id"])             # now it is
+        with patch.object(swarmd, "_setup", return_value=c), self.assertRaises(SystemExit) as exc:
+            add(title="Third", depends_on=["a task nobody queued"])
+        self.assertIn("no queued or finished task matches", str(exc.exception))
+
     def test_a_second_daemon_is_told_how_to_stop_the_first(self):
         """"Already running" is useless on its own when the running one has the wrong goal."""
         self.assertEqual(swarmd.holder(), "")                      # nothing running
@@ -656,7 +677,7 @@ class GuardTests(SwarmBase):
         c = self.cfg(repo)
         out = io.StringIO()
         args = NS(title="Enforce TRAIL in the pair backtest", detail="TRAIL is defined but unused.",
-                  kind="bugfix", priority=2,
+                  kind="bugfix", priority=2, depends_on=None,
                   acceptance=["a position closes at the trailing stop when price retraces past it",
                               "a table-driven test covers a retrace that does and does not trigger"])
         with patch.object(swarmd, "_setup", return_value=c), contextlib.redirect_stdout(out):
