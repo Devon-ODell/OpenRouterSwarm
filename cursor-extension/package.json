@@ -1,0 +1,132 @@
+{
+  "name": "openrouterswarm-chat",
+  "displayName": "OpenRouterSwarm Chat",
+  "description": "Sidebar chat against OpenRouter models, sharing the OpenRouterSwarm model roster.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "publisher": "openrouterswarm",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Devon-ODell/OpenRouterSwarm.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "openrouterswarm",
+          "title": "OpenRouterSwarm",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "openrouterswarm": [
+        {
+          "id": "openrouterswarm.chat",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "openrouterswarm.setApiKey",
+        "title": "OpenRouterSwarm: Set API Key"
+      },
+      {
+        "command": "openrouterswarm.clearApiKey",
+        "title": "OpenRouterSwarm: Clear Stored API Key"
+      },
+      {
+        "command": "openrouterswarm.pickModel",
+        "title": "OpenRouterSwarm: Select Model"
+      },
+      {
+        "command": "openrouterswarm.newChat",
+        "title": "OpenRouterSwarm: New Chat",
+        "icon": "$(add)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "openrouterswarm.newChat",
+          "when": "view == openrouterswarm.chat",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "OpenRouterSwarm Chat",
+      "properties": {
+        "openrouterswarm.models": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "inclusionai/ling-3.0-flash-fin:free",
+            "qwen/qwen3.8-27b:free",
+            "nex-agi/nex-n2.5-pro:free",
+            "dots-studio/dots-3-note-preview:free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "poolside/laguna-s-2.1:free",
+            "cohere/north-mini-code:free",
+            "thinkingmachines/inkling:free",
+            "google/gemma-4-31b-it:free"
+          ],
+          "markdownDescription": "Selectable models. Mirrors the `models` array in `swarm/config.json`."
+        },
+        "openrouterswarm.model": {
+          "type": "string",
+          "default": "inclusionai/ling-3.0-flash-fin:free",
+          "description": "Active model."
+        },
+        "openrouterswarm.systemPrompt": {
+          "type": "string",
+          "default": "You are a concise coding assistant embedded in an editor. Prefer short, correct answers and real code over prose.",
+          "description": "System prompt prepended to every conversation."
+        },
+        "openrouterswarm.includeSelection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Attach the active editor selection to your message as context."
+        },
+        "openrouterswarm.temperature": {
+          "type": "number",
+          "default": 0.3,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Sampling temperature."
+        },
+        "openrouterswarm.maxTokens": {
+          "type": "number",
+          "default": 2048,
+          "minimum": 1,
+          "description": "Maximum tokens to generate per reply."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile",
+    "test": "npm run compile && node test/sse.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
