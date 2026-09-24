@@ -518,6 +518,7 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
            "-p", prompt, "-C", str(cwd), "-m", model,
            "--read-only" if role in READ_ONLY_ROLES else "--yolo"]
     cmd = sandboxed(cmd, cwd, c)
+    log(f"{role}: asking {model} (up to {max_steps} rounds; free models take 1-7 min)", worker)
     t0 = time.time()
     # Keep progress/errors separate from the role's machine-readable answer.
     logfile = LOGS / f"{worker}-{role}-{time.time_ns()}.log"
@@ -887,6 +888,20 @@ def sync_trunk(c):
 
 # ------------------------------------------------------------------ worker
 
+def report_progress(workers, said, every=180):
+    """Say that a working worker is alive, and on what. A turn can be silent for minutes —
+    a slow free model, a first `go build` fetching modules — which reads as a freeze."""
+    now = time.time()
+    for w in workers:
+        task, since = getattr(w, "task", None), getattr(w, "started", 0)
+        if not (task and since and w.is_alive()):
+            continue
+        if now - said.get(w.name, since) > every:
+            said[w.name] = now
+            log(f"still on '{task['title'][:60]}' ({(now - since) / 60:.0f}m): "
+                f"{getattr(w, 'doing', '?')}", w.name)
+
+
 class Tally:
     """Finished tasks across workers; sets drain once an optional limit is reached."""
 
@@ -935,6 +950,7 @@ class Worker(threading.Thread):
             self.evidence.record(role, role_calls=self.role_calls, active_model=model)
             self.evidence.write(f"prompt-{self.role_calls:02d}-{role}.txt", prompt)
         c = dict(self.c, study=False) if getattr(self, "mit", None) == "off" else self.c
+        self.doing = f"{role} with {model}"
         editing = role not in READ_ONLY_ROLES and self.wt is not None and Path(cwd) == Path(self.wt)
         before = self.snapshot()[0] if editing else None
         tried = set()
@@ -980,6 +996,7 @@ class Worker(threading.Thread):
 
     def do_task(self, task, goal):
         self.task, self.stage, self.wt = task, "error", None
+        self.doing, self.started = "starting", time.time()
         self.evidence, self.role_calls, self.gate_count = None, 0, 0
         self.mit = None
         count_study(self.name, reset=True)
@@ -1017,6 +1034,7 @@ class Worker(threading.Thread):
     def gate(self, label):
         """Run configured commands and retain supervisor-owned evidence."""
         self.gate_count += 1
+        self.doing = f"running the tests ({label})"
         commands = [self.c["test_cmd"], *self.c.get("validation_commands", [])]
         evidence, passed = [], True
         for i, command in enumerate(commands):
@@ -1810,6 +1828,7 @@ def run_daemon(c, max_tasks=None):
     for w in workers:
         w.start()
     last_plan, last_sync, last_beat, dry_runs, plan_fails = 0.0, time.time(), time.time(), 0, 0
+    said = {}
     try:
         while not stop.is_set():
             if tally.drain.is_set():
@@ -1820,6 +1839,7 @@ def run_daemon(c, max_tasks=None):
             if time.time() - last_sync > 900:
                 last_sync = time.time()
                 sync_usage(account())
+            report_progress(workers, said)
             if time.time() - last_beat > 3600:
                 last_beat = time.time()
                 log(f"heartbeat {json.dumps(budget.snapshot())}")

@@ -632,6 +632,45 @@ class GuardTests(SwarmBase):
                 patch.object(swarmd, "free_tool_models", return_value={"a:free": {}}):
             swarmd.preflight(self.cfg(repo, models=["a:free"], test_cmd="true"))
 
+    def test_a_long_turn_reports_which_model_it_is_waiting_on(self):
+        """Minutes of silence during a turn read as a freeze, so each turn announces itself."""
+        lines = []
+        budget = Mock(cap=10, reserve=1)
+        budget.check.return_value = (True, 0, "ok")
+        p = Mock(returncode=0)
+        p.communicate.return_value = ("answer", None)
+
+        class Fake:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return p
+
+            def __exit__(self, *a):
+                return False
+        with patch.object(swarmd, "process", Fake), \
+                patch.object(swarmd, "log", side_effect=lambda m, *a: lines.append(m)):
+            swarmd.flint("x", self.root, {"python": "python3"}, "implementer", "w0", budget, 25, "a:free")
+        self.assertIn("implementer: asking a:free (up to 25 rounds", lines[0])
+
+    def test_a_working_worker_is_reported_alive_with_what_it_is_doing(self):
+        w = self.worker(self.cfg(self.root))
+        w.task, w.started, w.doing = {"title": "Ingest Binance order books"}, time.time() - 600, "implementer with a:free"
+        idle = self.worker(self.cfg(self.root))          # claimed nothing: nothing to report
+        idle.name, idle.task, idle.started = "w1", None, 0
+        said, lines = {}, []
+        with patch.object(swarmd, "log", side_effect=lambda m, *a: lines.append(m)), \
+                patch.object(type(w), "is_alive", lambda self: True):
+            swarmd.report_progress([w, idle], said)
+            swarmd.report_progress([w, idle], said)       # again inside the interval: stays quiet
+        self.assertEqual(len(lines), 1)
+        self.assertIn("still on 'Ingest Binance order books' (10m): implementer with a:free", lines[0])
+        with patch.object(swarmd, "log", side_effect=lambda m, *a: lines.append(m)), \
+                patch.object(type(w), "is_alive", lambda self: True):
+            swarmd.report_progress([w], said, every=0)     # once the interval passes, again
+        self.assertEqual(len(lines), 2)
+
     def test_the_runner_up_test_command_is_offered_when_the_first_fails(self):
         """A Go service with Python beside it: the wrong guess must name the right one."""
         repo, _ = self.repo()
