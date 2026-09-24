@@ -1,4 +1,6 @@
 """Offline tests for the self-reinforcing swarm: temporary repos, no real API calls."""
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -14,7 +16,7 @@ import uuid
 from unittest.mock import Mock, patch
 
 import flint
-from swarm import learn, sandbox, swarmd
+from swarm import learn, sandbox, swarmd, workflow
 from swarm.learn import is_breakthrough, novelty, parse_scores, reward
 
 
@@ -631,6 +633,32 @@ class GuardTests(SwarmBase):
         with patch.object(swarmd, "account", return_value=None), \
                 patch.object(swarmd, "free_tool_models", return_value={"a:free": {}}):
             swarmd.preflight(self.cfg(repo, models=["a:free"], test_cmd="true"))
+
+    def test_added_tasks_carry_each_acceptance_criterion_separately(self):
+        """The reviewer checks criteria one by one, so one blob is worth less than a list."""
+        repo, _ = self.repo()
+        c = self.cfg(repo)
+        out = io.StringIO()
+        args = NS(title="Enforce TRAIL in the pair backtest", detail="TRAIL is defined but unused.",
+                  kind="bugfix", priority=2,
+                  acceptance=["a position closes at the trailing stop when price retraces past it",
+                              "a table-driven test covers a retrace that does and does not trigger"])
+        with patch.object(swarmd, "_setup", return_value=c), contextlib.redirect_stdout(out):
+            swarmd.cmd_add(args)
+        task = swarmd.Queue().pending()[0]
+        self.assertEqual([r["id"] for r in workflow.criteria(task)], ["C1", "C2"])
+        self.assertIn("closes at the trailing stop", workflow.criteria(task)[0]["text"])
+        self.assertEqual(task["priority"], 2)
+        self.assertIn("C2", out.getvalue())
+        # Without any, the detail stands as the single criterion, as before.
+        with patch.object(swarmd, "_setup", return_value=c), contextlib.redirect_stdout(io.StringIO()):
+            swarmd.cmd_add(NS(**{**vars(args), "title": "Another", "acceptance": None}))
+        other = next(t for t in swarmd.Queue().pending() if t["title"] == "Another")
+        self.assertEqual(workflow.criteria(other)[0]["text"], "TRAIL is defined but unused.")
+        # A duplicate title is refused loudly rather than silently dropped.
+        with patch.object(swarmd, "_setup", return_value=c), self.assertRaises(SystemExit) as exc:
+            swarmd.cmd_add(args)
+        self.assertIn("already tried", str(exc.exception))
 
     def test_a_long_turn_reports_which_model_it_is_waiting_on(self):
         """Minutes of silence during a turn read as a freeze, so each turn announces itself."""

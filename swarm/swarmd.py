@@ -33,7 +33,7 @@ from budget import Budget               # noqa: E402
 from learn import (Ledger, format_playbook, is_breakthrough, json_array,  # noqa: E402
                    novelty, parse_scores, reward, weight, defect, exhibit,
                    FAULTY, CRIME, BREAKTHROUGH_WEIGHT, PENALTY_WEIGHT)
-from workflow import Attempt, STRATEGIES, REVIEW, REPAIR, contract, criteria, parse_review, failure_signature
+from workflow import Attempt, STRATEGIES, REVIEW, REPAIR, contract, criteria, parse_review, failure_signature  # noqa: E501
 import sandbox                          # noqa: E402
 
 CONFIG = Path(os.environ.get("FLINT_SWARM_CONFIG") or HERE / "config.json").expanduser()
@@ -2014,9 +2014,18 @@ def cmd_report(a):
 
 
 def cmd_add(a):
-    _setup()
-    t = Queue().add(a.title, a.detail or "", a.kind, priority=a.priority, origin="human")
-    print(f"queued {t['id']}" if t else "duplicate — not queued")
+    c = _setup()
+    try:
+        t = Queue(c.get("max_depth", 1), c.get("max_queue", 20)).add(
+            a.title, a.detail or "", a.kind, priority=a.priority, origin="human",
+            acceptance=a.acceptance or None)
+    except ValueError as e:
+        sys.exit(f"not queued: {e}")
+    if not t:
+        sys.exit("not queued: that title was already tried, or the queue is full")
+    print(f"queued {t['id']}: {t['title']}")
+    for row in criteria(t):
+        print(f"  {row['id']} {row['text'][:150]}")
 
 
 def cmd_plan(a):
@@ -2078,6 +2087,8 @@ def main():
     p.add_argument("--detail", default="")
     p.add_argument("--kind", default="feature")
     p.add_argument("--priority", type=int, default=1, help="hand-added tasks jump the queue (default 1)")
+    p.add_argument("--acceptance", action="append", metavar="TEXT",
+                   help="one thing the reviewer must verify; repeat for each (default: the detail)")
     p.set_defaults(fn=cmd_add)
     p2 = sub.add_parser("plan")
     p2.add_argument("-n", type=int, default=5)
