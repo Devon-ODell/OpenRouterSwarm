@@ -1636,6 +1636,28 @@ def configure(repo, test_cmd=None):
     log(f"target {repo} on {c['base_branch']}; tests: {c['test_cmd']}")
 
 
+def why_unrunnable(cmd):
+    """Why a test command could not run at all, as a line to append to an error, or "".
+
+    Judged from the command itself: its output only says "not found", which is equally true of
+    a missing interpreter and of prose passed by mistake. Only a single program can be checked,
+    so a compound shell command is left alone."""
+    if re.search(r"[|&;<>()`]|\$\(", cmd):
+        return ""
+    try:
+        first = shlex.split(cmd)[0]
+    except (ValueError, IndexError):
+        return ""
+    if shutil.which(first):
+        return ""
+    if not re.fullmatch(r"[\w.+-]+(/[\w.+-]+)*", first):
+        return ("\n  --test-cmd takes a shell command that runs the tests, not a description of "
+                "the work; the goal goes in --goal.")
+    instead = {"python": "python3", "pip": "pip3"}.get(first)
+    return (f"\n  `{first}` is not installed or not on PATH"
+            + (f" — macOS ships `{instead}`, not `{first}`." if instead else "."))
+
+
 def preflight(c):
     """Fail fast, before spending requests, on anything that would waste the night."""
     paid = [m for m in (c.get("models") or [c.get("model")]) if m and not m.endswith(":free")]
@@ -1675,8 +1697,10 @@ def preflight(c):
     gone = embedded_repos(c["repo"])
     if gone:
         blind = [n for n in gone if re.search(rf"(^|[^\w-]){re.escape(n)}([^\w-]|$)", c["test_cmd"])]
-        log(f"NOTE: {', '.join(gone)} — own Git repositories, so their code is absent from every "
-            f"worktree the swarm builds; it cannot read or change them from here")
+        for name in gone:
+            log(f"NOTE: {name}/ is a Git repository of its own, so its code is absent from every "
+                f"worktree the swarm builds and cannot be read or changed from here. To work on "
+                f"it: swarm grind {shlex.quote(str(Path(c['repo']) / name))}")
         if blind:
             sys.exit(f"the test command works inside {', '.join(blind)}, which is a separate Git "
                      f"repository: the swarm's worktrees do not contain that code, so every task "
@@ -1688,12 +1712,9 @@ def preflight(c):
         view = refresh_view(c)
         ok, output = run_gate(view, c)
     if not ok:
-        hint = ""
-        if re.search(r"(command not found|not found|No such file or directory)", output):
-            hint = ("\n  --test-cmd takes a shell command that runs the tests, not a description "
-                    "of the work; the goal goes in --goal.")
         sys.exit(f"`{c['test_cmd']}` fails on {trunk_name(c)} before any work, so every task "
-                 f"would be rejected. Fix the tests or pass --test-cmd.{hint}\n{output[-1500:]}")
+                 f"would be rejected. Fix the tests or pass --test-cmd.{why_unrunnable(c['test_cmd'])}"
+                 f"\n{output[-1500:]}")
     log(f"baseline green on {trunk_name(c)}")
 
 
@@ -1886,7 +1907,11 @@ def cmd_grind(a):
     elif a.test_cmd:
         configure(load_cfg().get("repo", "."), a.test_cmd)
     c = _setup(a)
-    if a.goal:
+    if a.goal and re.fullmatch(r"(?:read|use|see|follow|from)?\s*\.?/?GOAL\.md\.?", a.goal.strip(), re.I):
+        # They mean the file. Any goal kept from an earlier run would shadow it.
+        (STATE / "GOAL.md").unlink(missing_ok=True)
+        log(f"--goal names the goal file; reading {Path(c['repo']) / c.get('goal_file', 'GOAL.md')}")
+    elif a.goal:
         (STATE / "GOAL.md").write_text(a.goal.strip() + "\n")
     log(f"goal: {read_goal(c)[:200]}")
     start(c, hours=a.hours, max_tasks=a.max_tasks, awake=True)

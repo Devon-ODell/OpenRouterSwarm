@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from types import SimpleNamespace as NS
 import unittest
 import uuid
 from unittest.mock import Mock, patch
@@ -630,6 +631,51 @@ class GuardTests(SwarmBase):
         with patch.object(swarmd, "account", return_value=None), \
                 patch.object(swarmd, "free_tool_models", return_value={"a:free": {}}):
             swarmd.preflight(self.cfg(repo, models=["a:free"], test_cmd="true"))
+
+    def test_an_unrunnable_test_command_is_diagnosed_from_the_command(self):
+        """Output only ever says "not found": the command itself says which problem it is."""
+        installed = {"python3", "go", "true", "echo"}          # a Mac: python3, no python
+        with patch.object(swarmd.shutil, "which", lambda c: c if c in installed else None):
+            self.assertIn("macOS ships `python3`", swarmd.why_unrunnable("python -m pytest -q"))
+            self.assertIn("not a description of the work",
+                          swarmd.why_unrunnable("hello! I want you guys to update this extension"))
+            self.assertIn("not installed or not on PATH", swarmd.why_unrunnable("nosuchtool --run"))
+            self.assertEqual(swarmd.why_unrunnable("python3 -m pytest -q"), "")   # runnable
+            self.assertEqual(swarmd.why_unrunnable("cd x && go test ./..."), "")  # compound: no guess
+            self.assertEqual(swarmd.why_unrunnable(""), "")
+            self.assertEqual(swarmd.why_unrunnable("echo 'unbalanced"), "")
+
+    def test_goal_naming_the_goal_file_reads_the_file(self):
+        repo, _ = self.repo()
+        (repo / "GOAL.md").write_text("# Goal\n\nA triangular-arbitrage scanner.\n")
+        (swarmd.STATE / "GOAL.md").write_text("a goal from an earlier run\n")
+        c = self.cfg(repo)
+        args = NS(repo=str(repo), goal="read GOAL.md", new=None, test_cmd="true",
+                  hours=None, workers=None, max_tasks=0)
+        with patch.object(swarmd, "configure"), patch.object(swarmd, "_setup", return_value=c), \
+                patch.object(swarmd, "start"):
+            swarmd.cmd_grind(args)
+        self.assertFalse((swarmd.STATE / "GOAL.md").exists())   # the stale goal cannot shadow it
+        self.assertIn("triangular-arbitrage scanner", swarmd.read_goal(c))
+        # An actual goal is still stored and still wins.
+        with patch.object(swarmd, "configure"), patch.object(swarmd, "_setup", return_value=c), \
+                patch.object(swarmd, "start"):
+            swarmd.cmd_grind(NS(**{**vars(args), "goal": "Build the ingest layer"}))
+        self.assertEqual(swarmd.read_goal(c), "Build the ingest layer")
+
+    def test_an_embedded_repo_note_says_how_to_work_on_it(self):
+        repo, _ = self.repo()
+        inner = repo / "kraken-bot-trainingGrounds"
+        inner.mkdir()
+        subprocess.run(["git", "-C", str(inner), "init", "-q", "-b", "main"], check=True)
+        lines = []
+        with patch.object(swarmd, "log", side_effect=lambda m, *a: lines.append(m)), \
+                patch.object(swarmd, "account", return_value=None), \
+                patch.object(swarmd, "free_tool_models", return_value={"a:free": {}}):
+            swarmd.preflight(self.cfg(repo, models=["a:free"], test_cmd="true"))
+        note = next(l for l in lines if l.startswith("NOTE:"))
+        self.assertIn(f"swarm grind {inner}", note)          # the remedy, not just the diagnosis
+        self.assertIn("is a Git repository of its own", note)
 
     def test_a_model_this_key_cannot_use_is_dropped_not_rested_and_retried(self):
         """403 "only available on agentic harnesses" is permanent: no penalty, no redraw."""
