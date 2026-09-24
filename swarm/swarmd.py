@@ -1784,13 +1784,21 @@ def keep_awake():
 
 # ------------------------------------------------------------------ daemon
 
-def holder():
-    """Who holds this repository's daemon lock, and how to stop it. The note is only written
-    by a daemon that holds the lock, so a dead process's note is ignored."""
+def daemon_note():
+    """The record a running daemon leaves while it holds this repository's lock, or None.
+    A note left behind by a process that is gone is ignored."""
     try:
         d = json.loads((STATE / "daemon.pid").read_text())
         os.kill(int(d["pid"]), 0)
+        return d
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def holder():
+    """How to watch or stop the daemon already running here."""
+    d = daemon_note()
+    if not d:
         return ""
     return (f"\n  It started at {dt.datetime.fromtimestamp(d['started']):%H:%M:%S} with the goal: "
             f"{str(d.get('goal', ''))[:120]}\n"
@@ -2008,8 +2016,13 @@ def cmd_status(a):
     pend = q.pending()
     done = _read(q.done)
     _, ahead = git(["rev-list", "--count", f"{c.get('base_branch', 'main')}..{trunk_name(c)}"], cwd=c["repo"])
+    note = daemon_note()
     print(json.dumps({
         "repo": c["repo"], "trunk": trunk_name(c), "trunk_ahead": ahead,
+        "daemon": {"running": bool(note),
+                   "pid": note and note.get("pid"),
+                   "since": note and dt.datetime.fromtimestamp(note["started"]).isoformat(timespec="seconds"),
+                   "goal": note and str(note.get("goal", ""))[:200]},
         "budget": snap,
         "pacing": {"allowed_now": ok, "wait_s": round(wait), "reason": why},
         "queue": {"pending": len(pend),

@@ -639,6 +639,7 @@ class GuardTests(SwarmBase):
         self.assertEqual(swarmd.holder(), "")                      # nothing running
         (swarmd.STATE / "daemon.pid").write_text(json.dumps(
             {"pid": os.getpid(), "started": time.time(), "goal": "read and execute GOAL.md"}))
+        self.assertEqual(swarmd.daemon_note()["pid"], os.getpid())
         told = swarmd.holder()
         self.assertIn(f"kill -INT {os.getpid()}", told)
         self.assertIn("read and execute GOAL.md", told)            # the goal it is stuck on
@@ -647,6 +648,7 @@ class GuardTests(SwarmBase):
         self.assertEqual(swarmd.holder(), "")                      # a dead pid says nothing
         (swarmd.STATE / "daemon.pid").write_text("not json")
         self.assertEqual(swarmd.holder(), "")
+        self.assertIsNone(swarmd.daemon_note())
 
     def test_added_tasks_carry_each_acceptance_criterion_separately(self):
         """The reviewer checks criteria one by one, so one blob is worth less than a list."""
