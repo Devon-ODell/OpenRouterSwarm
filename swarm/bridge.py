@@ -214,7 +214,8 @@ def run_flint(prompt, repo, model, steps, study=True, timeout=420, on_progress=N
         return {"ok": True, "text": out.strip(), **base}
     reason = {3: "daily free-request cap reached", 4: "credit or account limit", 5: "ran out of steps",
               6: "budget pause", 7: "provider unavailable",
-              8: "model busy (rate-limited upstream)"}.get(p.returncode, "failed")
+              8: "model busy (rate-limited upstream)",
+              9: "model not available to this API key"}.get(p.returncode, "failed")
     tail = "\n".join((err or "").strip().splitlines()[-3:])
     return {"ok": False, "error": f"{reason}: {tail[-400:]}", **base}
 
@@ -262,8 +263,8 @@ def cmd_ask(a):
             r = {"ok": False, "model": model, "error": f"{type(e).__name__}: {e}"}
         if r["ok"]:
             ledger.warm(model)
-        elif r.get("exit") in (7, 8):
-            ledger.cool(model, r["error"], busy=r.get("exit") == 8)
+        elif r.get("exit") in (7, 8, 9):
+            ledger.cool(model, r["error"], busy=r.get("exit") == 8, permanent=r.get("exit") == 9)
         results.append(r)
         emit({"event": "answer" if r["ok"] else "error", **r})
 

@@ -339,6 +339,11 @@ class ProviderBusy(ProviderUnavailable):
     """The model works but is rate-limited upstream (429): try another model, or this one shortly."""
 
 
+class ModelUnavailable(ProviderUnavailable):
+    """This key cannot use this model at all (403 forbidden, 404 no such model/endpoint).
+    Waiting will not help: the model has to be replaced in the pool."""
+
+
 def _next_utc_midnight():
     now = datetime.datetime.now(datetime.timezone.utc)
     return (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0,
@@ -581,8 +586,12 @@ class Agent:
                     continue
                 if str(code) == "402":
                     raise OutOfCredits("OpenRouter returned 402: insufficient credits or account limit reached.") from e
-                if str(code) == "404":
-                    raise ProviderUnavailable(f"{self.model}: model or endpoint not available (404): {e}") from e
+                # 403/404 are permanent for this key: the model is gated (e.g. "only available on
+                # agentic harnesses"), renamed or gone. Retrying only spends the daily allowance.
+                if str(code) in ("403", "404"):
+                    detail = str(_error_parts(e)[0].get("message") or e)
+                    raise ModelUnavailable(f"{self.model} is not available to this API key "
+                                           f"({code}): {detail[:300]}") from e
                 if not isinstance(e, RateLimitError) and str(code) != "429":
                     raise
                 kind, reset_at, msg = classify_429(e)
@@ -1015,6 +1024,9 @@ def main():
         except OutOfCredits as e:
             print(f"flint: {e}", file=sys.stderr)
             sys.exit(4)
+        except ModelUnavailable as e:
+            print(f"flint: model unavailable: {e}", file=sys.stderr)
+            sys.exit(9)  # permanent for this key: the swarm drops the model rather than waiting
         except ProviderBusy as e:
             print(f"flint: model busy: {e}", file=sys.stderr)
             sys.exit(8)  # rate-limited upstream: the swarm hands the role to another model

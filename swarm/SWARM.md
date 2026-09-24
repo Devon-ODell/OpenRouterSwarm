@@ -103,8 +103,11 @@ role that edits files is handed over only while it has changed nothing;
 reviewers and judges are never the implementer. Handoffs are `handoff` rows in
 `journal.jsonl`, and the model that actually answered gets the credit.
 
-A model that is **down** (404, repeated 5xx or dropped streams; exit 7) rests
-30 minutes, doubling up to 12 hours. Neither lowers its score. Rests are saved
+A model this key cannot use at all (403 "only available on agentic harnesses",
+404 no such model; exit 9) is dropped for the run and named in the log: waiting
+would not bring it back, so remove it from the pool. A model that is **down**
+(repeated 5xx or dropped streams; exit 7) rests 30 minutes, doubling up to 12
+hours. Neither lowers its score. Rests are saved
 in `learn.json`, so they survive restarts: startup lists resting models,
 `swarm status` shows them under `resting`, strikes older than 12 hours are
 forgotten, and `swarm wake` ends every rest now. When every model is resting,
@@ -199,7 +202,13 @@ Per target repository: `swarm/state/<repo>-<hash>/` holds the queue, journal,
 
 Exit codes from flint turns: 1 error, 3 provider daily cap, 4 credit/account
 limit, 5 step limit, 6 local budget pause, 7 provider unavailable, 8 model busy
-(rate-limited upstream), 130 Ctrl-C.
+(rate-limited upstream), 9 model not available to this key, 130 Ctrl-C.
+
+The target must be the repository that actually holds the code. A folder that
+merely contains projects is searched one level down for a single testable
+project; a project with its own `.git` is refused, because Git keeps an
+embedded repository's files out of its parent, so the swarm's worktrees would
+be empty where that code should be.
 
 ```sh
 .venv/bin/python -m unittest discover -s tests -v

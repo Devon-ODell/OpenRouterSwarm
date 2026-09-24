@@ -151,6 +151,28 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(kind, "provider")
         self.assertIn("50 requests per day", msg)
 
+    def test_a_gated_model_is_not_retried_and_exits_9(self):
+        """thinkingmachines/inkling:free: 403 "only available on agentic harnesses"."""
+        a = agent()
+        body = {"message": "thinkingmachines/inkling:free is only available on agentic harnesses.",
+                "code": 403, "metadata": {"routing_funnel": []}}
+        a._stream_once = Mock(side_effect=flint.APIError("Error code: 403", request=Mock(), body=body))
+        with patch.object(flint.time, "sleep") as sleep:
+            with self.assertRaises(flint.ModelUnavailable) as caught:
+                a.complete()
+        self.assertEqual(a._stream_once.call_count, 1)   # retrying spends the daily allowance
+        sleep.assert_not_called()
+        self.assertIn("only available on agentic harnesses", str(caught.exception))
+
+    def test_gated_model_exits_9(self):
+        a = agent()
+        a.turn = Mock(side_effect=flint.ModelUnavailable("gated"))
+        with patch.object(flint, "Agent", return_value=a), patch.object(sys, "argv", ["flint", "-p", "t"]), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as exc:
+                flint.main()
+        self.assertEqual(exc.exception.code, 9)
+
     def test_busy_model_exits_8(self):
         a = agent()
         a.turn = Mock(side_effect=flint.ProviderBusy("rate-limited upstream"))

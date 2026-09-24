@@ -568,7 +568,8 @@ class GuardTests(SwarmBase):
     def test_role_exit_codes_map_to_swarm_exceptions(self):
         budget = Mock(cap=10, reserve=1)
         budget.check.return_value = (True, 0, "ok")
-        for rc, exc in ((7, swarmd.ProviderDown), (8, swarmd.ProviderBusy), (5, swarmd.StepLimit),
+        for rc, exc in ((7, swarmd.ProviderDown), (8, swarmd.ProviderBusy), (9, swarmd.ModelGone),
+                        (5, swarmd.StepLimit),
                         (1, swarmd.ModelError), (3, swarmd.CapReached), (4, swarmd.NoCredits)):
             p = Mock(returncode=rc)
             p.communicate.return_value = ("", None)
@@ -584,6 +585,78 @@ class GuardTests(SwarmBase):
                     return False
             with self.subTest(rc=rc), patch.object(swarmd, "process", Fake), self.assertRaises(exc):
                 swarmd.flint("x", self.root, {"python": "python3"}, "implementer", "w0", budget, 1, "a:free")
+
+    def test_a_folder_of_projects_is_tested_one_level_down(self):
+        """The layout that stopped a real run: an umbrella folder holding several projects."""
+        repo = self.root / "hedge-fund"
+        (repo / "kraken-bot-trainingGrounds").mkdir(parents=True)
+        (repo / "kraken-bot-trainingGrounds" / "go.mod").write_text("module x\n")
+        (repo / "condor").mkdir()                               # empty: not a project
+        (repo / "kraken-agent-files" / "signalman").mkdir(parents=True)
+        (repo / "kraken-agent-files" / "signalman" / "go.mod").write_text("module y\n")   # too deep
+        self.assertEqual(swarmd.detect_test_cmd(repo), "cd kraken-bot-trainingGrounds && go test ./...")
+        # A second project one level down is ambiguous: the owner picks, and is shown the options.
+        (repo / "condor" / "go.mod").write_text("module z\n")
+        self.assertIsNone(swarmd.detect_test_cmd(repo))
+        hint = swarmd.test_cmd_hint(repo)
+        self.assertIn("--test-cmd 'cd condor && go test ./...'", hint)
+        self.assertIn("--test-cmd 'cd kraken-bot-trainingGrounds && go test ./...'", hint)
+        # A directory whose name needs quoting stays a single shell word.
+        plain = self.root / "plain"
+        (plain / "my app").mkdir(parents=True)
+        (plain / "my app" / "go.mod").write_text("module w\n")
+        self.assertEqual(swarmd.detect_test_cmd(plain), "cd 'my app' && go test ./...")
+        self.assertIn("Nothing recognisable to test", swarmd.test_cmd_hint(self.root / "nope"))
+
+    def test_a_project_in_its_own_git_repo_is_never_silently_tested(self):
+        """An embedded repository's files are absent from the parent's worktrees."""
+        repo, git = self.repo()
+        inner = repo / "kraken-bot-trainingGrounds"
+        inner.mkdir()
+        (inner / "go.mod").write_text("module x\n")
+        subprocess.run(["git", "-C", str(inner), "init", "-q", "-b", "main"], check=True)
+        self.assertEqual(swarmd.embedded_repos(repo), ["kraken-bot-trainingGrounds"])
+        self.assertIsNone(swarmd.detect_test_cmd(repo))          # not offered as the one project
+        hint = swarmd.test_cmd_hint(repo)
+        self.assertIn("its own Git repository", hint)
+        self.assertIn(f"swarm grind {inner}", hint)
+        c = self.cfg(repo, models=["a:free"], test_cmd="cd kraken-bot-trainingGrounds && go test ./...")
+        with patch.object(swarmd, "account", return_value=None), \
+                patch.object(swarmd, "free_tool_models", return_value={"a:free": {}}):
+            with self.assertRaises(SystemExit) as exc:
+                swarmd.preflight(c)
+        self.assertIn("separate Git repository", str(exc.exception))
+        # A test command that stays out of it runs as usual.
+        with patch.object(swarmd, "account", return_value=None), \
+                patch.object(swarmd, "free_tool_models", return_value={"a:free": {}}):
+            swarmd.preflight(self.cfg(repo, models=["a:free"], test_cmd="true"))
+
+    def test_a_model_this_key_cannot_use_is_dropped_not_rested_and_retried(self):
+        """403 "only available on agentic harnesses" is permanent: no penalty, no redraw."""
+        repo, _ = self.repo()
+        calls = []
+
+        def fake(prompt, cwd, c, role, worker, budget, steps, model):
+            calls.append(model)
+            if model == "gated:free":
+                raise swarmd.ModelGone(model, "flint: model unavailable: gated:free is not "
+                                              "available to this API key (403): agentic harnesses only")
+            if role == "implementer":
+                (cwd / "app.txt").write_text("change\n")
+                return "done"
+            return review(prompt) if role == "adversary" else "{}"
+        c = self.cfg(repo, models=["gated:free", "good:free", "other:free"])
+        w = self.worker(c)
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task({"id": "t1", "title": "x", "detail": ""}, "goal")
+        self.assertTrue(ok, note)
+        snap = w.ledger.snapshot()
+        self.assertTrue(snap["cooldown"]["gated:free"]["permanent"])
+        self.assertNotIn("gated:free", snap["arms"].get("implementer", {}))   # never scored
+        self.assertLessEqual(calls.count("gated:free"), 1)   # drawn once, then never again
+        self.assertIsNone(w.ledger.pick("implementer", ["gated:free"]))
+        # The log tells the owner what to do rather than promising it will come back.
+        self.assertIn("Remove it from", swarmd.rest(w.ledger, swarmd.ModelGone("gated:free", "403")))
 
     def test_detect_test_cmd(self):
         cases = [({"go.mod": ""}, "go test ./..."),

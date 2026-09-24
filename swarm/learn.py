@@ -294,19 +294,24 @@ class Ledger:
             s["total"] += r
             s["last"] = time.time()
 
-    def cool(self, model, reason="", busy=False):
+    def cool(self, model, reason="", busy=False, permanent=False):
         """Rest a model whose provider is failing. Not a quality judgement.
 
         busy: rate-limited upstream, which clears in minutes; it rests the model briefly and
-        leaves its outage strikes alone. Failures older than COOLDOWN_MAX (e.g. from an earlier
-        run, since the ledger persists) are forgotten rather than escalating a new rest."""
+        leaves its outage strikes alone. permanent: this key cannot use the model at all, so it
+        rests for the maximum instead of being redrawn every half hour. Failures older than
+        COOLDOWN_MAX (e.g. from an earlier run, since the ledger persists) are forgotten rather
+        than escalating a new rest."""
         now = time.time()
         with self.txn() as d:
             c = d["cooldown"].setdefault(model, {"strikes": 0})
             if now - c.get("last", c.get("until", 0)) > COOLDOWN_MAX:
                 c["strikes"], c["busy"] = 0, 0
             c["last"] = now
-            if busy:
+            if permanent:
+                c["permanent"] = True
+                rest = COOLDOWN_MAX
+            elif busy:
                 c["busy"] = c.get("busy", 0) + 1
                 rest = min(BUSY_MAX, BUSY_COOLDOWN * 2 ** (c["busy"] - 1))
             else:

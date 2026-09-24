@@ -19,7 +19,7 @@ The supervisor never merges into your checkout: accepted work accumulates on
 merge what you want. Agents and tests run in a write-restricting macOS
 sandbox; it contains accidents, not a determined attacker.
 """
-import argparse, datetime as dt, fcntl, hashlib, json, os, random, re, shutil, signal
+import argparse, datetime as dt, fcntl, hashlib, json, os, random, re, shlex, shutil, signal
 import subprocess, sys, threading, time, traceback, uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -451,11 +451,19 @@ class ProviderBusy(ProviderDown):
     """The model is rate-limited upstream: it works, but another model should take this turn."""
 
 
+class ModelGone(ProviderDown):
+    """This API key cannot use the model at all (403/404). Waiting will not bring it back."""
+
+
 def rest(ledger, e):
     """Rest the model behind a ProviderDown; returns a phrase for the log."""
-    busy = isinstance(e, ProviderBusy)
-    lines = str(e).strip().splitlines()
-    until = ledger.cool(e.model, lines[-1] if lines else "", busy=busy)
+    busy, gone = isinstance(e, ProviderBusy), isinstance(e, ModelGone)
+    lines = [l for l in str(e).strip().splitlines() if l.strip()]
+    why = lines[-1] if lines else ""
+    until = ledger.cool(e.model, why, busy=busy, permanent=gone)
+    if gone:
+        return (f"{e.model} is not available to this API key — dropping it for this run. "
+                f"Remove it from {CONFIG} (`swarm models --write` rewrites the pool): {why[:200]}")
     return (f"{e.model} {'is busy (rate-limited upstream)' if busy else 'is unavailable'}; "
             f"resting it until {dt.datetime.fromtimestamp(until):%H:%M:%S}")
 
@@ -532,6 +540,8 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         raise ProviderDown(model, error)
     if p.returncode == 8:
         raise ProviderBusy(model, error)
+    if p.returncode == 9:
+        raise ModelGone(model, error)
     if p.returncode != 0:
         raise ModelError(f"{role} turn failed (rc={p.returncode}); log: {logfile}\n{error}")
     return out.strip()
@@ -1495,6 +1505,66 @@ def free_tool_models():
 # ------------------------------------------------------------------ setup
 
 def detect_test_cmd(repo):
+    """How to test this repository, or None. A folder that only holds projects (no manifest of
+    its own) is searched one level down: a single project there is used, several are ambiguous
+    and left to the owner, since testing the wrong one would reject every task."""
+    repo = Path(repo)
+    cmd = project_test_cmd(repo)
+    if cmd:
+        return cmd
+    found = sub_projects(repo)
+    if len(found) == 1:
+        name, cmd = found[0]
+        log(f"no project at the top level; testing the only one inside it: {name}")
+        return f"cd {shlex.quote(name)} && {cmd}"
+    return None
+
+
+def embedded_repos(repo):
+    """Directories one level inside repo that are Git repositories of their own.
+
+    Git never stores an embedded repository's files in its parent, so those directories come
+    out EMPTY in every worktree the swarm builds. The swarm cannot read or change that code
+    from here: it has to be pointed at the inner repository instead."""
+    return [d.name for d in _subdirs(repo) if (d / ".git").exists()]
+
+
+def _subdirs(repo):
+    try:
+        return sorted(d for d in Path(repo).iterdir() if d.is_dir() and not d.name.startswith("."))
+    except OSError:
+        return []
+
+
+def sub_projects(repo):
+    """[(directory name, its test command)] for projects one level inside repo, skipping
+    embedded repositories, whose code a worktree of this repository would not contain."""
+    gone = set(embedded_repos(repo))
+    return [(d.name, cmd) for d in _subdirs(repo) if d.name not in gone
+            for cmd in [project_test_cmd(d)] if cmd]
+
+
+def test_cmd_hint(repo):
+    """What to tell someone whose repository the swarm cannot test by itself."""
+    repo, lines = Path(repo), []
+    for name in embedded_repos(repo):
+        lines += [f"  {name}/ is its own Git repository, so its code is not part of {repo.name} "
+                  f"and never appears in the swarm's worktrees.",
+                  f"  Point the swarm at it directly:",
+                  f"    swarm grind {shlex.quote(str(repo / name))} --goal '...'"]
+    found = sub_projects(repo)
+    if found:
+        lines.append("  Projects inside it, and how each would be tested:")
+        lines += [f"    --test-cmd 'cd {shlex.quote(n)} && {c}'" for n, c in found]
+        lines.append("  Point the swarm at one of those directories instead, or pass one of the above.")
+    if not lines:
+        lines = ["  Nothing recognisable to test (no go.mod, package.json, pyproject.toml, "
+                 "Cargo.toml or Makefile test target).",
+                 "  Pass the command you run yourself, e.g. --test-cmd 'go test ./...'"]
+    return "\n".join(lines)
+
+
+def project_test_cmd(repo):
     repo = Path(repo)
     if (repo / "go.mod").exists():
         return "go test ./..."
@@ -1560,7 +1630,7 @@ def configure(repo, test_cmd=None):
     c["python"] = python_for(c)
     save_cfg(c)
     if c["test_cmd"].startswith("__"):
-        sys.exit(f"could not detect how to test {repo}; pass --test-cmd 'your test command'")
+        sys.exit(f"could not detect how to test {repo}.\n{test_cmd_hint(repo)}")
     log(f"target {repo} on {c['base_branch']}; tests: {c['test_cmd']}")
 
 
@@ -1600,14 +1670,28 @@ def preflight(c):
     if corpus.is_file():
         from corpus_index import stats
         log(f"study corpus: {stats(corpus)['chunks']} chunks")
+    gone = embedded_repos(c["repo"])
+    if gone:
+        blind = [n for n in gone if re.search(rf"(^|[^\w-]){re.escape(n)}([^\w-]|$)", c["test_cmd"])]
+        log(f"NOTE: {', '.join(gone)} — own Git repositories, so their code is absent from every "
+            f"worktree the swarm builds; it cannot read or change them from here")
+        if blind:
+            sys.exit(f"the test command works inside {', '.join(blind)}, which is a separate Git "
+                     f"repository: the swarm's worktrees do not contain that code, so every task "
+                     f"would fail.\n  Point the swarm at it instead:\n"
+                     f"    swarm grind {shlex.quote(str(Path(c['repo']) / blind[0]))} --goal '...'")
     ensure_trunk(c)
     sync_trunk(c)
     with _view_lock:
         view = refresh_view(c)
         ok, output = run_gate(view, c)
     if not ok:
+        hint = ""
+        if re.search(r"(command not found|not found|No such file or directory)", output):
+            hint = ("\n  --test-cmd takes a shell command that runs the tests, not a description "
+                    "of the work; the goal goes in --goal.")
         sys.exit(f"`{c['test_cmd']}` fails on {trunk_name(c)} before any work, so every task "
-                 f"would be rejected. Fix the tests or pass --test-cmd.\n{output[-1500:]}")
+                 f"would be rejected. Fix the tests or pass --test-cmd.{hint}\n{output[-1500:]}")
     log(f"baseline green on {trunk_name(c)}")
 
 
