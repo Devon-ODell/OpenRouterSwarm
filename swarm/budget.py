@@ -95,6 +95,18 @@ class Budget:
 
         return True, 0, f"within budget ({spent}/{usable}, {self.reserve} reserved)"
 
+    def paid_would_help(self, state=None):
+        """True when free capacity is the only thing in the way.
+
+        A paid model can run in that case, so a swarm with a dollar budget switches to one
+        instead of idling until midnight. During the owner's window it returns False: that
+        pause is a request to leave the machine alone, not a shortage of free requests."""
+        now = dt.datetime.now(UTC)
+        if self._in_owner_window(now.astimezone(LOCAL_TZ)):
+            return False
+        allowed, _, _ = self.check(state=state)
+        return not allowed
+
     def snapshot(self):
         now = dt.datetime.now(UTC)
         day_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(days=1)

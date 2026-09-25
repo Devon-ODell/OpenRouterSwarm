@@ -248,7 +248,7 @@ TOOL_SCHEMAS = [
             {"command": {"type": "string"},
              "timeout": {"type": "integer", "description": "seconds (default 120)"}}, ["command"]),
     _schema("study", "Search the local study corpus (MIT OCW lecture cards, slides, notes, problem sets "
-                     "and transcripts on deep learning and machine learning, probability, matrix calculus, discrete math and combinatorics, algorithms and Python, mathematical finance, fintech, blockchain, risk and decision analysis, venture finance, microeconomics, game theory, public finance, perception and psychology; plus past code reviews) for techniques "
+                     "and transcripts on deep learning and machine learning, probability, matrix calculus, discrete math and combinatorics, algorithms and Python, mathematical finance, fintech, blockchain, risk and decision analysis, venture finance, microeconomics, game theory, public finance, perception and psychology, math for computer science, cryptography (interactive proofs, SNARGs), poker strategy, semiconductor microfabrication, game design; plus past code reviews) for techniques "
                      "and reference material. Hits under flint/cards/ name the course and lecture; follow "
                      "their page links for source text. Free: no API quota.",
             {"query": {"type": "string", "description": "specific terms, e.g. 'dynamic programming subproblem memo'"},
@@ -283,7 +283,7 @@ def build_system_prompt():
         if f.exists():
             project += f"\n\nProject instructions from {name}:\n{f.read_text(errors='replace')[:8000]}"
     if _corpus_ready():
-        project += ("\n\nA `study` tool searches local MIT OpenCourseWare material (deep learning and machine learning, probability, matrix calculus, discrete math and combinatorics, algorithms and Python, mathematical finance, fintech, blockchain, risk and decision analysis, venture finance, microeconomics, game theory, public finance, perception and psychology) "
+        project += ("\n\nA `study` tool searches local MIT OpenCourseWare material (deep learning and machine learning, probability, matrix calculus, discrete math and combinatorics, algorithms and Python, mathematical finance, fintech, blockchain, risk and decision analysis, venture finance, microeconomics, game theory, public finance, perception and psychology, math for computer science, cryptography (interactive proofs, SNARGs), poker strategy, semiconductor microfabrication, game design) "
                     "and past code reviews. When a problem calls for a known algorithm, model or technique, "
                     "look it up there and cite the course and lecture it came from.")
     return f"""You are flint, a coding agent running in the user's terminal.
@@ -325,6 +325,17 @@ class IncompleteResponse(Exception):
     def __init__(self, msg, finish_reason=None):
         super().__init__(msg)
         self.finish_reason = finish_reason
+
+
+class SpendExhausted(Exception):
+    """This swarm's daily budget for paid models is used up.
+
+    Free models never touch it. The budget exists so that a swarm which falls back to
+    paid models when the free allowance runs out cannot quietly run up a bill."""
+
+    def __init__(self, spent, cap):
+        self.spent, self.cap = spent, cap
+        super().__init__(f"daily paid-model budget spent (${spent:.4f} of ${cap:.2f})")
 
 
 class BudgetPaused(Exception):
@@ -373,6 +384,74 @@ def fmt_reset(ts):
     return f"{local:%H:%M} local (in {mins // 60}h {mins % 60}m)"
 
 
+class Spend:
+    """Dollars charged to paid models, for one swarm, per UTC day.
+
+    `FLINT_SPEND_FILE` names the ledger and `FLINT_SPEND_CAP` the day's limit in
+    dollars; without a file there is no dollar accounting and nothing is gated, so
+    single-agent flint behaves exactly as before. One file per target repository is
+    what lets several swarms hold separate budgets on the same OpenRouter key.
+
+    Costs are what OpenRouter actually charged, read from the usage of each reply,
+    not an estimate from token counts."""
+
+    def __init__(self, path=None, cap=None):
+        path = path if path is not None else os.environ.get("FLINT_SPEND_FILE")
+        self.path = Path(path).expanduser() if path else None
+        cap = cap if cap is not None else os.environ.get("FLINT_SPEND_CAP")
+        self.cap = float(cap) if cap not in (None, "") else None
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.lock = self.path.with_suffix(".lock")
+
+    def _txn(self, fn):
+        if not self.path:
+            return None
+        with open(self.lock, "w") as lf:
+            if fcntl:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                d = json.loads(self.path.read_text()) if self.path.exists() else {}
+            except (json.JSONDecodeError, OSError):
+                d = {}
+            day = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+            if d.get("day") != day:
+                d.update(day=day, usd=0.0, requests=0)
+            out = fn(d)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(d))
+            tmp.replace(self.path)
+            return out
+
+    def today(self):
+        return self._txn(lambda d: float(d.get("usd", 0.0))) or 0.0
+
+    def add(self, usd):
+        """Record what a reply cost. Called once per paid reply, after it arrives."""
+        try:
+            usd = float(usd)
+        except (TypeError, ValueError):
+            return
+        if usd <= 0:
+            return
+
+        def step(d):
+            d["usd"] = round(float(d.get("usd", 0.0)) + usd, 6)
+            d["requests"] = int(d.get("requests", 0)) + 1
+        self._txn(step)
+
+    def remaining(self):
+        return None if self.cap is None or not self.path else max(0.0, self.cap - self.today())
+
+    def check(self):
+        """Raise before a paid request the day's budget can no longer cover."""
+        if self.cap is None or not self.path:
+            return
+        spent = self.today()
+        if spent >= self.cap:
+            raise SpendExhausted(spent, self.cap)
+
+
 class Throttle:
     """One request budget shared by every flint process on this machine.
 
@@ -405,23 +484,32 @@ class Throttle:
             tmp.replace(self.path)
             return out
 
-    def acquire(self, on_wait=None):
+    def acquire(self, on_wait=None, paid=False):
+        """Wait for a slot in the rolling per-minute window.
+
+        A paid request is the point of the fallback, so it is not held back by the free
+        allowance and does not count against it: the daily-cap block and the swarm's
+        request budget both describe free capacity only. It still takes a slot in the
+        per-minute window, which keeps a swarm that has switched to paid models spending
+        at the same deliberate pace rather than as fast as the network allows."""
         while True:
             def step(d):
                 now = time.time()
-                if d.get("blocked_until", 0) > now:
-                    raise DailyCapReached(d["blocked_until"])
-                policy = os.environ.get("FLINT_SWARM_BUDGET")
-                if policy:
-                    from swarm.budget import Budget
-                    allowed, delay, reason = Budget(**json.loads(policy)).check(state=d)
-                    if not allowed:
-                        raise BudgetPaused(f"{reason}; check again in {delay:.0f}s")
+                if not paid:
+                    if d.get("blocked_until", 0) > now:
+                        raise DailyCapReached(d["blocked_until"])
+                    policy = os.environ.get("FLINT_SWARM_BUDGET")
+                    if policy:
+                        from swarm.budget import Budget
+                        allowed, delay, reason = Budget(**json.loads(policy)).check(state=d)
+                        if not allowed:
+                            raise BudgetPaused(f"{reason}; check again in {delay:.0f}s")
                 recent = [t for t in d.get("recent", []) if now - t < 60]
                 d["recent"] = recent
                 if len(recent) < self.rpm:
                     recent.append(now)
-                    d["count"] = d.get("count", 0) + 1
+                    if not paid:
+                        d["count"] = d.get("count", 0) + 1
                     return 0
                 return 60 - (now - recent[0]) + 0.2
             wait = self._txn(step)
@@ -524,10 +612,14 @@ def fetch_key_info(api_key):
 
 # ─── agent ───────────────────────────────────────────────────────────────────
 class Agent:
-    # An agent spends nothing unless a parent handed it a wallet, so these are the defaults for
-    # every agent, however it was built.
+    # An agent spends nothing unless a parent handed it a wallet or a spend ledger, so these are
+    # the defaults for every agent, however it was built. `Spend(path="")` is a null ledger: it
+    # gates nothing and records nothing, which is what an agent built without __init__ should do.
     wallet = None
     spend_usd = 0.0
+    spend = Spend(path="", cap="")
+    last_cost = 0.0
+    total_cost = 0.0
 
     def __init__(self, model, yolo=False, headless=False, read_only=False):
         key = os.environ.get("OPENROUTER_API_KEY")
@@ -552,6 +644,9 @@ class Agent:
         self.last_prompt_tokens = 0
         self.wallet = wallet_from_env()
         self.spend_usd = 0.0
+        self.spend = Spend()
+        self.last_cost = 0.0
+        self.total_cost = 0.0
         self.reset()
 
     def reset(self):
@@ -560,6 +655,11 @@ class Agent:
             self.messages[0]["content"] += "\nRead-only mode: inspect and advise; you cannot edit files or run shell commands."
 
     # ── model call ──
+    @property
+    def paid(self):
+        """Free model ids end in `:free`; everything else is charged to the account."""
+        return not str(self.model).endswith(":free")
+
     def _request_kwargs(self):
         schemas = [t for t in TOOL_SCHEMAS
                    if (not self.read_only or t["function"]["name"] not in NEEDS_APPROVAL)
@@ -570,28 +670,44 @@ class Agent:
             kw["tool_choice"] = "none"
         if FALLBACKS:
             kw["extra_body"] = {"models": [self.model] + [m for m in FALLBACKS if m != self.model]}
-        if self.wallet:
-            # Bill from the provider's own number rather than a local price table.
+        if self.wallet is not None or self.spend.path:
+            # Bill from the provider's own number rather than a local price table. Both
+            # ledgers need it: the editor's wallet and a swarm's daily spend budget.
             kw.setdefault("extra_body", {})["usage"] = {"include": True}
         return kw
 
     def _charge(self, usage):
-        """Record what the request cost, once per request. Free models report $0."""
-        if self.wallet is None or usage is None:
+        """Bank what OpenRouter says the reply cost, once per request.
+
+        `cost` is the amount charged to the account and rides along in the final usage
+        message of the stream. The OpenAI client does not model it, so it arrives as an
+        extra field. A free model reports 0 and touches neither ledger.
+
+        There are two ledgers and a reply is banked to whichever are active: the wallet
+        is the editor's fixed pot of credits, handed down through FLINT_WALLET, and the
+        spend ledger is one swarm's budget for a single day, named by FLINT_SPEND_FILE.
+        A turn normally has one or the other, never both."""
+        if usage is None:
             return
         cost = getattr(usage, "cost", None)
         if cost is None:
-            extra = getattr(usage, "model_extra", None) or {}
-            cost = extra.get("cost") if isinstance(extra, dict) else None
+            extra = getattr(usage, "model_extra", None)
+            if isinstance(extra, dict):
+                cost = extra.get("cost")
         try:
             usd = round(max(0.0, float(cost)), 6)
         except (TypeError, ValueError):
             return
-        self.spend_usd = round(self.spend_usd + usd, 6)
-        snap = self.wallet.record(usd, self.model)
+        self.last_cost = usd
+        self.total_cost = round(self.total_cost + usd, 6)
         if usd:
-            self._note(f"[dim]spend: ${usd:.4f} this request, "
-                       f"${snap['spent']:.4f} of ${snap['cap']:.2f} allowance[/]")
+            self.spend.add(usd)
+        if self.wallet is not None:
+            self.spend_usd = round(self.spend_usd + usd, 6)
+            snap = self.wallet.record(usd, self.model)
+            if usd:
+                self._note(f"[dim]spend: ${usd:.4f} this request, "
+                           f"${snap['spent']:.4f} of ${snap['cap']:.2f} allowance[/]")
 
     def _note(self, msg):
         (console.print if not self.headless else
@@ -605,7 +721,9 @@ class Agent:
                 allowed, why = self.wallet.check()
                 if not allowed:
                     raise WalletEmpty(why)
-            self.throttle.acquire(on_wait=lambda s: self._note(
+            if self.paid:
+                self.spend.check()
+            self.throttle.acquire(paid=self.paid, on_wait=lambda s: self._note(
                 f"[dim]pacing: {RPM_LIMIT}/min budget used, waiting {s:.0f}s[/]"))
             try:
                 return self._stream_once()
@@ -860,7 +978,8 @@ class Agent:
         self.final_answer = True
         try:
             content, calls = self.complete()
-        except (DailyCapReached, OutOfCredits, BudgetPaused, ProviderUnavailable, KeyboardInterrupt):
+        except (DailyCapReached, OutOfCredits, BudgetPaused, SpendExhausted,
+                ProviderUnavailable, KeyboardInterrupt):
             raise
         except Exception as e:
             raise limit from e
@@ -1073,6 +1192,11 @@ def main():
         except WalletEmpty as e:
             print(f"flint: paid allowance exhausted: {e}", file=sys.stderr)
             sys.exit(10)
+        except SpendExhausted as e:
+            # Same exit code as a budget pause: the supervisor defers the task and tries
+            # again after the ledger rolls over at midnight UTC.
+            print(f"flint: {e}", file=sys.stderr)
+            sys.exit(6)
         except DailyCapReached as e:
             print(f"flint: daily free-model cap reached, resets {fmt_reset(e.reset_at)}", file=sys.stderr)
             sys.exit(3)  # distinct code so a swarm orchestrator can back off

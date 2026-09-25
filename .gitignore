@@ -11,3 +11,5 @@ swarm/state/
 cursor-extension/flint-root.txt
 cursor-extension/*.vsix
 swarm/config.json
+swarm/configs/
+*.command
