@@ -373,3 +373,54 @@ class SandboxLedgerTests(unittest.TestCase):
             prof = swarmd.sandbox_profile(self.dir.name, {"sandbox": True})
         self.assertIn(str(other / "spend.lock"), prof)
         self.assertNotIn(str(self.state / "spend.lock"), prof)
+
+
+class PlannerGateTests(unittest.TestCase):
+    """The planner may use the paid fallback, like any other turn.
+
+    A swarm whose queue has drained and whose free allowance is spent has nothing to work
+    on and, if the planner alone is held to free capacity, no way to think of anything
+    either. It would sit idle until midnight with its dollar budget untouched.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        p = patch.object(swarmd, "STATE", Path(self.dir.name))
+        p.start()
+        self.addCleanup(p.stop)
+        self.c = {"allow_paid": True, "daily_usd": 1.0,
+                  "models": ["poolside/laguna-s-2.1:free"],
+                  "paid_models": ["poolside/laguna-s-2.1"]}
+
+    def budget(self, spent, window=("00:00", "00:00")):
+        b = Budget(cap=100, reserve=0, owner_window=window)
+        patcher = patch.object(Budget, "spent_today", staticmethod(lambda: spent))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return b
+
+    def spent_usd(self, usd):
+        (Path(self.dir.name) / "spend.json").write_text(
+            json.dumps({"day": UTC_TODAY, "usd": usd}))
+
+    def test_free_capacity_lets_a_turn_start(self):
+        self.assertTrue(swarmd.can_take_a_turn(self.c, self.budget(0)))
+
+    def test_a_spent_allowance_still_allows_a_paid_turn(self):
+        b = self.budget(100)
+        self.assertFalse(b.check()[0])
+        self.assertTrue(swarmd.can_take_a_turn(self.c, b))
+
+    def test_nothing_starts_once_both_allowances_are_gone(self):
+        self.spent_usd(1.0)
+        self.assertFalse(swarmd.can_take_a_turn(self.c, self.budget(100)))
+
+    def test_a_free_only_swarm_still_waits_for_the_reset(self):
+        c = {"allow_paid": False, "models": ["poolside/laguna-s-2.1:free"]}
+        self.assertFalse(swarmd.can_take_a_turn(c, self.budget(100)))
+
+    def test_the_owner_window_is_not_overridden(self):
+        """The owner's window is a request to leave the machine alone, not a shortage."""
+        b = self.budget(0, window=("00:00", "23:59"))
+        self.assertFalse(swarmd.can_take_a_turn(self.c, b))

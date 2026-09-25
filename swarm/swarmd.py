@@ -201,6 +201,19 @@ def paid_stand_in(c, model):
     return next((m for m in paid if m == twin), paid[0])
 
 
+def can_take_a_turn(c, budget):
+    """Whether any turn could start right now — on a free model or a paid stand-in.
+
+    `flint()` already falls back to a paid model when free capacity is gone, so anything
+    that gates work on `budget.check()` alone is stricter than the turn it is guarding.
+    That matters most for the planner: a swarm whose queue has drained and whose free
+    allowance is spent has nothing to work on and no way to think of anything, so it sits
+    idle until midnight with its dollar budget untouched."""
+    if budget.check()[0]:
+        return True
+    return bool(budget.paid_would_help() and paid_stand_in(c, None))
+
+
 def trunk_name(c):
     return c.get("trunk", "swarm/trunk")
 
@@ -2120,7 +2133,8 @@ def run_daemon(c, max_tasks=None):
             # Planning costs requests like anything else, so it is rate-limited
             # and backs off when it stops producing new work.
             cooldown = c.get("plan_cooldown", 600) * (2 ** min(dry_runs, 4))
-            if len(q.ready()) < c["workers"] and time.time() - last_plan > cooldown and budget.check()[0]:
+            if (len(q.ready()) < c["workers"] and time.time() - last_plan > cooldown
+                    and can_take_a_turn(c, budget)):
                 last_plan = time.time()
                 try:
                     sync_trunk(c)
