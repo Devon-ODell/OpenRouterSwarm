@@ -424,3 +424,92 @@ class PlannerGateTests(unittest.TestCase):
         """The owner's window is a request to leave the machine alone, not a shortage."""
         b = self.budget(0, window=("00:00", "23:59"))
         self.assertFalse(swarmd.can_take_a_turn(self.c, b))
+
+
+class StandInAttributionTests(unittest.TestCase):
+    """Whoever answered gets the score.
+
+    `paid_stand_in` falls back to the first paid model when the chosen one has no paid
+    twin, so a turn can run on a model the bandit did not pick. Before this, the worker
+    still credited its own pick: every turn handed away scored the model that sat it out,
+    and the model that did the work got nothing. A model with no paid twin — qwen, until
+    its twin was configured — collected a run of zero rewards for other models' failures.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        p = patch.object(swarmd, "STATE", Path(self.dir.name))
+        p.start()
+        self.addCleanup(p.stop)
+        swarmd._ran_on.clear()
+        self.addCleanup(swarmd._ran_on.clear)
+        self.c = {"allow_paid": True, "daily_usd": 1.0,
+                  "models": ["qwen/qwen3.8-27b:free", "poolside/laguna-s-2.1:free"],
+                  "paid_models": ["poolside/laguna-s-2.1", "qwen/qwen3.8-27b"]}
+
+    def test_a_model_with_a_paid_twin_keeps_its_own_turn(self):
+        """The whole point of configuring the twin: the bandit's choice actually runs."""
+        self.assertEqual(swarmd.paid_stand_in(self.c, "qwen/qwen3.8-27b:free"),
+                         "qwen/qwen3.8-27b")
+
+    def test_without_a_twin_the_turn_is_handed_to_another_model(self):
+        c = dict(self.c, paid_models=["poolside/laguna-s-2.1"])
+        self.assertEqual(swarmd.paid_stand_in(c, "qwen/qwen3.8-27b:free"),
+                         "poolside/laguna-s-2.1")
+
+    def test_the_turn_publishes_the_model_that_answered(self):
+        """`_ran_on` is what the worker reads to decide who to credit."""
+        (Path(self.dir.name) / "logs").mkdir(exist_ok=True)
+        c = dict(self.c, python=sys.executable, paid_models=["poolside/laguna-s-2.1"])
+        with patch.object(swarmd, "LOGS", Path(self.dir.name) / "logs"):
+            self.run_flint(c, "qwen/qwen3.8-27b:free")
+        self.assertEqual(swarmd._ran_on.get("w0"), "poolside/laguna-s-2.1",
+                         "the worker would otherwise credit qwen for laguna's turn")
+
+    def test_a_turn_on_its_own_model_publishes_no_stand_in(self):
+        (Path(self.dir.name) / "logs").mkdir(exist_ok=True)
+        with patch.object(swarmd, "LOGS", Path(self.dir.name) / "logs"):
+            self.run_flint(dict(self.c, python=sys.executable),
+                           "qwen/qwen3.8-27b:free", allowed=True)
+        self.assertNotIn("w0", swarmd._ran_on)
+
+    def run_flint(self, c, model, allowed=False):
+        import contextlib
+
+        class FakeProc:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "done", ""
+
+        @contextlib.contextmanager
+        def fake_process(cmd, **kw):
+            yield FakeProc()
+
+        class B:
+            cap, reserve = 500, 100
+
+            def check(self, need=1, state=None):
+                return (True, 0, "ok") if allowed else (False, 900, "spent")
+
+            def paid_would_help(self, state=None):
+                return True
+
+        with patch.object(swarmd, "process", fake_process), \
+                patch.object(swarmd, "sandboxed", lambda cmd, cwd, c: cmd), \
+                patch.object(swarmd, "log", lambda *a, **k: None):
+            swarmd._stop.clear()
+            return swarmd.flint("p", self.dir.name, c, "implementer", "w0", B(), 5, model)
+
+    def test_a_stale_stand_in_does_not_leak_into_the_next_turn(self):
+        """flint() clears the record up front, so a turn that runs on the model it was
+        given is never credited to the previous turn's stand-in."""
+        swarmd._ran_on["w0"] = "poolside/laguna-s-2.1"
+        with patch.object(swarmd, "pool", lambda c: ["qwen/qwen3.8-27b:free"]), \
+                patch.object(swarmd, "_stop") as stop:
+            stop.is_set.return_value = True
+            with self.assertRaises(swarmd.Stopped):
+                swarmd.flint("p", self.dir.name, self.c, "implementer", "w0", None, 5,
+                             "qwen/qwen3.8-27b:free")
+        self.assertNotIn("w0", swarmd._ran_on)

@@ -64,6 +64,7 @@ _study_lock = threading.Lock()
 _study_calls = {}
 _held = {}            # worker -> when it last said it was waiting for the allowance
 _waiting = {}         # worker -> why it is not working, or absent while it is
+_ran_on = {}          # worker -> the model its last turn actually ran on, once a stand-in took it
 NO_CORPUS = os.path.join(os.devnull, "no-corpus.db")   # cannot exist: flint then hides `study`
 
 
@@ -690,8 +691,14 @@ def all_resting(ledger, c):
 
 
 def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
-    """One headless flint turn, paced against the daily allowance."""
+    """One headless flint turn, paced against the daily allowance.
+
+    The turn may end up on a paid stand-in rather than the model asked for, so it records
+    what actually ran in `_ran_on` for the caller to credit. Stale entries are cleared
+    first: a turn that runs on the model it was given must not inherit the last one's.
+    """
     model = model or (pool(c) or [DEFAULT_MODEL])[0]
+    _ran_on.pop(worker, None)
     while True:
         if _stop.is_set():
             raise Stopped("swarm is stopping")
@@ -710,7 +717,7 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
                        if left is not None else ""), worker)
                 journal("paid_fallback", role=role, worker=worker, model=model, to=alt,
                         spent_today=round(spend_today(c), 6), reason=why)
-                model = alt
+                model = _ran_on[worker] = alt
                 break
         # The allowance can be hours from resetting; saying so once a quarter hour is enough,
         # and the worker records that it is waiting rather than working.
@@ -1194,6 +1201,17 @@ class Worker(threading.Thread):
         while True:
             try:
                 out = flint(prompt, cwd, c, role, self.name, self.budget, steps, model)
+                # A paid stand-in may have taken the turn. Credit the model that actually
+                # answered, or the bandit learns from work another model did: a model with
+                # no paid twin would be scored for every turn `paid_stand_in` handed away.
+                ran = _ran_on.pop(self.name, None)
+                if ran and ran != model:
+                    asked = model
+                    model = self.last_model = ran
+                    self.doing = f"{role} with {ran}"
+                    if self.evidence:
+                        self.evidence.record(role, role_calls=self.role_calls, active_model=ran,
+                                             stood_in_for=asked)
                 break
             except ProviderDown as e:
                 log(rest(self.ledger, e), self.name)
