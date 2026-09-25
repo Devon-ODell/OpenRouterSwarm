@@ -12,7 +12,7 @@ accepted change leaves a lesson for the agents that come after it.
     swarm grind                                  # resume the configured target
     swarm run --hours 8                          # bounded run
     swarm report                                 # what happened while you were away
-    swarm status | add | plan | models | wake
+    swarm status | add | drop | plan | models | wake
 
 The supervisor never merges into your checkout: accepted work accumulates on
 `trunk` (default swarm/trunk). Review with `git log main..swarm/trunk` and
@@ -399,6 +399,22 @@ class Queue:
     def pending(self):
         with self.locked():
             return _read(self.path)
+
+    def drop(self, tid, why="dropped by hand"):
+        """Take a task out of the queue for good. A task a worker is running is left alone:
+        stop the run first, or its worker would land work for a task that no longer exists."""
+        with self.locked():
+            rows = _read(self.path)
+            task = next((r for r in rows if r["id"] == tid), None)
+            if not task:
+                return None
+            if task.get("claimed"):
+                return "claimed"
+            task.update(status="dropped", note=why, finished=time.time())
+            _write(self.path, [r for r in rows if r["id"] != tid])
+            with open(self.done, "a") as f:
+                f.write(json.dumps(task) + "\n")
+            return task
 
     def recover(self, accepted=None):
         """Only called after acquiring the exclusive daemon lock."""
@@ -2156,6 +2172,37 @@ def cmd_add(a):
         print(f"  waits for {dep}")
 
 
+def cmd_drop(a):
+    """Remove queued tasks, by title or id. With none named, list what is queued."""
+    c = _setup()
+    q = Queue(c.get("max_depth", 1), c.get("max_queue", 20))
+    pending = q.pending()
+    if not a.tasks:
+        if not pending:
+            print("nothing queued")
+            return
+        for t in pending:
+            mark = "running" if t.get("claimed") else f"priority {t.get('priority', 0)}"
+            waits = f" waits for {len(t['depends_on'])}" if t.get("depends_on") else ""
+            print(f"{t['id']}  {mark}{waits}  {t['title']}")
+        print(f"\n{len(pending)} queued. Drop with: swarm drop '<title>' ['<title>' ...]")
+        return
+    try:
+        ids = q.resolve(a.tasks)
+    except ValueError as e:
+        sys.exit(str(e))
+    queued = {t["id"] for t in pending}
+    for tid, ref in zip(ids, a.tasks):
+        if tid not in queued:
+            print(f"not queued (already finished or dropped): {ref}")
+            continue
+        out = q.drop(tid, a.why)
+        if out == "claimed":
+            print(f"a worker is running {tid}: stop the swarm first, or let it finish")
+        elif out:
+            print(f"dropped {tid}: {out['title']}")
+
+
 def cmd_plan(a):
     c = _setup()
     b = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
@@ -2207,6 +2254,10 @@ def main():
     run.add_argument("--max-tasks", type=int)
     run.set_defaults(fn=cmd_run)
     sub.add_parser("status").set_defaults(fn=cmd_status)
+    d = sub.add_parser("drop", help="list queued tasks, or remove them by title or id")
+    d.add_argument("tasks", nargs="*", metavar="TITLE_OR_ID")
+    d.add_argument("--why", default="dropped by hand", help="recorded with the task")
+    d.set_defaults(fn=cmd_drop)
     r = sub.add_parser("report", help="what landed, breakthroughs, leaderboard, playbook")
     r.add_argument("--hours", type=float, default=24)
     r.set_defaults(fn=cmd_report)

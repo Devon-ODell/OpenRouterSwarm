@@ -50,6 +50,10 @@ edits the current directory directly. The swarm never edits your checkout.
 Failures retry once with their notes, then the decomposer splits the task into
 2–3 smaller ones (depth 1); if those fail twice they are parked for you.
 
+`swarm drop` lists what is queued, with each task's id, priority and what it
+waits for; naming tasks (by exact title or id) removes them and records why.
+A task a worker is running is left alone until the run stops.
+
 ## Rewards, creativity and breakthroughs
 
 Only work that passed the tests, the reviewer and landing can score above 0.4.

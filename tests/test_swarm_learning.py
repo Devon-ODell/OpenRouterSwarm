@@ -634,6 +634,37 @@ class GuardTests(SwarmBase):
                 patch.object(swarmd, "free_tool_models", return_value={"a:free": {}}):
             swarmd.preflight(self.cfg(repo, models=["a:free"], test_cmd="true"))
 
+    def test_queued_tasks_can_be_listed_and_dropped_by_title(self):
+        """Work the swarm duplicated by hand has to be removable without editing JSON."""
+        repo, _ = self.repo()
+        c = self.cfg(repo)
+        add = lambda t: swarmd.cmd_add(NS(title=t, detail="d", kind="feature", priority=1,
+                                          acceptance=None, depends_on=None))
+        out = io.StringIO()
+        with patch.object(swarmd, "_setup", return_value=c), contextlib.redirect_stdout(out):
+            add("Find triangular arbitrage cycles")
+            add("Keep this one")
+            swarmd.cmd_drop(NS(tasks=[], why="x"))                      # no names: list them
+        self.assertIn("Find triangular arbitrage cycles", out.getvalue())
+        self.assertIn("2 queued", out.getvalue())
+        out = io.StringIO()
+        with patch.object(swarmd, "_setup", return_value=c), contextlib.redirect_stdout(out):
+            swarmd.cmd_drop(NS(tasks=["find TRIANGULAR arbitrage cycles"], why="already built"))
+        q = swarmd.Queue()
+        self.assertEqual([t["title"] for t in q.pending()], ["Keep this one"])
+        self.assertIn("dropped", out.getvalue())
+        done = swarmd._read(q.done)
+        self.assertEqual((done[0]["status"], done[0]["note"]), ("dropped", "already built"))
+        # A task a worker is running is left alone, and an unknown name is refused.
+        q.claim()
+        out = io.StringIO()
+        with patch.object(swarmd, "_setup", return_value=c), contextlib.redirect_stdout(out):
+            swarmd.cmd_drop(NS(tasks=["Keep this one"], why="x"))
+        self.assertIn("a worker is running", out.getvalue())
+        self.assertEqual(len(swarmd.Queue().pending()), 1)
+        with patch.object(swarmd, "_setup", return_value=c), self.assertRaises(SystemExit):
+            swarmd.cmd_drop(NS(tasks=["never queued"], why="x"))
+
     def test_a_task_can_wait_for_another_named_by_its_title(self):
         """Later work is queued now but must not start until its foundation is done."""
         repo, _ = self.repo()
