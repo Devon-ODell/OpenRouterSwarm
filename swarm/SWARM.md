@@ -162,11 +162,44 @@ extension into Cursor. From the editor you can:
 - look up MIT lectures;
 - start, stop and read reports on the swarm for the current repository.
 
+Starting the swarm on a repository with no commits offers to commit a baseline first.
+A repository other than the one in `config.json` gets its own config
+(`swarm/configs/<repo>-<hash>.json`, seeded from `config.json`), so two swarms can run side by
+side without one rewriting the other's target; edit that file to give it its own models.
+Stop only stops the swarm on the repository you are in.
+
 It talks to `swarm/bridge.py`, a JSON CLI you can also use directly (see its
 docstring). Asking uses read-only agents in the sandbox. It spends the day's
 free requests but not the swarm's reserve. 👍/👎 on an answer trains a
 separate bandit (`swarm/state/consult/learn.json`) that picks which models
 answer next time.
+
+## Paid fallback and the daily dollar budget
+
+The swarm works on free models. When the free allowance is gone it can finish the day on
+paid models instead of idling until midnight, under a budget that is per repository:
+
+```json
+"allow_paid": true,
+"paid_models": ["poolside/laguna-s-2.1", "inclusionai/ling-3.0-flash-fin"],
+"daily_usd": 1.00
+```
+
+`models` stays free-only and is always tried first; `paid_models` is reached for only when
+free capacity is exhausted or every free model is resting. A model's own paid twin is
+preferred, so `x:free` continues as `x` and the bandit keeps scoring the same weights. A
+free-only model (dots-3 has no paid twin) simply rests instead.
+
+Costs are what OpenRouter charged, read from each reply's usage, and kept in
+`swarm/state/<repo>/spend.json` for that repository alone: three swarms on one key hold
+three separate budgets. flint refuses a paid request once the day's budget is spent, and
+the supervisor defers the task until the ledger rolls over at midnight UTC. A request
+already in flight can carry the total a fraction of a cent past the cap.
+
+Paid requests do not count against the free allowance and are not blocked by it, but they
+still take a slot in the per-minute window, so a swarm on paid models spends at the same
+deliberate pace. `swarm status` reports the day's spend under `spend`. `owner_window`
+still pauses everything: it means leave the machine alone, not that free requests ran out.
 
 ## Budget
 

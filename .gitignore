@@ -11,3 +11,6 @@ swarm/state/
 cursor-extension/flint-root.txt
 cursor-extension/*.vsix
 swarm/config.json
+swarm/configs/
+start-studio-swarm.command
+start-all-swarms.command

@@ -85,7 +85,11 @@ async function bridgeJson(args) {
   const res = await runBridge(args);
   const last = res.events.filter((e) => e.event !== 'log').pop();
   if (!last) throw new Error(tail(res.stderr) || `bridge exited with code ${res.code}`);
-  if (last.ok === false || (last.event === 'error' && last.error)) throw new Error(last.error);
+  if (last.ok === false || (last.event === 'error' && last.error)) {
+    const err = new Error(last.error);
+    err.data = last;
+    throw err;
+  }
   return last;
 }
 
@@ -276,7 +280,18 @@ async function startGrind(repo) {
   if (goal) args.push('--goal', goal);
   if (testCmd) args.push('--test-cmd', testCmd);
   try {
-    const { command } = await bridgeJson(args);
+    let command;
+    try {
+      ({ command } = await bridgeJson(args));
+    } catch (e) {
+      if (!(e.data && e.data.needs_baseline)) throw e;
+      const commit = await vscode.window.showWarningMessage(
+        `${name} has no commits yet, and the swarm branches from a commit. Commit its current files as a baseline on main?`,
+        { modal: true }, 'Commit baseline');
+      if (commit !== 'Commit baseline') return;
+      await bridgeJson(['baseline', '--repo', repo]);
+      ({ command } = await bridgeJson(args));
+    }
     if (swarmTerminal && swarmTerminal.exitStatus === undefined) swarmTerminal.dispose();
     swarmTerminal = vscode.window.createTerminal({ name: `Flint Swarm: ${name}`, cwd: flintRoot() });
     swarmTerminal.show(true);
@@ -287,11 +302,13 @@ async function startGrind(repo) {
   }
 }
 
-async function stopGrind() {
-  const ok = await vscode.window.showWarningMessage('Stop the swarm? Work in progress is kept on its branch.', { modal: true }, 'Stop');
+async function stopGrind(repo) {
+  repo = typeof repo === 'string' ? repo : repoFor(currentEditor() && currentEditor().document.uri);
+  const which = repo ? `the swarm on ${path.basename(repo)}` : 'every running swarm';
+  const ok = await vscode.window.showWarningMessage(`Stop ${which}? Work in progress is kept on its branch.`, { modal: true }, 'Stop');
   if (ok !== 'Stop') return;
   try {
-    const res = await bridgeJson(['stop']);
+    const res = await bridgeJson(repo ? ['stop', '--repo', repo] : ['stop']);
     vscode.window.showInformationMessage(res.stopped.length ? `Sent stop to ${res.stopped.length} swarm process(es).` : 'No running swarm found.');
   } catch (e) {
     vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);

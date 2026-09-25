@@ -12,7 +12,14 @@ Every command prints JSON. `ask` streams one JSON object per line as models fini
     bridge.py report   --repo PATH [--hours 24]
     bridge.py vote     --model M --useful 1|0
     bridge.py grind-cmd --repo PATH [--goal G] [--test-cmd T] [--hours H]
-    bridge.py stop
+    bridge.py baseline --repo PATH
+    bridge.py stop     [--repo PATH]
+
+`grind-cmd` refuses a repository with no commits (`needs_baseline: true`); `baseline` commits
+its current files so the swarm has something to branch from. A repository other than the one
+in config.json gets its own config file (swarm/configs/<repo>.json, seeded from config.json),
+so starting a second swarm never rewrites the first one's target or test command. `stop` with
+--repo stops only the daemon working on that repository.
 
 `ask` runs read-only flint agents (read_file, list_files, search, study; no edits, no shell)
 in the macOS sandbox, several free models in parallel, then one more model merges their
@@ -21,6 +28,7 @@ sampling, role "consult"). Requests count against the same daily allowance as th
 not against the swarm's reserve, which exists for exactly this kind of use.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -385,20 +393,91 @@ def cmd_vote(a):
     return 0
 
 
+def has_commit(repo):
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+                          capture_output=True).returncode == 0
+
+
+def repo_config(repo):
+    """The config file a swarm on REPO should use: config.json when that is its target (or
+    nothing is configured yet), else swarm/configs/<repo>-<hash>.json seeded from it."""
+    repo = Path(repo).expanduser().resolve()
+    base = swarmd.load_cfg()
+    configured = str(base.get("repo") or "")
+    if not configured or configured.startswith("__") or Path(configured).expanduser().resolve() == repo:
+        return None
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", repo.name) + "-" + \
+        hashlib.sha1(str(repo).encode()).hexdigest()[:6]
+    path = swarmd.CONFIG.parent / "configs" / f"{slug}.json"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        seed = {k: v for k, v in base.items() if k not in ("repo", "test_cmd", "base_branch")}
+        path.write_text(json.dumps(seed, indent=2) + "\n")
+    return path
+
+
 def cmd_grind_cmd(a):
-    parts = [sys.executable, str(HERE / "swarmd.py"), "grind", str(Path(a.repo).expanduser().resolve())]
+    repo = Path(a.repo).expanduser().resolve()
+    if not has_commit(repo):
+        emit({"ok": False, "needs_baseline": True, "repo": str(repo),
+              "error": f"{repo.name} has no commits yet; the swarm branches from a commit."})
+        return 1
+    parts = [sys.executable, str(HERE / "swarmd.py"), "grind", str(repo)]
     if a.goal:
         parts += ["--goal", a.goal]
     if a.test_cmd:
         parts += ["--test-cmd", a.test_cmd]
     if a.hours:
         parts += ["--hours", str(a.hours)]
-    emit({"command": " ".join(shlex.quote(p) for p in parts)})
+    command = " ".join(shlex.quote(p) for p in parts)
+    config = repo_config(repo)
+    if config:
+        command = f"FLINT_SWARM_CONFIG={shlex.quote(str(config))} {command}"
+    emit({"command": command, "config": str(config or swarmd.CONFIG)})
+    return 0
+
+
+def cmd_baseline(a):
+    """Commit everything in REPO (git init first if needed) so the swarm can start on it."""
+    repo = Path(a.repo).expanduser().resolve()
+    if not repo.is_dir():
+        emit({"ok": False, "error": f"{repo} is not a folder"})
+        return 1
+    if has_commit(repo):
+        emit({"ok": True, "repo": str(repo), "created": False})
+        return 0
+
+    def git(*args, env=None):
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, env=env)
+    if not (repo / ".git").exists():
+        git("init", "-q", "-b", "main")
+    git("add", "-A")
+    r = git("commit", "-q", "--allow-empty", "-m", "baseline")
+    if r.returncode != 0:   # no user.name/user.email configured: commit as the swarm
+        r = git("commit", "-q", "--allow-empty", "-m", "baseline", env={**os.environ, **swarmd.GIT_IDENT})
+    if r.returncode != 0:
+        emit({"ok": False, "error": (r.stderr or r.stdout).strip()[-400:] or "git commit failed"})
+        return 1
+    emit({"ok": True, "repo": str(repo), "created": True,
+          "commit": git("rev-parse", "--short", "HEAD").stdout.strip()})
     return 0
 
 
 def cmd_stop(a):
-    """SIGINT to running swarm daemons (the same as Ctrl-C in their terminal)."""
+    """SIGINT to running swarm daemons (the same as Ctrl-C in their terminal); with --repo,
+    only the one working on that repository."""
+    if getattr(a, "repo", None):
+        swarmd.use_repo({"repo": a.repo})
+        note = swarmd.daemon_note()
+        stopped = []
+        if note:
+            try:
+                os.kill(int(note["pid"]), signal.SIGINT)
+                stopped.append(int(note["pid"]))
+            except (ProcessLookupError, PermissionError):
+                pass
+        emit({"stopped": stopped, "repo": str(Path(a.repo).expanduser().resolve())})
+        return 0
     out = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True, text=True).stdout
     me, stopped = os.getpid(), []
     for line in out.splitlines():
@@ -462,7 +541,12 @@ def main(argv=None):
     s.add_argument("--test-cmd")
     s.add_argument("--hours", type=float)
     s.set_defaults(fn=cmd_grind_cmd)
-    sub.add_parser("stop").set_defaults(fn=cmd_stop)
+    s = sub.add_parser("baseline")
+    s.add_argument("--repo", required=True)
+    s.set_defaults(fn=cmd_baseline)
+    s = sub.add_parser("stop")
+    s.add_argument("--repo", help="stop only the daemon working on this repository")
+    s.set_defaults(fn=cmd_stop)
     a = ap.parse_args(argv)
     signal.signal(signal.SIGTERM, _kill_children)
     try:

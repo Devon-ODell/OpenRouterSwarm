@@ -391,9 +391,57 @@ class BridgeTests(SwarmBase):
         self.assertEqual(out[0]["leaderboard"][0]["arm"], "a:free")
 
     def test_grind_command_is_shell_quoted(self):
-        rc, out = self.run_bridge("grind-cmd", "--repo", str(self.root), "--goal", "it's a game")
+        repo, _ = self.repo()
+        rc, out = self.run_bridge("grind-cmd", "--repo", str(repo), "--goal", "it's a game")
         self.assertIn("grind", out[0]["command"])
         self.assertIn("'it'\"'\"'s a game'", out[0]["command"])
+
+    def test_grind_refuses_a_repo_without_commits_until_a_baseline_is_committed(self):
+        repo = self.root / "empty"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        (repo / "idea.md").write_text("a game\n")
+        rc, out = self.run_bridge("grind-cmd", "--repo", str(repo))
+        self.assertEqual(rc, 1)
+        self.assertTrue(out[0]["needs_baseline"])
+        self.assertFalse(out[0]["ok"])
+        rc, out = self.run_bridge("baseline", "--repo", str(repo))
+        self.assertEqual((rc, out[0]["ok"], out[0]["created"]), (0, True, True))
+        files = subprocess.run(["git", "-C", str(repo), "ls-files"], capture_output=True, text=True).stdout
+        self.assertIn("idea.md", files)
+        rc, out = self.run_bridge("baseline", "--repo", str(repo))
+        self.assertFalse(out[0]["created"])
+        rc, out = self.run_bridge("grind-cmd", "--repo", str(repo))
+        self.assertEqual(rc, 0)
+        self.assertIn("grind", out[0]["command"])
+
+    def test_a_second_repo_gets_its_own_config_so_the_first_swarm_keeps_its_target(self):
+        first, _ = self.repo()
+        self.config.write_text(json.dumps({"repo": str(first), "test_cmd": "make test", "models": ["a:free"],
+                                           "daily_cap": 600}))
+        second = self.root / "second"
+        second.mkdir()
+        subprocess.run(["git", "-C", str(second), "init", "-q", "-b", "main"], check=True)
+        self.run_bridge("baseline", "--repo", str(second))
+        rc, out = self.run_bridge("grind-cmd", "--repo", str(second))
+        self.assertTrue(out[0]["command"].startswith("FLINT_SWARM_CONFIG="))
+        seeded = json.loads(Path(out[0]["config"]).read_text())
+        self.assertEqual((seeded["models"], seeded["daily_cap"]), (["a:free"], 600))
+        self.assertNotIn("repo", seeded)
+        self.assertEqual(json.loads(self.config.read_text())["repo"], str(first))
+        rc, out = self.run_bridge("grind-cmd", "--repo", str(first))
+        self.assertFalse(out[0]["command"].startswith("FLINT_SWARM_CONFIG="))
+
+    def test_stop_with_a_repo_signals_only_that_repos_daemon(self):
+        repo, _ = self.repo()
+        self.sw.use_repo({"repo": str(repo)})
+        (self.sw.STATE / "daemon.pid").write_text(json.dumps({"pid": 424242, "started": 0, "goal": "g"}))
+        sent = []
+        with patch.object(bridge.os, "kill", side_effect=lambda pid, sig: sent.append((pid, sig))), \
+                patch.object(bridge.subprocess, "run", side_effect=AssertionError("must not scan every process")):
+            rc, out = self.run_bridge("stop", "--repo", str(repo))
+        self.assertEqual(out[0]["stopped"], [424242])
+        self.assertIn((424242, bridge.signal.SIGINT), sent)
 
 
 if __name__ == "__main__":

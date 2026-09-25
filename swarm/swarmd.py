@@ -144,9 +144,61 @@ def wt_root():
 
 
 def pool(c):
-    """Candidate models. Paid models are dropped unless allow_paid is set."""
+    """The free models the swarm works with. Paid ids in `models` are dropped unless
+    allow_paid is set, so a stray paid entry can never quietly spend credits."""
     ms = c.get("models") or [c.get("model") or DEFAULT_MODEL]
     return [m for m in ms if c.get("allow_paid") or m.endswith(":free")]
+
+
+def paid_pool(c):
+    """Paid models to fall back on, from `paid_models`.
+
+    These are deliberately kept out of `models`: the swarm works on free models and
+    reaches for a paid one only when free capacity is gone (see `paid_stand_in`), so the
+    bandit's scores stay comparable and the day's bill stays small."""
+    if not c.get("allow_paid"):
+        return []
+    return [m for m in (c.get("paid_models") or []) if not m.endswith(":free")]
+
+
+def spend_today(c=None):
+    """Dollars this swarm has charged to paid models today, from flint's ledger."""
+    try:
+        d = json.loads((STATE / "spend.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0.0
+    if d.get("day") != dt.datetime.now(dt.timezone.utc).date().isoformat():
+        return 0.0
+    try:
+        return float(d.get("usd", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def spend_left(c):
+    """What is left of today's dollar budget, or None when no budget is set."""
+    cap = c.get("daily_usd")
+    if cap in (None, ""):
+        return None
+    try:
+        return max(0.0, float(cap) - spend_today(c))
+    except (TypeError, ValueError):
+        return None
+
+
+def paid_stand_in(c, model):
+    """The paid model to run this turn on instead of `model`, or None.
+
+    A model's own paid twin is preferred — `x:free` and `x` are the same weights, so the
+    turn continues with the model the bandit chose rather than a different one."""
+    paid = paid_pool(c)
+    if not paid:
+        return None
+    left = spend_left(c)
+    if left is not None and left <= 0:
+        return None
+    twin = str(model)[:-len(":free")] if str(model).endswith(":free") else None
+    return next((m for m in paid if m == twin), paid[0])
 
 
 def trunk_name(c):
@@ -536,6 +588,20 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         ok, wait, why = budget.check()
         if ok:
             break
+        # Free capacity is gone. If this swarm has a dollar budget left, the turn runs on a
+        # paid model rather than idling until midnight; `paid_stand_in` returns None once the
+        # budget is spent, and during the owner's window no paid model is reached for at all.
+        if budget.paid_would_help():
+            alt = paid_stand_in(c, model)
+            if alt:
+                left = spend_left(c)
+                log(f"{role}: {why} — running on paid {alt}"
+                    + (f" (${left:.2f} of today's ${float(c['daily_usd']):.2f} left)"
+                       if left is not None else ""), worker)
+                journal("paid_fallback", role=role, worker=worker, model=model, to=alt,
+                        spent_today=round(spend_today(c), 6), reason=why)
+                model = alt
+                break
         # The allowance can be hours from resetting; saying so once a quarter hour is enough,
         # and the worker records that it is waiting rather than working.
         waiting(worker, f"waiting for the allowance: {why}")
@@ -556,6 +622,11 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         env["FLINT_CORPUS_DB"] = str(Path(c["corpus_db"]).expanduser())
     env["FLINT_SWARM_BUDGET"] = json.dumps(dict(
         cap=budget.cap, reserve=budget.reserve, owner_window=c.get("owner_window", ["00:00", "00:00"])))
+    # Per-repository, so several swarms on one key hold separate daily budgets. flint charges
+    # real costs here and refuses a paid request the remaining budget cannot cover.
+    env["FLINT_SPEND_FILE"] = str(STATE / "spend.json")
+    if c.get("daily_usd") not in (None, ""):
+        env["FLINT_SPEND_CAP"] = str(float(c["daily_usd"]))
     cmd = [c.get("python", sys.executable), str(ROOT / "flint.py"),
            "-p", prompt, "-C", str(cwd), "-m", model,
            "--read-only" if role in READ_ONLY_ROLES else "--yolo"]
@@ -611,7 +682,7 @@ PERSONAS = {
                 "'oh, that's clever': a new capability, mechanic, tool or insight that fits the "
                 "goal. Unusual is welcome; a gimmick that does not serve the goal is not.",
     "scholar": "Use the study corpus (the study tool searches MIT OpenCourseWare lecture cards, "
-               "slides, notes, problem sets and transcripts on deep learning and machine learning, probability, matrix calculus, discrete math and combinatorics, algorithms and Python, mathematical finance, fintech, blockchain, risk and decision analysis, venture finance, microeconomics, game theory, public finance, perception and psychology, plus past code "
+               "slides, notes, problem sets and transcripts on deep learning and machine learning, probability, matrix calculus, discrete math and combinatorics, algorithms and Python, mathematical finance, fintech, blockchain, risk and decision analysis, venture finance, microeconomics, game theory, public finance, perception and psychology, math for computer science, cryptography (interactive proofs, SNARGs), poker strategy, semiconductor microfabrication, game design, plus past code "
                "reviews; MIT OCW Courses/agent-skills/FLINT-INDEX.md maps topics to lectures). "
                "Propose tasks that apply a specific technique from it to this project, and name "
                "the course, lecture and source page in the detail.",
@@ -976,8 +1047,21 @@ class Worker(threading.Thread):
 
     def pick(self, exclude=()):
         """Implementers by Thompson sampling. Reviewers and judges come from the
-        same posterior, excluding the implementer so nobody grades their own work."""
-        return self.ledger.pick("implementer", pool(self.c), exclude=exclude)
+        same posterior, excluding the implementer so nobody grades their own work.
+
+        When every free model is resting, a paid stand-in keeps the attempt alive rather
+        than abandoning work already done — but only while the day's budget allows."""
+        m = self.ledger.pick("implementer", pool(self.c), exclude=exclude)
+        if m is not None:
+            return m
+        left = spend_left(self.c)
+        if left is not None and left <= 0:
+            return None
+        return next((p for p in paid_pool(self.c) if p not in set(exclude)), None)
+
+    def no_review(self):
+        """Models the owner has barred from reviewing (config `reviewer_exclude`)."""
+        return set(self.c.get("reviewer_exclude") or ())
 
     def call(self, role, prompt, cwd, steps, model, avoid=()):
         """One role turn. If the model is busy or down, the turn goes to another model (never
@@ -1006,7 +1090,7 @@ class Worker(threading.Thread):
                 tried.add(model)
                 if editing and self.snapshot()[0] != before:
                     raise
-                nxt = self.pick(set(avoid) | tried)
+                nxt = self.pick(set(avoid) | tried | (self.no_review() if role == "adversary" else set()))
                 if nxt is None:
                     raise
                 log(f"handing {role} to {nxt}", self.name)
@@ -1182,7 +1266,7 @@ class Worker(threading.Thread):
             return "model_error", str(exc), info
         # After a handoff the model that actually wrote the code is its author.
         impl = info["implementer"] = self.last_model or impl
-        adv = self.pick({impl}) or impl
+        adv = self.pick({impl} | self.no_review()) or impl
         info["reviewer"] = adv
         info["same_model_review"] = adv == impl
         seen = set()
@@ -1769,6 +1853,16 @@ def preflight(c):
     if paid and not c.get("allow_paid"):
         sys.exit(f"refusing non-free models {paid}: they spend credits. "
                  "Remove them or set allow_paid: true in swarm/config.json.")
+    if c.get("paid_models") and not c.get("allow_paid"):
+        sys.exit(f"paid_models {c['paid_models']} would spend credits. "
+                 "Set allow_paid: true to let the swarm fall back to them, or remove them.")
+    if c.get("daily_usd") in (None, "") and paid_pool(c):
+        sys.exit("paid_models needs daily_usd: a dollar budget for one day, so the fallback "
+                 "cannot run up an open-ended bill.")
+    stray = [m for m in (c.get("paid_models") or []) if m.endswith(":free")]
+    if stray:
+        sys.exit(f"paid_models must name paid model ids; {stray} are free. "
+                 "Free models belong in `models`.")
     info = account()
     if info:
         q = info.get("free_model_daily_requests") or {}
@@ -1792,6 +1886,14 @@ def preflight(c):
     if not pool(c):
         sys.exit("no usable models in the pool; run `swarm models --write`")
     log(f"model pool ({len(pool(c))}): {', '.join(pool(c))}")
+    if paid_pool(c):
+        left = spend_left(c)
+        log(f"paid fallback ({len(paid_pool(c))}): {', '.join(paid_pool(c))} — "
+            f"${float(c['daily_usd']):.2f}/day for this repo"
+            + (f", ${left:.2f} left today" if left is not None else "")
+            + "; used only once free capacity is gone")
+    else:
+        log("paid fallback: off — free models only")
     if c.get("sandbox"):
         log("sandbox: " + ("on (writes limited to each worktree, caches and temp)"
                            if sandbox.available() else "UNAVAILABLE — agents run unsandboxed"))
@@ -2074,6 +2176,9 @@ def cmd_status(a):
                    "since": note and dt.datetime.fromtimestamp(note["started"]).isoformat(timespec="seconds"),
                    "goal": note and str(note.get("goal", ""))[:200]},
         "budget": snap,
+        "spend": {"today_usd": round(spend_today(c), 6), "daily_usd": c.get("daily_usd"),
+                  "remaining_usd": (round(spend_left(c), 6) if spend_left(c) is not None else None),
+                  "paid_fallback": paid_pool(c)},
         "pacing": {"allowed_now": ok, "wait_s": round(wait), "reason": why},
         "queue": {"pending": len(pend),
                   "claimed": sum(1 for t in pend if t.get("claimed"))},
