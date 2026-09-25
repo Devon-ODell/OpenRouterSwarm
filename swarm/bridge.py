@@ -7,10 +7,17 @@ Every command prints JSON. `ask` streams one JSON object per line as models fini
     bridge.py status   --repo PATH
     bridge.py ask      --repo PATH --question Q [--file F --start N --end M --selection-file S]
                        [--models 3 | --model a:free,b:free] [--no-synthesis] [--no-study]
+                       [--paid off|auto|always]
     bridge.py task     --repo PATH --title T [--detail D] [--file F --start N --end M --selection-file S]
+    bridge.py queue-get    --repo PATH --id ID
+    bridge.py queue-edit   --repo PATH --id ID [--title T] [--detail D] [--kind K]
+                           [--priority N] [--acceptance TEXT ...]
+    bridge.py queue-remove --repo PATH --id ID [--cascade]
+    bridge.py queue-clear  --repo PATH [--include-claimed]
     bridge.py study    --query Q [-k 6]
     bridge.py report   --repo PATH [--hours 24]
     bridge.py vote     --model M --useful 1|0
+    bridge.py wallet   [--cap 5] [--reset] [--enable | --disable] [--account]
     bridge.py grind-cmd --repo PATH [--goal G] [--test-cmd T] [--hours H]
     bridge.py stop
 
@@ -19,6 +26,12 @@ in the macOS sandbox, several free models in parallel, then one more model merge
 answers. Answers the user marks useful reinforce that model for later questions (Thompson
 sampling, role "consult"). Requests count against the same daily allowance as the swarm but
 not against the swarm's reserve, which exists for exactly this kind of use.
+
+Free models are the default and the swarm itself can use nothing else. The editor is the one
+exception: `editor_wallet` in swarm/config.json is a fixed pot of real credits (default $5) that
+`ask` may spend on a paid model when no free model answered, so a question is not simply lost to
+rate limits. Every charge is the number OpenRouter reports, recorded in ~/.flint/wallet.json, and
+the pot is checked before each request. `bridge.py wallet` reads and sets it.
 """
 import argparse
 import json
@@ -41,10 +54,18 @@ load_dotenv(ROOT / ".env", override=False)   # the sandbox cannot read .env; chi
 
 import sandbox  # noqa: E402
 import swarmd  # noqa: E402
+import wallet  # noqa: E402
 from learn import Ledger  # noqa: E402
 
 CONSULT = HERE / "state" / "consult" / "learn.json"
 MAX_SELECTION = 12_000
+MAX_PAID_PER_ASK = 2          # a rescue is meant to cost cents, not the pot
+# Tried in this order, but only after checking they still exist and still take tools: a retired
+# slug exits with "model not available", which is the same dead end as no answer at all. When
+# none of them survives, the catalog's cheap tier is used instead.
+PAID_RESCUE = ("anthropic/claude-haiku-4.5", "google/gemini-2.5-flash", "openai/gpt-5-mini",
+               "deepseek/deepseek-chat", "qwen/qwen3-coder")
+CHEAP_TIER = re.compile(r"(mini|flash|haiku|small|lite|nano|coder|turbo)")
 _children, _children_lock, _out_lock = set(), threading.Lock(), threading.Lock()
 
 
@@ -99,6 +120,68 @@ def daemon_running():
             return True
         fcntl.flock(f, fcntl.LOCK_UN)
     return False
+
+
+def wallet_for(c):
+    """The editor's dollar allowance, or None when it is switched off or empty. Only the bridge
+    ever builds one, so only editor-initiated turns can reach the account's credits; the grind
+    daemon keeps running on free models."""
+    w = c.get("editor_wallet") or {}
+    if w.get("enabled") is False:
+        return None
+    try:
+        cap = float(os.environ.get("FLINT_EDITOR_CAP") or w.get("cap_usd") or wallet.DEFAULT_CAP)
+    except (TypeError, ValueError):
+        cap = wallet.DEFAULT_CAP
+    return wallet.Wallet(cap=cap, label="cursor") if cap > 0 else None
+
+
+def _catalog():
+    """OpenRouter's model list, cached for an hour in FLINT_HOME."""
+    cache = Path(os.environ.get("FLINT_HOME", "~/.flint")).expanduser() / "models.json"
+    try:
+        if cache.is_file() and time.time() - cache.stat().st_mtime < 3600:
+            return json.loads(cache.read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    import flint as F
+    data = F.openrouter_get("/models", os.environ.get("OPENROUTER_API_KEY", ""), timeout=20)["data"]
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(data))
+    except OSError:
+        pass
+    return data
+
+
+def _token_price(m):
+    """Rough cost of one turn's worth of tokens, weighting the prompt: agents read a lot."""
+    p = m.get("pricing") or {}
+    try:
+        return float(p.get("prompt") or 0) * 3 + float(p.get("completion") or 0)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def paid_models(c, n=1):
+    """Paid models the wallet may spend on: the configured ones that are still real, then the
+    catalog's cheap tier, cheapest first. Tool support is required — an agent without tools
+    cannot read the code it is being asked about."""
+    wanted = list((c.get("editor_wallet") or {}).get("paid_models") or PAID_RESCUE)
+    try:
+        catalog = {m["id"]: m for m in _catalog()}
+    except Exception:
+        return wanted[:n]                     # catalog unreachable: trust the configuration
+
+    def usable(m):
+        return (not m["id"].endswith(":free") and _token_price(m) < float("inf")
+                and "tools" in (m.get("supported_parameters") or []))
+
+    picked = [s for s in wanted if s in catalog and usable(catalog[s])]
+    rest = sorted((m for m in catalog.values() if usable(m) and m["id"] not in picked),
+                  key=_token_price)
+    cheap = [m["id"] for m in rest if CHEAP_TIER.search(m["id"])] or [m["id"] for m in rest]
+    return (picked + cheap)[:n]
 
 
 def selection_context(repo, file=None, start=None, end=None, selection_file=None):
@@ -159,10 +242,16 @@ Credit the model behind each key point in brackets, e.g. [qwen/qwen3.8-27b:free]
 unless code is needed."""
 
 
-def run_flint(prompt, repo, model, steps, study=True, timeout=420, on_progress=None):
-    """One read-only flint turn. on_progress receives its "round …"/"tool: …" lines as they happen."""
+def run_flint(prompt, repo, model, steps, study=True, timeout=420, on_progress=None, purse=None):
+    """One read-only flint turn. on_progress receives its "round …"/"tool: …" lines as they happen.
+
+    `purse` is a Wallet, passed only for a paid model: a free turn must never be stopped because
+    the dollar allowance is empty."""
     env = dict(os.environ, FLINT_MAX_STEPS=str(steps))
     env.pop("FLINT_SWARM_BUDGET", None)
+    env.pop("FLINT_WALLET", None)
+    if purse is not None:
+        env["FLINT_WALLET"] = purse.env(label="cursor ask")
     if not study:
         env["FLINT_CORPUS_DB"] = swarmd.NO_CORPUS
     cmd = [sys.executable, str(ROOT / "flint.py"), "-p", prompt, "-C", str(repo), "-m", model, "--read-only"]
@@ -180,7 +269,8 @@ def run_flint(prompt, repo, model, steps, study=True, timeout=420, on_progress=N
         for line in p.stderr:
             lines.append(line)
             s = line.strip()
-            if on_progress and s.startswith(("round ", "tool: ", "step limit", "provider", "per-minute", "pacing")):
+            if on_progress and s.startswith(("round ", "tool: ", "step limit", "provider",
+                                             "per-minute", "pacing", "spend: ", "cost: ")):
                 on_progress(s)
 
     def expire():
@@ -204,18 +294,22 @@ def run_flint(prompt, repo, model, steps, study=True, timeout=420, on_progress=N
     if expired.is_set():
         rounds = len(re.findall(r"^round \d+/", err, re.M))
         return {"ok": False, "model": model, "error": f"timed out after {timeout}s ({rounds} requests made)",
-                "secs": round(time.time() - t0), "requests": rounds, "exit": None}
+                "secs": round(time.time() - t0), "requests": rounds, "exit": None,
+                "paid": purse is not None, "usd": None}
     studied = len(re.findall(r"^tool: study$", err or "", re.M))
     tools = len(re.findall(r"^tool: ", err or "", re.M))
     rounds = len(re.findall(r"^round \d+/", err or "", re.M))
+    spent = re.search(r"^cost: \$([0-9.]+) this turn", err or "", re.M)
     base = {"model": model, "secs": round(time.time() - t0), "study_calls": studied,
-            "tool_calls": tools, "requests": rounds, "exit": p.returncode}
+            "tool_calls": tools, "requests": rounds, "exit": p.returncode,
+            "paid": purse is not None, "usd": float(spent.group(1)) if spent else None}
     if p.returncode == 0 and out.strip():
         return {"ok": True, "text": out.strip(), **base}
     reason = {3: "daily free-request cap reached", 4: "credit or account limit", 5: "ran out of steps",
               6: "budget pause", 7: "provider unavailable",
               8: "model busy (rate-limited upstream)",
-              9: "model not available to this API key"}.get(p.returncode, "failed")
+              9: "model not available to this API key",
+              10: "paid allowance exhausted"}.get(p.returncode, "failed")
     tail = "\n".join((err or "").strip().splitlines()[-3:])
     return {"ok": False, "error": f"{reason}: {tail[-400:]}", **base}
 
@@ -246,44 +340,72 @@ def cmd_ask(a):
         lang = Path(a.file).suffix.lstrip(".")
         context = f"\nCODE THE DEVELOPER POINTED AT: {where}\n```{lang}\n{code}\n```\n"
     corpus_ok = not a.no_study and Path(c.get("corpus_db") or "~/.flint/corpus.db").expanduser().is_file()
-    models = pick_models(c, a.models, a.model.split(",") if a.model else None)
+    purse = None if a.paid == "off" else wallet_for(c)
+    models, paid_first = [], False
+    if a.paid == "always" and purse and purse.check()[0]:
+        models, paid_first = paid_models(c, max(1, min(a.models, MAX_PAID_PER_ASK))), True
+    if not models:
+        models, paid_first = pick_models(c, a.models, a.model.split(",") if a.model else None), False
     if not models:
         emit({"event": "error", "error": "no usable models: every model in the pool is resting or the pool is empty"})
         return 2
-    emit({"event": "context", "repo": repo, "where": where, "models": models, "study": corpus_ok})
+    emit({"event": "context", "repo": repo, "where": where, "models": models, "study": corpus_ok,
+          "paid": paid_first, "wallet": purse.snapshot() if purse else None})
     prompt = ASK.format(question=a.question.strip(), context=context, study=STUDY_HINT if corpus_ok else "")
     ledger, results = Ledger(CONSULT), []
 
-    def one(model):
-        emit({"event": "start", "model": model})
-        try:
-            r = run_flint(prompt, repo, model, a.steps, corpus_ok, a.timeout,
-                          lambda s: emit({"event": "progress", "model": model, "text": s}))
-        except Exception as e:   # a thread must report, not vanish
-            r = {"ok": False, "model": model, "error": f"{type(e).__name__}: {e}"}
-        if r["ok"]:
-            ledger.warm(model)
-        elif r.get("exit") in (7, 8, 9):
-            ledger.cool(model, r["error"], busy=r.get("exit") == 8, permanent=r.get("exit") == 9)
-        results.append(r)
-        emit({"event": "answer" if r["ok"] else "error", **r})
+    def run_round(pool, with_purse=None):
+        """Ask several models at once. Each thread reports its own result, whatever happens."""
+        def one(model):
+            emit({"event": "start", "model": model, "paid": with_purse is not None})
+            try:
+                r = run_flint(prompt, repo, model, a.steps, corpus_ok, a.timeout,
+                              lambda s: emit({"event": "progress", "model": model, "text": s}),
+                              purse=with_purse)
+            except Exception as e:   # a thread must report, not vanish
+                r = {"ok": False, "model": model, "error": f"{type(e).__name__}: {e}"}
+            if r["ok"]:
+                ledger.warm(model)
+            elif r.get("exit") in (7, 8, 9):
+                ledger.cool(model, r["error"], busy=r.get("exit") == 8, permanent=r.get("exit") == 9)
+            results.append(r)
+            emit({"event": "answer" if r["ok"] else "error", **r})
 
-    threads = [threading.Thread(target=one, args=(m,)) for m in models]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+        threads = [threading.Thread(target=one, args=(m,)) for m in pool]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    run_round(models, purse if paid_first else None)
     good = [r for r in results if r["ok"]]
+    if not good and not paid_first and a.paid != "off":
+        # Nothing came back: every free model was busy, gated or too slow. This is the case the
+        # wallet exists for — one paid model, checked against the allowance first, rather than
+        # handing back an empty panel.
+        allowed, why = purse.check() if purse else (False, "no paid allowance is configured")
+        rescue = paid_models(c, min(MAX_PAID_PER_ASK, max(1, a.rescue_models))) if allowed else []
+        emit({"event": "rescue", "models": rescue, "why": why,
+              "wallet": purse.snapshot() if purse else None})
+        if rescue:
+            models += rescue
+            run_round(rescue, purse)
+            good = [r for r in results if r["ok"]]
     if len(good) >= 2 and not a.no_synthesis:
-        merger = pick_models(c, 1, None) or [good[0]["model"]]
+        free_good = [r for r in good if not r.get("paid")]
+        merger = pick_models(c, 1, None) or [(free_good or good)[0]["model"]]
         answers = "\n\n".join(f"--- {r['model']} ---\n{r['text'][:6000]}" for r in good)
         emit({"event": "start", "model": merger[0], "role": "synthesis"})
         r = run_flint(SYNTH.format(question=a.question.strip(), context=context, answers=answers),
                       repo, merger[0], a.steps, corpus_ok, a.timeout,
-                      lambda s: emit({"event": "progress", "model": merger[0], "role": "synthesis", "text": s}))
+                      lambda s: emit({"event": "progress", "model": merger[0], "role": "synthesis", "text": s}),
+                      purse=purse if not merger[0].endswith(":free") else None)
+        results.append(r)
         emit({"event": "synthesis" if r["ok"] else "error", "role": "synthesis", **r})
     emit({"event": "done", "answered": len(good), "asked": len(models),
-          "requests": sum(r.get("requests", 0) for r in results)})
+          "requests": sum(r.get("requests", 0) for r in results),
+          "usd": round(sum(r.get("usd") or 0.0 for r in results), 6),
+          "wallet": purse.snapshot() if purse else None})
     return 0
 
 
@@ -300,7 +422,8 @@ def cmd_info(a):
            "configured_repo": None if str(c.get("repo", "__")).startswith("__") else c.get("repo"),
            "models": swarmd.pool(c), "allow_paid": bool(c.get("allow_paid")), "corpus": corpus,
            "sandbox": sandbox.available(), "api_key": bool(os.environ.get("OPENROUTER_API_KEY")),
-           "mit_experiment": c.get("mit_experiment")}
+           "mit_experiment": c.get("mit_experiment"),
+           "wallet": (lambda w: w.snapshot() if w else None)(wallet_for(c))}
     if a.quota:
         info = swarmd.account()
         out["quota"] = (info or {}).get("free_model_daily_requests")
@@ -312,6 +435,117 @@ def _journal_line(j):
     what = j.get("title") or j.get("model") or ""
     extra = j.get("stage") or j.get("role") or ""
     return f"{j.get('iso', '')[11:16]} {j.get('event', '')} {extra} {what}".strip()
+
+
+def queue_row(t, rows, full=False):
+    """One queued task as the editor shows it. `full` carries the whole detail, for the edit form;
+    the list view only needs enough to recognise the task."""
+    detail = (t.get("detail") or "").strip()
+    row = {"id": t["id"], "title": t.get("title", ""), "kind": t.get("kind", "feature"),
+           "priority": t.get("priority", 0), "attempts": t.get("attempts", 0),
+           "claimed": bool(t.get("claimed")), "origin": t.get("origin"),
+           "status": t.get("status"), "not_before": t.get("not_before", 0),
+           "created": t.get("created", 0), "depth": t.get("depth", 0),
+           "acceptance": [x for x in (t.get("acceptance") or []) if isinstance(x, str)],
+           "depends_on": t.get("depends_on", []),
+           "blocks": [{"id": r["id"], "title": r["title"]} for r in swarmd.Queue.blocked_by(t["id"], rows)],
+           "note": (t.get("notes") or [t.get("note")] or [None])[-1]}
+    row["detail"] = detail if full else detail[:400]
+    row["detail_truncated"] = not full and len(detail) > 400
+    return row
+
+
+def _queue(repo):
+    """(config, queue) for a repository, with per-repo state selected."""
+    c = config_for(repo)
+    swarmd.use_repo(c)
+    return c, swarmd.Queue(c.get("max_depth", 1), c.get("max_queue", 20))
+
+
+def cmd_queue_get(a):
+    c, q = _queue(a.repo)
+    rows = q.pending()
+    t = next((r for r in rows if r["id"] == a.id), None)
+    if t is None:
+        emit({"ok": False, "error": f"no queued task with id {a.id}; it may have just been claimed"})
+        return 2
+    emit({"ok": True, "task": queue_row(t, rows, full=True), "kinds": list(swarmd.KINDS)})
+    return 0
+
+
+def cmd_queue_edit(a):
+    c, q = _queue(a.repo)
+    try:
+        t = q.edit(a.id, title=a.title, detail=a.detail, kind=a.kind, priority=a.priority,
+                   acceptance=a.acceptance)
+    except KeyError:
+        emit({"ok": False, "error": f"no queued task with id {a.id}"})
+        return 2
+    except ValueError as e:
+        emit({"ok": False, "error": str(e)})
+        return 2
+    emit({"ok": True, "task": queue_row(t, q.pending(), full=True)})
+    return 0
+
+
+def cmd_queue_remove(a):
+    c, q = _queue(a.repo)
+    rows = q.pending()
+    target = next((r for r in rows if r["id"] == a.id), None)
+    try:
+        gone = q.remove(a.id, cascade=a.cascade)
+    except KeyError:
+        emit({"ok": False, "error": f"no queued task with id {a.id}"})
+        return 2
+    except ValueError as e:
+        emit({"ok": False, "error": str(e), "id": a.id,
+              "needs_cascade": [{"id": r["id"], "title": r["title"]}
+                                for r in swarmd.Queue.blocked_by(a.id, rows)]})
+        return 2
+    emit({"ok": True, "removed": [{"id": r["id"], "title": r["title"]} for r in gone],
+          "was_claimed": bool(target and target.get("claimed")), "queued": len(q.pending())})
+    return 0
+
+
+def cmd_queue_clear(a):
+    c, q = _queue(a.repo)
+    gone, kept = q.clear(include_claimed=a.include_claimed)
+    emit({"ok": True, "removed": [{"id": r["id"], "title": r["title"]} for r in gone],
+          "kept": [{"id": r["id"], "title": r["title"]} for r in kept]})
+    return 0
+
+
+def cmd_wallet(a):
+    """Read or set the editor's dollar allowance. The cap lives in swarm/config.json; what has
+    been spent lives in ~/.flint/wallet.json, shared by every checkout on the machine."""
+    c = swarmd.load_cfg()
+    w = dict(c.get("editor_wallet") or {})
+    if a.cap is not None:
+        if a.cap < 0:
+            emit({"ok": False, "error": "a cap cannot be negative"})
+            return 2
+        w["cap_usd"] = round(float(a.cap), 2)
+    if a.enable:
+        w["enabled"] = True
+    if a.disable:
+        w["enabled"] = False
+    if a.cap is not None or a.enable or a.disable:
+        c["editor_wallet"] = w
+        swarmd.save_cfg(c)
+    purse = wallet_for(c)
+    if a.reset and purse:
+        purse.reset()
+    out = {"ok": True, "enabled": bool(purse), "config": str(swarmd.CONFIG),
+           "wallet": purse.snapshot() if purse else
+                     {"cap": 0.0, "spent": wallet.Wallet(cap=0).spent(), "remaining": 0.0},
+           "paid_models": paid_models(c, 3) if purse else []}
+    if a.account:
+        info = swarmd.account() or {}
+        out["account"] = {"is_free_tier": info.get("is_free_tier"),
+                          "usage_daily": info.get("usage_daily"),
+                          "limit_remaining": info.get("limit_remaining")}
+    emit(out)
+    return 0
 
 
 def cmd_status(a):
@@ -330,12 +564,14 @@ def cmd_status(a):
                            owner_window=c.get("owner_window", ["00:00", "00:00"])).snapshot()
     emit({"repo": c["repo"], "is_target": is_target(c["repo"]), "daemon_running": daemon_running(),
           "trunk": swarmd.trunk_name(c), "trunk_ahead": int(ahead) if str(ahead or "").isdigit() else None,
-          "queue": [{"id": t["id"], "title": t["title"], "priority": t.get("priority", 0),
-                     "claimed": bool(t.get("claimed")), "origin": t.get("origin")} for t in pending],
+          "queue": [queue_row(t, pending) for t in pending],
+          "max_queue": c.get("max_queue", 20),
+          "kinds": list(swarmd.KINDS),
           "landed": sum(t.get("status") == "done" for t in done),
           "parked": sum(t.get("status") in ("parked", "split") for t in done),
           "budget": budget, "experiment": {"verdict": exp["verdict"], "on": exp["on"]["attempts"],
                                            "off": exp["off"]["attempts"]},
+          "wallet": (lambda w: w.snapshot() if w else None)(wallet_for(c)),
           "recent": [_journal_line(j) for j in swarmd._read(swarmd.STATE / "journal.jsonl")[-12:]]})
     return 0
 
@@ -438,11 +674,44 @@ def main(argv=None):
             s.add_argument("--timeout", type=int, default=420, help="seconds per model (free models can be slow)")
             s.add_argument("--no-synthesis", action="store_true")
             s.add_argument("--no-study", action="store_true")
+            s.add_argument("--paid", choices=("off", "auto", "always"), default="auto",
+                           help="off: free models only. auto: spend from the editor wallet only "
+                                "when no free model answered. always: start with paid models.")
+            s.add_argument("--rescue-models", type=int, default=1,
+                           help=f"paid models to try when no free one answered (max {MAX_PAID_PER_ASK})")
         else:
             s.add_argument("--title", required=True)
             s.add_argument("--detail", default="")
             s.add_argument("--kind", default="feature", choices=swarmd.KINDS)
             s.add_argument("--priority", type=int, default=1)
+    for name, fn in (("queue-get", cmd_queue_get), ("queue-edit", cmd_queue_edit),
+                     ("queue-remove", cmd_queue_remove)):
+        s = sub.add_parser(name)
+        s.add_argument("--repo", required=True)
+        s.add_argument("--id", required=True)
+        s.set_defaults(fn=fn)
+        if name == "queue-edit":
+            s.add_argument("--title")
+            s.add_argument("--detail")
+            s.add_argument("--kind", choices=swarmd.KINDS)
+            s.add_argument("--priority", type=int, choices=(0, 1, 2))
+            s.add_argument("--acceptance", action="append",
+                           help="one acceptance criterion; repeat for several")
+        if name == "queue-remove":
+            s.add_argument("--cascade", action="store_true",
+                           help="also remove the queued tasks that depend on this one")
+    s = sub.add_parser("queue-clear")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--include-claimed", action="store_true",
+                   help="also drop the task a worker is running right now")
+    s.set_defaults(fn=cmd_queue_clear)
+    s = sub.add_parser("wallet")
+    s.add_argument("--cap", type=float, help="dollars the editor may spend in total (0 disables it)")
+    s.add_argument("--reset", action="store_true", help="set what has been spent back to $0")
+    s.add_argument("--enable", action="store_true")
+    s.add_argument("--disable", action="store_true")
+    s.add_argument("--account", action="store_true", help="also ask OpenRouter about the account's credits")
+    s.set_defaults(fn=cmd_wallet)
     s = sub.add_parser("study")
     s.add_argument("--query", required=True)
     s.add_argument("-k", type=int, default=6)

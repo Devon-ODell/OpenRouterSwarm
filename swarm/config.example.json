@@ -17,6 +17,18 @@
     "cohere/north-mini-code:free"
   ],
   "allow_paid": false,
+  "editor_wallet": {
+    "_comment": "Dollars the Cursor/VS Code extension may spend on paid models when no free model answers a question. The swarm daemon never touches this: it is free-models-only unless allow_paid is set. Spending is recorded in ~/.flint/wallet.json and checked before every request.",
+    "enabled": true,
+    "cap_usd": 5.0,
+    "paid_models": [
+      "anthropic/claude-haiku-4.5",
+      "google/gemini-2.5-flash",
+      "openai/gpt-5-mini",
+      "deepseek/deepseek-chat",
+      "qwen/qwen3-coder"
+    ]
+  },
   "workers": 1,
   "daily_cap": 1000,
   "reserve": 100,

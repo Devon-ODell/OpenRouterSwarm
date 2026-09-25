@@ -1,8 +1,8 @@
 {
   "name": "flint-swarm",
   "displayName": "Flint Swarm",
-  "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers with a merged verdict, swarm tasks for the selection, and MIT OpenCourseWare lookups.",
-  "version": "0.1.0",
+  "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers with a merged verdict, a queue you can edit, and MIT OpenCourseWare lookups.",
+  "version": "0.2.0",
   "publisher": "devon-odell",
   "license": "UNLICENSED",
   "private": true,
@@ -72,6 +72,22 @@
         "category": "Flint Swarm"
       },
       {
+        "command": "flintSwarm.showQueue",
+        "title": "Show the Swarm Queue",
+        "category": "Flint Swarm",
+        "icon": "$(list-unordered)"
+      },
+      {
+        "command": "flintSwarm.clearQueue",
+        "title": "Clear the Swarm Queue",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.setBudget",
+        "title": "Set the Paid Model Budget",
+        "category": "Flint Swarm"
+      },
+      {
         "command": "flintSwarm.refresh",
         "title": "Refresh Swarm Status",
         "category": "Flint Swarm",
@@ -95,9 +111,14 @@
       ],
       "view/title": [
         {
+          "command": "flintSwarm.showQueue",
+          "when": "view == flintSwarm.panel",
+          "group": "navigation@1"
+        },
+        {
           "command": "flintSwarm.refresh",
           "when": "view == flintSwarm.panel",
-          "group": "navigation"
+          "group": "navigation@2"
         }
       ]
     },
@@ -145,6 +166,28 @@
           "type": "boolean",
           "default": true,
           "description": "Let answering models search the MIT OpenCourseWare corpus with the study tool."
+        },
+        "flintSwarm.timeoutSeconds": {
+          "type": "number",
+          "default": 300,
+          "minimum": 60,
+          "maximum": 1800,
+          "description": "Seconds a single model may take before it is given up on. Free models are slow; raise this if good answers are being cut off."
+        },
+        "flintSwarm.paidFallback": {
+          "type": "string",
+          "enum": [
+            "off",
+            "auto",
+            "always"
+          ],
+          "enumDescriptions": [
+            "Free models only. A question with no free answer comes back empty.",
+            "Spend from the paid budget only when no free model answered.",
+            "Answer with paid models from the start. Fastest and most reliable; spends the budget quickest."
+          ],
+          "default": "auto",
+          "description": "Whether a question may fall back to a paid model, spending from the budget set with \"Flint Swarm: Set the Paid Model Budget\" (default $5 in total)."
         }
       }
     }

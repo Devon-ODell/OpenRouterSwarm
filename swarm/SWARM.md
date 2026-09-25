@@ -159,6 +159,7 @@ extension into Cursor. From the editor you can:
 
 - ask several free models about the selection, or the function under the cursor, in parallel, with a merged and checked answer;
 - queue a swarm task for the selection, with file and lines attached;
+- see the queue in its own tab, and edit or drop a task from it (hover a row for ✎ and ✕);
 - look up MIT lectures;
 - start, stop and read reports on the swarm for the current repository.
 
@@ -168,13 +169,44 @@ free requests but not the swarm's reserve. 👍/👎 on an answer trains a
 separate bandit (`swarm/state/consult/learn.json`) that picks which models
 answer next time.
 
+The queue tab reads `bridge.py status` and writes with `queue-edit`,
+`queue-remove` and `queue-clear`. Editing keeps the task's id, dependencies and
+attempt history, and clears a retry backoff so a fixed task is tried again at
+once. Two things are refused rather than done quietly: rewriting a task a worker
+is running right now, and removing a task other queued tasks depend on — those
+can never be claimed without it, so they are only removed together, on a
+confirmation.
+
+### The editor's paid allowance
+
+The swarm cannot spend credits. The extension can, up to a fixed pot, because a
+question whose free models are all rate-limited is otherwise simply lost:
+
+- `editor_wallet` in `config.json` sets it (`cap_usd`, default $5, `enabled`,
+  and `paid_models` to prefer). `bridge.py wallet [--cap N] [--reset]
+  [--disable] [--account]` reads and changes it, as does *Flint Swarm: Set the
+  Paid Model Budget* in the editor.
+- `--paid auto` (the default) spends only when **no** free model answered:
+  one paid model is asked to rescue the question. `--paid off` is free-only;
+  `--paid always` starts with paid models.
+- Configured slugs are checked against OpenRouter's live catalog and skipped if
+  they no longer exist or no longer take tools, so a retired model does not turn
+  into another dead end; failing that, the catalog's cheap tier is used.
+- What is charged is what OpenRouter reports for the request (`usage.cost`),
+  accumulated in `~/.flint/wallet.json` under a file lock and checked before
+  every request, so parallel answers cannot overspend the pot. Only turns the
+  bridge starts for a paid model carry the wallet: a free turn is never stopped
+  because the pot is empty. flint exits 10 when it is.
+
 ## Budget
 
 With at least $10 of credits OpenRouter allows 1000 free-model requests per UTC
 day (8 pm Eastern). The swarm reads the real limit and usage from OpenRouter at
 startup and every 15 minutes, keeps `reserve` (100) for you, and waits for the
 reset when the rest is spent. Only `:free` models are used; a paid model in the
-pool is refused unless `allow_paid` is true, so credits are never spent.
+pool is refused unless `allow_paid` is true, so the daemon never spends credits.
+The one exception is the editor's `editor_wallet` above, which is capped in
+dollars and only reachable from the extension.
 `swarm models` lists free tool-capable models; `swarm models --write` resets the
 pool. One worker usually spends the day's allowance, so more workers finish
 sooner, not more; they also land in parallel and conflict more.

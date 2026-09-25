@@ -400,6 +400,90 @@ class Queue:
         with self.locked():
             return _read(self.path)
 
+    def get(self, tid):
+        with self.locked():
+            return next((r for r in _read(self.path) if r["id"] == tid), None)
+
+    @staticmethod
+    def blocked_by(tid, rows):
+        """Pending tasks that could never be claimed if `tid` went away: the ones that depend on
+        it, directly or through another task. Children are not included — only depends_on gates
+        claim(), so a child of a removed task still runs."""
+        doomed, grew = {tid}, True
+        while grew:
+            grew = False
+            for r in rows:
+                if r["id"] not in doomed and doomed.intersection(r.get("depends_on") or []):
+                    doomed.add(r["id"])
+                    grew = True
+        return [r for r in rows if r["id"] in doomed and r["id"] != tid]
+
+    def remove(self, tid, cascade=False):
+        """Drop a pending task, e.g. because the developer deleted it in the editor. Tasks that
+        depend on it can never be claimed once it is gone, so they go too — but only when the
+        caller asks, so a click cannot quietly empty half the queue. Returns the removed rows."""
+        with self.locked():
+            rows = _read(self.path)
+            if not any(r["id"] == tid for r in rows):
+                raise KeyError(tid)
+            doomed = self.blocked_by(tid, rows)
+            if doomed and not cascade:
+                raise ValueError(f"{len(doomed)} queued task(s) depend on this one: "
+                                 + ", ".join(r["title"] for r in doomed))
+            gone = {tid} | {r["id"] for r in doomed}
+            _write(self.path, [r for r in rows if r["id"] not in gone])
+            return [r for r in rows if r["id"] in gone]
+
+    def clear(self, include_claimed=False):
+        """Empty the queue. A claimed task is the one a worker is in the middle of, so it stays
+        unless the caller insists. Returns (removed, kept)."""
+        with self.locked():
+            rows = _read(self.path)
+            kept = [] if include_claimed else [r for r in rows if r.get("claimed")]
+            keep = {r["id"] for r in kept}
+            _write(self.path, kept)
+            return [r for r in rows if r["id"] not in keep], kept
+
+    def edit(self, tid, title=None, detail=None, kind=None, priority=None, acceptance=None):
+        """Rewrite a pending task in place, keeping its id, its dependencies and its history.
+        Only the fields given change. A task being worked on right now is refused: the worker
+        already has the old wording. Editing clears a retry backoff, since the point of fixing
+        a task is to have it tried again."""
+        with self.locked():
+            rows = _read(self.path)
+            task = next((r for r in rows if r["id"] == tid), None)
+            if task is None:
+                raise KeyError(tid)
+            if task.get("claimed"):
+                raise ValueError("a worker is running this task right now; stop the swarm, "
+                                 "or wait for the attempt to finish")
+            new = dict(task)
+            if title is not None:
+                if not title.strip():
+                    raise ValueError("a task needs a title")
+                taken = {r["title"].strip().lower() for r in rows + _read(self.done) if r["id"] != tid}
+                if title.strip().lower() in taken:
+                    raise ValueError("another task already has that title")
+                new["title"] = title.strip()
+            if detail is not None:
+                new["detail"] = detail.strip()
+            if kind is not None:
+                if kind not in KINDS:
+                    raise ValueError(f"kind must be one of {', '.join(KINDS)}")
+                new["kind"] = kind
+            if priority is not None:
+                if not 0 <= int(priority) <= 2:
+                    raise ValueError("priority must be 0, 1 or 2")
+                new["priority"] = int(priority)
+            if acceptance is not None:
+                new["acceptance"] = [a.strip() for a in acceptance if a and a.strip()] or None
+                if new["acceptance"] is None:
+                    del new["acceptance"]
+            criteria(new)                      # refuses an unusable acceptance list before it lands
+            new.pop("not_before", None)
+            _write(self.path, [new if r["id"] == tid else r for r in rows])
+            return new
+
     def recover(self, accepted=None):
         """Only called after acquiring the exclusive daemon lock."""
         with self.locked():

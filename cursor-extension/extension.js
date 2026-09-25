@@ -81,10 +81,16 @@ function runBridge(args, opts = {}) {
   });
 }
 
-async function bridgeJson(args) {
+/** The bridge's last object, whether it reports success or failure. */
+async function bridgeLast(args) {
   const res = await runBridge(args);
   const last = res.events.filter((e) => e.event !== 'log').pop();
   if (!last) throw new Error(tail(res.stderr) || `bridge exited with code ${res.code}`);
+  return last;
+}
+
+async function bridgeJson(args) {
+  const last = await bridgeLast(args);
   if (last.ok === false || (last.event === 'error' && last.error)) throw new Error(last.error);
   return last;
 }
@@ -164,7 +170,8 @@ async function ask(question, ctx) {
   await panel.reveal();
   const c = cfg();
   const args = ['ask', '--repo', repo, '--question', question, '--models', String(c.get('models')),
-    '--steps', String(c.get('stepsPerModel'))];
+    '--steps', String(c.get('stepsPerModel')), '--timeout', String(c.get('timeoutSeconds') || 300),
+    '--paid', String(c.get('paidFallback') || 'auto')];
   if (!c.get('synthesize')) args.push('--no-synthesis');
   if (!c.get('useStudy')) args.push('--no-study');
   const go = (selectionFile) => vscode.window.withProgress(
@@ -180,6 +187,9 @@ async function ask(question, ctx) {
           panel.post({ type: 'askEvent', id, event: ev });
           if (ev.event === 'answer') progress.report({ message: `${++answered} answered (${ev.model})` });
           if (ev.event === 'start' && ev.role === 'synthesis') progress.report({ message: `merging with ${ev.model}…` });
+          if (ev.event === 'rescue' && ev.models && ev.models.length) {
+            progress.report({ message: `no free model answered — paying for ${ev.models[0]}…` });
+          }
         },
       });
       if (!res.events.some((e) => e.event === 'done')) {
@@ -233,6 +243,139 @@ async function queueTask(title, ctx) {
 
 async function cmdQueue() {
   await queueTask(null, await codeContext(currentEditor()));
+}
+
+// ---------------------------------------------------------------- the queue
+
+/** The repository the panel is showing, which is not always the active editor's. */
+function panelRepo(msg) {
+  return (msg && msg.repo) || repoFor(currentEditor() && currentEditor().document.uri);
+}
+
+async function queueGet(msg) {
+  const repo = panelRepo(msg);
+  if (!repo) return;
+  try {
+    const res = await bridgeJson(['queue-get', '--repo', repo, '--id', msg.id]);
+    panel.post({ type: 'queueTask', task: res.task, kinds: res.kinds });
+  } catch (e) {
+    vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
+    refreshStatus();
+  }
+}
+
+async function queueEdit(msg) {
+  const repo = panelRepo(msg);
+  if (!repo) return;
+  const args = ['queue-edit', '--repo', repo, '--id', msg.id];
+  if (msg.title != null) args.push('--title', msg.title);
+  if (msg.detail != null) args.push('--detail', msg.detail);
+  if (msg.kind) args.push('--kind', msg.kind);
+  if (msg.priority != null) args.push('--priority', String(msg.priority));
+  for (const line of msg.acceptance || []) args.push('--acceptance', line);
+  try {
+    const res = await bridgeJson(args);
+    panel.post({ type: 'queueSaved', task: res.task });
+    vscode.window.setStatusBarMessage(`$(check) Swarm task updated: ${res.task.title}`, 4000);
+  } catch (e) {
+    panel.post({ type: 'queueError', id: msg.id, error: e.message });
+  }
+  refreshStatus();
+}
+
+async function queueRemove(msg) {
+  const repo = panelRepo(msg);
+  if (!repo) return;
+  const blocks = msg.blocks || [];
+  // A quick ✕ should stay quick. Only the two cases that lose more than one task ask first.
+  if (msg.claimed || blocks.length) {
+    const what = msg.claimed
+      ? `A worker is running "${msg.title}" right now. Remove it anyway? The attempt in progress is abandoned; work already committed stays on the swarm branch.`
+      : `"${msg.title}" is needed by ${blocks.length} other queued task(s): ${blocks.map((b) => b.title).join(', ')}. They can never run without it, so they are removed too.`;
+    const ok = await vscode.window.showWarningMessage(what, { modal: true }, 'Remove');
+    if (ok !== 'Remove') return;
+  }
+  const res = await bridgeLast(['queue-remove', '--repo', repo, '--id', msg.id,
+    ...(blocks.length ? ['--cascade'] : [])]).catch((e) => ({ ok: false, error: e.message }));
+  if (res.ok === false) {
+    if ((res.needs_cascade || []).length) {   // it gained a dependent since the panel last looked
+      return queueRemove(Object.assign({}, msg, { blocks: res.needs_cascade }));
+    }
+    vscode.window.showErrorMessage(`Flint swarm: ${res.error}`);
+  } else {
+    const names = (res.removed || []).map((r) => r.title);
+    vscode.window.setStatusBarMessage(`$(trash) Removed from the swarm queue: ${names.join(', ')}`, 4000);
+  }
+  refreshStatus();
+}
+
+async function clearQueue(msg) {
+  const repo = panelRepo(msg);
+  if (!repo) { vscode.window.showWarningMessage('Open a file in a Git repository first.'); return; }
+  const s = await bridgeJson(['status', '--repo', repo]).catch(() => null);
+  const n = s ? s.queue.length : 0;
+  if (!n) { vscode.window.showInformationMessage('The swarm queue is already empty.'); return; }
+  const claimed = s.queue.filter((t) => t.claimed).length;
+  const ok = await vscode.window.showWarningMessage(
+    `Remove all ${n - claimed} waiting task(s) from the swarm queue for ${path.basename(repo)}?` +
+    (claimed ? ` The ${claimed} task(s) being worked on right now are kept.` : ' This cannot be undone.'),
+    { modal: true }, 'Clear the queue');
+  if (ok !== 'Clear the queue') return;
+  try {
+    const res = await bridgeJson(['queue-clear', '--repo', repo]);
+    vscode.window.showInformationMessage(`Removed ${res.removed.length} task(s) from the queue.`);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
+  }
+  refreshStatus();
+}
+
+async function showQueue() {
+  await panel.reveal();
+  panel.post({ type: 'tab', tab: 'queue' });
+  return refreshStatus();
+}
+
+// ---------------------------------------------------------------- paid budget
+
+/** What OpenRouter says about the credits behind the key, so the dialog can say whether the
+ *  budget is actually spendable. */
+function creditNote(account) {
+  if (!account) return '';
+  if (account.is_free_tier) return ' Warning: this API key has no purchased credits, so paid models will be refused.';
+  const left = account.limit_remaining;
+  return left != null ? ` The key has $${left.toFixed(2)} left.`
+    : ` Spent on the account today: $${(account.usage_daily || 0).toFixed(4)}.`;
+}
+
+async function setBudget() {
+  let current = null, account = null;
+  try {
+    const res = await bridgeJson(['wallet', '--account']);
+    current = res.wallet;
+    account = res.account;
+  } catch (_) { /* reported below */ }
+  const answer = await vscode.window.showInputBox({
+    title: 'Paid model budget for this extension',
+    prompt: (current
+      ? `Dollars the extension may spend in total. $${current.spent.toFixed(4)} of $${current.cap.toFixed(2)} used so far. 0 turns paid models off.`
+      : 'Dollars the extension may spend in total. 0 turns paid models off.') + creditNote(account),
+    value: current ? String(current.cap) : '5',
+    validateInput: (v) => (/^\d+(\.\d{1,2})?$/.test(v.trim()) ? null : 'A dollar amount, e.g. 5 or 2.50'),
+  });
+  if (answer === undefined) return;
+  try {
+    const res = await bridgeJson(['wallet', '--cap', String(parseFloat(answer)), '--enable']);
+    const w = res.wallet;
+    const act = w.spent > 0 ? await vscode.window.showInformationMessage(
+      `Budget set to $${w.cap.toFixed(2)}. $${w.spent.toFixed(4)} of it is already spent.`, 'Reset to $0 spent') : null;
+    if (act) await bridgeJson(['wallet', '--reset']);
+    else if (w.spent === 0) vscode.window.showInformationMessage(`Budget set to $${w.cap.toFixed(2)}, nothing spent yet.`);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
+  }
+  lastInfo = 0;
+  refreshStatus();
 }
 
 async function study(query) {
@@ -338,7 +481,10 @@ function refreshStatus() {
         const s = await bridgeJson(['status', '--repo', repo]);
         panel.post({ type: 'status', data: s });
         statusItem.text = s.daemon_running ? `$(sync~spin) Swarm · ${s.queue.length} queued` : '$(organization) Swarm';
-        statusItem.tooltip = s.daemon_running ? `Flint swarm running on ${s.repo}` : 'Flint swarm: ask about the code you are working on';
+        statusItem.tooltip = (s.daemon_running ? `Flint swarm running on ${s.repo}`
+          : 'Flint swarm: ask about the code you are working on')
+          + (s.wallet ? `\nPaid budget: $${s.wallet.spent.toFixed(4)} of $${s.wallet.cap.toFixed(2)} used`
+            : '\nPaid models off: free models only');
       }
       if (Date.now() - lastInfo > 5 * 60 * 1000) {
         lastInfo = Date.now();
@@ -387,14 +533,24 @@ class SwarmPanel {
 <body>
 <div id="status"></div>
 <div class="row"><button id="start" class="secondary">Start swarm</button><button id="stop" class="secondary">Stop</button><button id="report" class="secondary">Report</button></div>
-<div id="recent"></div>
-<form id="askForm">
-  <textarea id="question" placeholder="Ask the swarm about the code you're on… (⌘/Ctrl+Enter)"></textarea>
-  <label><input type="checkbox" id="withCode" checked> Include my selection (or the function under the cursor)</label>
-  <div class="row"><button type="submit">Ask the swarm</button><button id="queue" type="button" class="secondary">Queue as task</button><button id="lookup" type="button" class="secondary">MIT lookup</button></div>
-</form>
+<nav id="tabs" role="tablist">
+  <button class="tab" id="tab-ask" data-tab="ask" role="tab" aria-selected="true">Swarm</button>
+  <button class="tab" id="tab-queue" data-tab="queue" role="tab" aria-selected="false">Queue<span id="qcount" class="badge" hidden></span></button>
+</nav>
 <div id="notice" class="notice"></div>
-<section id="threads"></section>
+<section id="pane-ask" role="tabpanel">
+  <div id="recent"></div>
+  <form id="askForm">
+    <textarea id="question" placeholder="Ask the swarm about the code you're on… (⌘/Ctrl+Enter)"></textarea>
+    <label><input type="checkbox" id="withCode" checked> Include my selection (or the function under the cursor)</label>
+    <div class="row"><button type="submit">Ask the swarm</button><button id="queue" type="button" class="secondary">Queue as task</button><button id="lookup" type="button" class="secondary">MIT lookup</button></div>
+  </form>
+  <section id="threads"></section>
+</section>
+<section id="pane-queue" role="tabpanel" hidden>
+  <div id="queueHead"></div>
+  <div id="queueList"></div>
+</section>
 <script nonce="${nonce}" src="${uri('render.js')}"></script>
 <script nonce="${nonce}" src="${uri('panel.js')}"></script>
 </body></html>`;
@@ -427,6 +583,18 @@ class SwarmPanel {
       await stopGrind();
     } else if (m.type === 'report') {
       await showReport();
+    } else if (m.type === 'queueGet') {
+      await queueGet(m);
+    } else if (m.type === 'queueEdit') {
+      await queueEdit(m);
+    } else if (m.type === 'queueRemove') {
+      await queueRemove(m);
+    } else if (m.type === 'queueClear') {
+      await clearQueue(m);
+    } else if (m.type === 'budget') {
+      await setBudget();
+    } else if (m.type === 'refresh') {
+      await refreshStatus();
     }
   }
 }
@@ -453,6 +621,9 @@ function activate(context) {
   reg('flintSwarm.startGrind', () => startGrind());
   reg('flintSwarm.stopGrind', stopGrind);
   reg('flintSwarm.showReport', showReport);
+  reg('flintSwarm.showQueue', showQueue);
+  reg('flintSwarm.clearQueue', () => clearQueue());
+  reg('flintSwarm.setBudget', setBudget);
   reg('flintSwarm.refresh', () => { lastInfo = 0; return refreshStatus(); });
   const timer = setInterval(() => { if (panel.view && panel.view.visible) refreshStatus(); }, 60 * 1000);
   context.subscriptions.push({ dispose: () => clearInterval(timer) });
@@ -466,4 +637,5 @@ function deactivate() {
   for (const child of running) child.kill('SIGTERM');
 }
 
-module.exports = { activate, deactivate, _test: { parseLines, innermost, flintRoot, where, bridgeJson, PRESETS } };
+module.exports = { activate, deactivate,
+  _test: { parseLines, innermost, flintRoot, where, bridgeJson, bridgeLast, PRESETS } };
