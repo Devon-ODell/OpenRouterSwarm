@@ -32,7 +32,7 @@ function expandHome(p) { return p ? p.replace(/^~(?=$|\/)/, os.homedir()) : p; }
 function flintRoot() {
   const candidates = [expandHome((cfg().get('flintPath') || '').trim()), process.env.FLINT_ROOT];
   try { candidates.push(fs.readFileSync(path.join(__dirname, 'flint-root.txt'), 'utf8').trim()); } catch (_) { /* not packaged */ }
-  candidates.push(path.resolve(__dirname, '..'), path.join(os.homedir(), 'Desktop', 'LingAI-Trader'));
+  candidates.push(path.resolve(__dirname, '..'));
   return candidates.find((c) => c && fs.existsSync(path.join(c, 'swarm', 'bridge.py'))) || null;
 }
 
@@ -386,6 +386,7 @@ class SwarmPanel {
 <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="stylesheet" href="${uri('panel.css')}"></head>
 <body>
 <div id="status"></div>
+<div id="editing"></div>
 <div class="row"><button id="start" class="secondary">Start swarm</button><button id="stop" class="secondary">Stop</button><button id="report" class="secondary">Report</button></div>
 <div id="recent"></div>
 <form id="askForm">

@@ -38,3 +38,6 @@ a.file:hover { text-decoration: underline; }
 .note { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; }
 .spin { width: 9px; height: 9px; border: 2px solid var(--vscode-descriptionForeground); border-top-color: transparent; border-radius: 50%; display: inline-block; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+.section { margin: 6px 0; padding-top: 6px; border-top: 1px solid var(--vscode-panel-border); }
+.section b { display: block; margin-bottom: 2px; }

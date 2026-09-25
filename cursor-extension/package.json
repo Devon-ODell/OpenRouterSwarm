@@ -115,7 +115,7 @@
         "flintSwarm.flintPath": {
           "type": "string",
           "default": "",
-          "description": "Folder that contains flint.py and swarm/ (your LingAI-Trader checkout). Leave empty to use the folder recorded at install time."
+          "description": "Folder that contains flint.py and swarm/. Leave empty to use the folder recorded at install time."
         },
         "flintSwarm.python": {
           "type": "string",

@@ -205,7 +205,7 @@ def run_flint(prompt, repo, model, steps, study=True, timeout=420, on_progress=N
         rounds = len(re.findall(r"^round \d+/", err, re.M))
         return {"ok": False, "model": model, "error": f"timed out after {timeout}s ({rounds} requests made)",
                 "secs": round(time.time() - t0), "requests": rounds, "exit": None}
-    studied = len(re.findall(r"^tool: study$", err or "", re.M))
+    studied = len(re.findall(r"^tool: study\b", err or "", re.M))
     tools = len(re.findall(r"^tool: ", err or "", re.M))
     rounds = len(re.findall(r"^round \d+/", err or "", re.M))
     base = {"model": model, "secs": round(time.time() - t0), "study_calls": studied,
@@ -309,9 +309,24 @@ def cmd_info(a):
 
 
 def _journal_line(j):
+    """One line of the activity feed. Edits name the files, since that is what an owner
+    watching the swarm actually wants to know."""
+    at, event = j.get("iso", "")[11:16], j.get("event", "")
+    if event == "edits":
+        files = j.get("files") or []
+        names = ", ".join(f["path"] for f in files[:3])
+        more = f" +{len(files) - 3} more" if len(files) > 3 else ""
+        churn = f"+{sum(f.get('added', 0) for f in files)}/-{sum(f.get('removed', 0) for f in files)}"
+        return f"{at} edited {names}{more} ({churn})"
+    if event == "turn" and j.get("edits"):
+        return f"{at} {j.get('role', '')} {j.get('model', '')} wrote {', '.join(j['edits'][:3])}"
+    if event == "turn":
+        return f"{at} {j.get('role', '')} {j.get('model', '')} ({j.get('secs', '?')}s)"
+    if event == "handoff":
+        return f"{at} {j.get('role', '')} handed from {j.get('model', '')} to {j.get('to', '')}"
     what = j.get("title") or j.get("model") or ""
     extra = j.get("stage") or j.get("role") or ""
-    return f"{j.get('iso', '')[11:16]} {j.get('event', '')} {extra} {what}".strip()
+    return f"{at} {event} {extra} {what}".strip()
 
 
 def cmd_status(a):
@@ -326,6 +341,18 @@ def cmd_status(a):
         _, ahead = swarmd.git(["rev-list", "--count", f"{c.get('base_branch', 'main')}..{swarmd.trunk_name(c)}"], cwd=c["repo"])
     import experiment
     exp = experiment.summary(swarmd.STATE / "journal.jsonl")
+    rows = swarmd._read(swarmd.STATE / "journal.jsonl")
+    # The files most recently changed, newest first: what the swarm is working on right now.
+    editing, seen = [], set()
+    for j in reversed(rows[-400:]):
+        for f in (j.get("files") or []) if j.get("event") == "edits" else []:
+            if f["path"] not in seen:
+                seen.add(f["path"])
+                editing.append({"path": f["path"], "added": f.get("added", 0),
+                                "removed": f.get("removed", 0), "at": j.get("iso", "")[11:16],
+                                "task": j.get("title", "")})
+        if len(editing) >= 12:
+            break
     budget = swarmd.Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                            owner_window=c.get("owner_window", ["00:00", "00:00"])).snapshot()
     emit({"repo": c["repo"], "is_target": is_target(c["repo"]), "daemon_running": daemon_running(),
@@ -336,7 +363,8 @@ def cmd_status(a):
           "parked": sum(t.get("status") in ("parked", "split") for t in done),
           "budget": budget, "experiment": {"verdict": exp["verdict"], "on": exp["on"]["attempts"],
                                            "off": exp["off"]["attempts"]},
-          "recent": [_journal_line(j) for j in swarmd._read(swarmd.STATE / "journal.jsonl")[-12:]]})
+          "recent": [_journal_line(j) for j in rows[-14:]],
+          "editing": editing})
     return 0
 
 

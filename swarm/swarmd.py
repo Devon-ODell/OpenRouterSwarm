@@ -441,6 +441,17 @@ def waiting(worker, why):
         _waiting[worker] = why
 
 
+EDIT_TOOL = re.compile(r"^tool: (write_file|edit_file) (.+)$", re.M)
+
+
+def touched(progress):
+    """Files a turn wrote to, in the order it first touched them, from its own progress log."""
+    seen = {}
+    for _, path in EDIT_TOOL.findall(progress):
+        seen.setdefault(path.strip(), True)
+    return list(seen)
+
+
 def count_study(worker, n=0, reset=False):
     """Study-tool calls made by one worker's turns since its attempt began."""
     with _study_lock:
@@ -574,10 +585,15 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
                 p.communicate()
                 raise
     progress = logfile.read_text(errors="replace")
-    studied = len(re.findall(r"^tool: study$", progress, re.M))
+    studied = len(re.findall(r"^tool: study\b", progress, re.M))
     count_study(worker, studied)
+    edits = touched(progress)
+    if edits:
+        log(f"{role}: {model} edited " + ", ".join(edits[:4])
+            + (f" (+{len(edits) - 4} more)" if len(edits) > 4 else ""), worker)
     journal("turn", role=role, worker=worker, model=model, rc=p.returncode,
-            secs=round(time.time() - t0), chars=len(out), log=str(logfile), study_calls=studied)
+            secs=round(time.time() - t0), chars=len(out), log=str(logfile), study_calls=studied,
+            edits=edits[:40])
     error = progress[-1200:]
     with open(logfile, "a") as f:  # keep the answer beside the progress for later review
         f.write(f"\n--- answer from {model} (exit {p.returncode}) ---\n{out}\n")
@@ -1097,6 +1113,34 @@ class Worker(threading.Thread):
         self.evidence.record("verifying", gate=label, gates=evidence)
         return passed, json.dumps(evidence, indent=2)
 
+    def changes(self):
+        """[(path, added, removed)] of the staged candidate, from Git rather than the model."""
+        rc, stat = git(["diff", "--cached", "--numstat", self.review_base], cwd=self.wt)
+        if rc != 0:
+            return []
+        rows = []
+        for line in stat.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3:
+                added, removed, path = parts
+                rows.append((path, int(added) if added.isdigit() else 0,
+                             int(removed) if removed.isdigit() else 0))
+        return rows
+
+    def report_changes(self, label):
+        """Say what the attempt has actually changed so far, and record it."""
+        rows = self.changes()
+        if not rows:
+            return rows
+        shown = ", ".join(f"{p} +{a}-{d}" for p, a, d in rows[:5])
+        log(f"{label}: {len(rows)} file(s), +{sum(a for _, a, _ in rows)}/-{sum(d for _, _, d in rows)}"
+            f" — {shown}" + (f", +{len(rows) - 5} more" if len(rows) > 5 else ""), self.name)
+        journal("edits", id=self.task["id"], title=self.task["title"], worker=self.name,
+                stage=label, files=[{"path": p, "added": a, "removed": d} for p, a, d in rows[:40]])
+        if self.evidence:
+            self.evidence.record("changed", files=[p for p, _, _ in rows])
+        return rows
+
     def snapshot(self):
         if not self.own_branch():
             raise ModelError(f"worker switched away from {self.branch}")
@@ -1195,6 +1239,7 @@ class Worker(threading.Thread):
             tree, diff = self.snapshot()
             if not diff.strip():
                 return "no_change", "no implementation changes; inspect the retained handoff", info
+            self.report_changes(f"candidate-{cycle}")
             if weakened_tests(diff):
                 return "weakened_tests", "existing assertions removed; manual review required", info
             ok, tests = self.gate(f"candidate-{cycle}")

@@ -655,6 +655,48 @@ class GuardTests(SwarmBase):
             add(title="Third", depends_on=["a task nobody queued"])
         self.assertIn("no queued or finished task matches", str(exc.exception))
 
+    def test_a_turn_reports_the_files_it_edited(self):
+        """The owner's question all day was "what is it actually doing"."""
+        progress = ("round 1/25: requesting a:free\n"
+                    "tool: read_file internal/store/wal.go\n"
+                    "tool: edit_file internal/store/wal.go\n"
+                    "tool: study expected shortfall\n"
+                    "tool: write_file internal/store/wal_test.go\n"
+                    "tool: edit_file internal/store/wal.go\n"      # the same file again
+                    "tool: bash go test ./internal/...\n")
+        self.assertEqual(swarmd.touched(progress),
+                         ["internal/store/wal.go", "internal/store/wal_test.go"])
+        self.assertEqual(swarmd.touched("round 1/25: requesting a:free\n"), [])
+        # A study line now carries its query; counting it must not depend on the line ending there.
+        self.assertEqual(len(re.findall(r"^tool: study\b", progress, re.M)), 1)
+
+    def test_changed_files_come_from_git_not_the_model(self):
+        repo, git = self.repo()
+        w = self.worker(self.cfg(repo))
+        w.task = {"id": "t1", "title": "Bound portal queries"}
+        w.evidence = None
+        swarmd.ensure_trunk(w.c)
+        w.ensure_worktree({"id": "t1"})
+        _, w.review_base = swarmd.git(["rev-parse", "HEAD"], cwd=w.wt, check=True)
+        self.assertEqual(w.report_changes("baseline"), [])      # nothing changed, nothing claimed
+        (w.wt / "app.txt").write_text("one\ntwo\n")
+        (w.wt / "new.txt").write_text("fresh\n")
+        swarmd.git(["add", "-A"], cwd=w.wt, check=True)
+        lines = []
+        with patch.object(swarmd, "log", side_effect=lambda m, *a: lines.append(m)):
+            rows = w.report_changes("candidate-0")
+        self.assertEqual(sorted(p for p, _, _ in rows), ["app.txt", "new.txt"])
+        self.assertIn("2 file(s)", lines[0])
+        self.assertIn("app.txt", lines[0])
+        edits = [j for j in swarmd._read(swarmd.STATE / "journal.jsonl") if j["event"] == "edits"]
+        self.assertEqual(edits[0]["title"], "Bound portal queries")
+        self.assertEqual({f["path"] for f in edits[0]["files"]}, {"app.txt", "new.txt"})
+        # Committing does not hide the work: the candidate is still measured from the base it
+        # started at, which is what the reviewer is shown.
+        swarmd.git(["commit", "-qm", "x"], cwd=w.wt, check=True)
+        self.assertEqual(sorted(p for p, _, _ in w.report_changes("candidate-1")),
+                         ["app.txt", "new.txt"])
+
     def test_ctrl_c_does_not_score_the_models_that_were_mid_turn(self):
         """Stopping the run killed each turn's process, which looked like a crashed model."""
         repo, _ = self.repo()

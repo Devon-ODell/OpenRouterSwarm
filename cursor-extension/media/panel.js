@@ -29,6 +29,19 @@
     return bits.map((b) => `<div>${b}</div>`).join('');
   }
 
+  function editingHtml() {
+    // What the swarm has changed, newest first. Each row opens the file in the target repo.
+    const files = (status && status.editing) || [];
+    if (!files.length) return '';
+    const repo = (status && status.repo) || '';
+    const rows = files.slice(0, 8).map((f) => {
+      const churn = `<span class="dim">+${f.added}\u2212${f.removed}</span>`;
+      const where = f.task ? ` <span class="dim">${R.esc(f.task.slice(0, 40))}</span>` : '';
+      return `<div><a href="#" class="file" data-path="${R.esc(repo + '/' + f.path)}">${R.esc(f.path)}</a> ${churn}${where}</div>`;
+    }).join('');
+    return `<div class="section"><b>Being edited</b>${rows}</div>`;
+  }
+
   function renderStatus() {
     $('status').innerHTML = statusHtml();
     const running = status && status.daemon_running;
@@ -36,6 +49,7 @@
     $('stop').disabled = !running;
     const recent = (status && status.recent) || [];
     $('recent').innerHTML = recent.length ? recent.slice(-6).reverse().map((r) => `<div>${R.esc(r)}</div>`).join('') : '';
+    $('editing').innerHTML = editingHtml();
   }
 
   function cardHtml(c) {

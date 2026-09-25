@@ -139,6 +139,18 @@ can `read_file` the page a card cites. Raw OCW site pages fill in only when
 nothing better matched. Excerpts are injected into a prompt unasked only when a
 lecture card matches the task. The `study` tool returns whatever matches.
 
+## Watching it work
+
+A turn is silent for minutes, so the supervisor says what it is waiting on and
+what changed. Each turn names its model and the rounds it may use; every three
+minutes a busy worker reports its task, elapsed time, role and model, or that
+it is waiting for the day's allowance. Files a turn writes to are named as it
+goes (`implementer: a:free edited internal/store/wal.go`), and each candidate
+is measured against Git rather than the model's own account of itself
+(`candidate-0: 3 file(s), +84/-4 — ...`). Both land in `journal.jsonl` as
+`turn` and `edits` rows, and the Cursor panel lists what is being edited, each
+file opening in the target repository.
+
 ## Review and merge
 
 ```sh

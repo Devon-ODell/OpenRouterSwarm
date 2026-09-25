@@ -715,8 +715,9 @@ class Agent:
 
     @staticmethod
     def _summary(name, args):
-        key = {"bash": "command", "search": "pattern", "list_files": "pattern"}.get(name, "path")
-        s = str(args.get(key, "")).replace("\n", " ")
+        key = {"bash": "command", "search": "pattern", "list_files": "pattern",
+               "study": "query"}.get(name, "path")
+        s = str(args.get(key, "")).replace("\n", " ").strip()
         return s if len(s) < 80 else s[:77] + "…"
 
     def run_tool(self, call):
@@ -737,7 +738,9 @@ class Agent:
             console.print(Text.assemble(("◆ ", ACCENT), (name, "bold"),
                                         (f"({self._summary(name, args)})", "dim")))
         else:
-            print(f"tool: {name}", file=sys.stderr, flush=True)
+            # The supervisor and the editor read these lines to show what is being touched,
+            # so name the target, not just the tool.
+            print(f"tool: {name} {self._summary(name, args)}".rstrip(), file=sys.stderr, flush=True)
         if name in NEEDS_APPROVAL:
             ok, reason = self._approve(name, args)
             if not ok:
