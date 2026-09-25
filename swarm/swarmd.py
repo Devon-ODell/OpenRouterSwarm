@@ -62,6 +62,8 @@ _stop = threading.Event()
 _sync_failed = {}
 _study_lock = threading.Lock()
 _study_calls = {}
+_held = {}            # worker -> when it last said it was waiting for the allowance
+_waiting = {}         # worker -> why it is not working, or absent while it is
 NO_CORPUS = os.path.join(os.devnull, "no-corpus.db")   # cannot exist: flint then hides `study`
 
 
@@ -162,6 +164,15 @@ def clean_env():
     return {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
 
 
+def kill_group(p):
+    """Stop a child and everything it started. Never raises: a process that is already gone,
+    or that the OS will not let us signal, must not abort a shutdown that is killing others."""
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:              # gone (ProcessLookupError) or refused (PermissionError)
+        pass
+
+
 @contextmanager
 def process(cmd, **kwargs):
     with _process_lock:
@@ -173,10 +184,7 @@ def process(cmd, **kwargs):
         yield p
     finally:
         if p.poll() is None:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            kill_group(p)
         p.wait()
         with _process_lock:
             _processes.discard(p)
@@ -186,10 +194,7 @@ def shutdown():
     _stop.set()
     with _process_lock:
         for p in _processes:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            kill_group(p)
 
 
 def sh(cmd, cwd=None, timeout=900, env=None):
@@ -199,10 +204,7 @@ def sh(cmd, cwd=None, timeout=900, env=None):
         try:
             out, err = p.communicate(timeout=timeout)
         except BaseException:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            kill_group(p)
             p.communicate()
             raise
     return p.returncode, (out or "") + (err or "")
@@ -431,6 +433,14 @@ def study(q, c, k=None):
         return ""
 
 
+def waiting(worker, why):
+    """Record that a worker is blocked rather than working, so progress reports say so."""
+    if why is None:
+        _waiting.pop(worker, None)
+    else:
+        _waiting[worker] = why
+
+
 def count_study(worker, n=0, reset=False):
     """Study-tool calls made by one worker's turns since its attempt began."""
     with _study_lock:
@@ -522,8 +532,15 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         ok, wait, why = budget.check()
         if ok:
             break
-        log(f"{role}: holding {wait/60:.1f}m — {why}", worker)
+        # The allowance can be hours from resetting; saying so once a quarter hour is enough,
+        # and the worker records that it is waiting rather than working.
+        waiting(worker, f"waiting for the allowance: {why}")
+        if time.time() - _held.get(worker, 0) > 900:
+            _held[worker] = time.time()
+            log(f"{role}: holding {wait/60:.0f}m — {why}", worker)
         _stop.wait(max(1, min(wait, 60)))
+    _held.pop(worker, None)
+    waiting(worker, None)
 
     env = dict(os.environ)
     env["FLINT_MAX_STEPS"] = str(max_steps)
@@ -549,10 +566,7 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
             try:
                 out, _ = p.communicate(timeout=c.get("turn_timeout", 1800))
             except BaseException:
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                kill_group(p)
                 p.communicate()
                 raise
     progress = logfile.read_text(errors="replace")
@@ -920,7 +934,7 @@ def report_progress(workers, said, every=180):
         if now - said.get(w.name, since) > every:
             said[w.name] = now
             log(f"still on '{task['title'][:60]}' ({(now - since) / 60:.0f}m): "
-                f"{getattr(w, 'doing', '?')}", w.name)
+                f"{_waiting.get(w.name) or getattr(w, 'doing', '?')}", w.name)
 
 
 class Tally:
@@ -1470,7 +1484,14 @@ class Worker(threading.Thread):
                 log(f"error on {task['id']}: {e}", self.name)
                 journal("error", id=task["id"], err=str(e)[:500],
                         tb=traceback.format_exc()[-1200:])
-                self.q.release(task["id"], False, str(e)[:400])
+                # A turn that timed out is still a failed attempt: let it split like any other,
+                # or the task is shelved with no smaller pieces to try.
+                final = self.q.release(task["id"], False, str(e)[:400])
+                if final and final.get("status") == "split":
+                    try:
+                        self.decompose(final, read_goal(self.c))
+                    except Exception as exc:
+                        log(f"could not split '{final['title']}': {exc}", self.name)
                 self.stop.wait(30)
 
 

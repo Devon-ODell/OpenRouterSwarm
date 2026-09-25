@@ -90,7 +90,7 @@ def run_process(command, cwd, out_path, err_path, timeout, prompt=None):
             # Also stop background children left behind after a successful cycle.
             try:
                 os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except OSError:      # already gone, or the OS refused: neither is worth crashing on
                 pass
             p.wait()
 

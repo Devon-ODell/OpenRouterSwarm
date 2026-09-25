@@ -655,6 +655,42 @@ class GuardTests(SwarmBase):
             add(title="Third", depends_on=["a task nobody queued"])
         self.assertIn("no queued or finished task matches", str(exc.exception))
 
+    def test_shutdown_survives_a_child_it_is_not_allowed_to_kill(self):
+        """A run ended on PermissionError from killpg, losing the shutdown and the exit."""
+        p = Mock(pid=4242)
+        p.poll.return_value = None
+        swarmd._processes.add(p)
+        self.addCleanup(swarmd._processes.discard, p)
+        for boom in (PermissionError(1, "Operation not permitted"), ProcessLookupError()):
+            with self.subTest(error=type(boom).__name__), \
+                    patch.object(swarmd.os, "killpg", side_effect=boom):
+                swarmd.shutdown()                      # must not raise
+                swarmd.kill_group(p)
+        self.assertTrue(swarmd._stop.is_set())
+        swarmd._stop.clear()
+
+    def test_a_task_that_errors_on_its_last_attempt_is_still_split(self):
+        """A timed-out turn is a failed attempt; without this the task is shelved whole."""
+        repo, _ = self.repo()
+        q = swarmd.Queue(max_depth=1)
+        task = q.add("Enforce TRAIL in the pair backtest", "trailing stop", kind="bugfix")
+        q.claim()
+        q.release(task["id"], False, "first attempt produced nothing")   # attempt 1 of 2
+        rows = swarmd._read(q.path)                    # skip the retry backoff
+        rows[0]["not_before"] = 0
+        swarmd._write(q.path, rows)
+        w = self.worker(self.cfg(repo, models=["a:free"]), q)
+        w.do_task = Mock(side_effect=subprocess.TimeoutExpired("flint", 1800))
+        w.decompose = Mock(return_value=2)
+        # Leave the loop from the wait every path reaches, so a regression fails here rather
+        # than spinning forever.
+        with patch.object(w.stop, "wait", side_effect=lambda *a: w.stop.set()):
+            w.run()
+        self.assertTrue(w.decompose.called, "a failed last attempt was not split")
+        split = w.decompose.call_args[0][0]
+        self.assertEqual((split["id"], split["status"]), (task["id"], "split"))
+        self.assertIn("timed out", split["note"])
+
     def test_a_second_daemon_is_told_how_to_stop_the_first(self):
         """"Already running" is useless on its own when the running one has the wrong goal."""
         self.assertEqual(swarmd.holder(), "")                      # nothing running
