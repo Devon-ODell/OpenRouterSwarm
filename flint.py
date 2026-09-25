@@ -331,6 +331,23 @@ class BudgetPaused(Exception):
     pass
 
 
+class WalletEmpty(Exception):
+    """The dollar allowance handed down for this run (FLINT_WALLET) is used up."""
+
+
+def wallet_from_env():
+    """The paid allowance a parent handed down, or None. The swarm daemon never sets one: only
+    the editor bridge does, so only editor-initiated turns can reach the account's credits."""
+    if not os.environ.get("FLINT_WALLET"):
+        return None
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from swarm.wallet import Wallet
+        return Wallet.from_env()
+    except Exception:
+        return None
+
+
 class ProviderUnavailable(Exception):
     """The model or its providers cannot serve requests right now (overload, 404, 5xx)."""
 
@@ -507,6 +524,11 @@ def fetch_key_info(api_key):
 
 # ─── agent ───────────────────────────────────────────────────────────────────
 class Agent:
+    # An agent spends nothing unless a parent handed it a wallet, so these are the defaults for
+    # every agent, however it was built.
+    wallet = None
+    spend_usd = 0.0
+
     def __init__(self, model, yolo=False, headless=False, read_only=False):
         key = os.environ.get("OPENROUTER_API_KEY")
         if not key:
@@ -528,6 +550,8 @@ class Agent:
         self.always = set()
         self.last_reasoning = ""
         self.last_prompt_tokens = 0
+        self.wallet = wallet_from_env()
+        self.spend_usd = 0.0
         self.reset()
 
     def reset(self):
@@ -546,7 +570,28 @@ class Agent:
             kw["tool_choice"] = "none"
         if FALLBACKS:
             kw["extra_body"] = {"models": [self.model] + [m for m in FALLBACKS if m != self.model]}
+        if self.wallet:
+            # Bill from the provider's own number rather than a local price table.
+            kw.setdefault("extra_body", {})["usage"] = {"include": True}
         return kw
+
+    def _charge(self, usage):
+        """Record what the request cost, once per request. Free models report $0."""
+        if self.wallet is None or usage is None:
+            return
+        cost = getattr(usage, "cost", None)
+        if cost is None:
+            extra = getattr(usage, "model_extra", None) or {}
+            cost = extra.get("cost") if isinstance(extra, dict) else None
+        try:
+            usd = round(max(0.0, float(cost)), 6)
+        except (TypeError, ValueError):
+            return
+        self.spend_usd = round(self.spend_usd + usd, 6)
+        snap = self.wallet.record(usd, self.model)
+        if usd:
+            self._note(f"[dim]spend: ${usd:.4f} this request, "
+                       f"${snap['spent']:.4f} of ${snap['cap']:.2f} allowance[/]")
 
     def _note(self, msg):
         (console.print if not self.headless else
@@ -556,6 +601,10 @@ class Agent:
         # Failed attempts can still count toward the daily quota, so retries are few and deliberate.
         provider_retries = 0
         for attempt in range(8):
+            if self.wallet:
+                allowed, why = self.wallet.check()
+                if not allowed:
+                    raise WalletEmpty(why)
             self.throttle.acquire(on_wait=lambda s: self._note(
                 f"[dim]pacing: {RPM_LIMIT}/min budget used, waiting {s:.0f}s[/]"))
             try:
@@ -619,7 +668,7 @@ class Agent:
     def _stream_once(self):
         stream = self.client.chat.completions.create(**self._request_kwargs())
         content, reasoning, calls = "", "", {}
-        finish_reason = None
+        finish_reason, billed = None, None
         live = None
         status = None if self.headless else console.status("[dim]thinking…[/]", spinner="dots")
         if status:
@@ -627,6 +676,8 @@ class Agent:
         try:
             for chunk in stream:
                 usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    billed = usage
                 if usage and getattr(usage, "prompt_tokens", None):
                     self.last_prompt_tokens = usage.prompt_tokens
                 if not chunk.choices:
@@ -662,6 +713,7 @@ class Agent:
                         slot["args"] += fn.arguments
         finally:
             stream.close()
+            self._charge(billed)      # a reply that failed halfway through still cost money
             if status:
                 status.stop()
             if live:
@@ -1018,6 +1070,9 @@ def main():
         except BudgetPaused as e:
             print(f"flint: budget paused: {e}", file=sys.stderr)
             sys.exit(6)
+        except WalletEmpty as e:
+            print(f"flint: paid allowance exhausted: {e}", file=sys.stderr)
+            sys.exit(10)
         except DailyCapReached as e:
             print(f"flint: daily free-model cap reached, resets {fmt_reset(e.reset_at)}", file=sys.stderr)
             sys.exit(3)  # distinct code so a swarm orchestrator can back off
@@ -1038,6 +1093,10 @@ def main():
             sys.exit(1)
         finally:
             agent.save_checkpoint()
+            if agent.wallet:
+                print(f"cost: ${agent.spend_usd:.4f} this turn, "
+                      f"${agent.wallet.spent():.4f} of ${agent.wallet.cap:.2f} allowance",
+                      file=sys.stderr)
     else:
         repl(Agent(a.model, yolo=a.yolo, read_only=a.read_only))
 

@@ -334,7 +334,8 @@ class BridgeTests(SwarmBase):
         # bridge.py runs as a script and imports swarmd as a top-level module: patch that copy
         # too, or its state would land in the real swarm/state folder.
         self.sw = bridge.swarmd
-        patches = [(swarmd, "CONFIG", self.config), (bridge, "CONSULT", self.root / "consult.json")]
+        patches = [(swarmd, "CONFIG", self.config), (bridge, "CONSULT", self.root / "consult.json"),
+                   (bridge.wallet, "STATE", self.root)]
         patches += [(self.sw, name, value) for name, value in (
             ("CONFIG", self.config), ("STATE", self.root / "state"), ("LOGS", self.root / "logs"), ("HERE", self.root))]
         for target, name, value in patches:
@@ -371,8 +372,8 @@ class BridgeTests(SwarmBase):
         repo, _ = self.repo()
         calls = []
 
-        def fake_run(prompt, repo_, model, steps, study=True, timeout=300, on_progress=None):
-            calls.append((prompt, model, study))
+        def fake_run(prompt, repo_, model, steps, study=True, timeout=300, on_progress=None, purse=None):
+            calls.append((prompt, model, study, purse))
             on_progress("round 1/8: requesting " + model)
             return {"ok": True, "model": model, "text": f"answer from {model}", "secs": 1, "study_calls": 1,
                     "tool_calls": 2, "requests": 3, "exit": 0}
@@ -387,8 +388,136 @@ class BridgeTests(SwarmBase):
         self.assertNotIn("paid/x", events[0]["models"])
         self.assertTrue(events[0]["study"])
         self.assertIn("answer from", calls[-1][0])  # the merger sees every answer
+        # A free turn is never handed the wallet: an empty allowance must not stop free models.
+        self.assertEqual([c[3] for c in calls], [None] * len(calls))
+        self.assertEqual(events[-1]["usd"], 0)
         rc, out = self.run_bridge("vote", "--model", "a:free", "--useful", "1")
         self.assertEqual(out[0]["leaderboard"][0]["arm"], "a:free")
+
+    def test_a_question_no_free_model_answers_is_rescued_by_one_paid_model(self):
+        """The case the wallet exists for: every free model is busy, gated or too slow."""
+        repo, _ = self.repo()
+        seen = []
+
+        def fake_run(prompt, repo_, model, steps, study=True, timeout=300, on_progress=None, purse=None):
+            seen.append((model, purse is not None))
+            if model.endswith(":free"):
+                return {"ok": False, "model": model, "error": "model busy", "exit": 8, "requests": 1}
+            return {"ok": True, "model": model, "text": "here is the bug", "secs": 2, "requests": 4,
+                    "exit": 0, "paid": True, "usd": 0.0031}
+        with patch.object(bridge, "run_flint", side_effect=fake_run), \
+                patch.object(bridge, "paid_models", return_value=["paid/x"]), \
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "k"}):
+            rc, events = self.run_bridge("ask", "--repo", str(repo), "--question", "why?", "--models", "2")
+        self.assertEqual(rc, 0)
+        rescue = next(e for e in events if e["event"] == "rescue")
+        self.assertEqual(rescue["models"], ["paid/x"])
+        answer = next(e for e in events if e["event"] == "answer")
+        self.assertEqual((answer["model"], answer["paid"]), ("paid/x", True))
+        self.assertEqual([m for m, _ in seen][-1], "paid/x")
+        self.assertEqual([purse for m, purse in seen if m.endswith(":free")], [False, False])
+        self.assertTrue([purse for m, purse in seen if m == "paid/x"][0], "the paid turn carries the wallet")
+        done = events[-1]
+        self.assertEqual((done["answered"], done["usd"]), (1, 0.0031))
+        self.assertEqual(done["wallet"]["cap"], 5.0)
+
+    def test_free_only_mode_never_reaches_a_paid_model(self):
+        repo, _ = self.repo()
+        used = []
+
+        def fake_run(prompt, repo_, model, steps, study=True, timeout=300, on_progress=None, purse=None):
+            used.append(model)
+            return {"ok": False, "model": model, "error": "model busy", "exit": 8, "requests": 1}
+        with patch.object(bridge, "run_flint", side_effect=fake_run), \
+                patch.object(bridge, "paid_models", return_value=["paid/x"]), \
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "k"}):
+            rc, events = self.run_bridge("ask", "--repo", str(repo), "--question", "why?",
+                                         "--models", "2", "--paid", "off")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("paid/x", used)
+        self.assertNotIn("rescue", [e["event"] for e in events])
+        self.assertIsNone(events[0]["wallet"])
+
+    def test_an_empty_allowance_reports_why_instead_of_spending(self):
+        repo, _ = self.repo()
+        bridge.wallet.Wallet(cap=5.0).record(6.0, "paid/x")     # ledger lives under self.root
+
+        def fake_run(prompt, repo_, model, steps, study=True, timeout=300, on_progress=None, purse=None):
+            self.assertIsNone(purse, "nothing may be charged once the allowance is spent")
+            return {"ok": False, "model": model, "error": "model busy", "exit": 8, "requests": 1}
+        with patch.object(bridge, "run_flint", side_effect=fake_run), \
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "k"}):
+            rc, events = self.run_bridge("ask", "--repo", str(repo), "--question", "why?", "--models", "1")
+        rescue = next(e for e in events if e["event"] == "rescue")
+        self.assertEqual(rescue["models"], [])
+        self.assertIn("allowance spent", rescue["why"])
+
+    def test_the_queue_can_be_read_edited_and_cleared_from_the_editor(self):
+        repo, _ = self.repo()
+        for title in ("First task", "Second task"):
+            self.assertEqual(self.run_bridge("task", "--repo", str(repo), "--title", title)[0], 0)
+        first, second = [t["id"] for t in self.sw.Queue().pending()]
+
+        rc, out = self.run_bridge("status", "--repo", str(repo))
+        row = next(t for t in out[0]["queue"] if t["id"] == first)
+        self.assertEqual((row["title"], row["kind"], row["claimed"], row["blocks"]),
+                         ("First task", "feature", False, []))
+        self.assertEqual(out[0]["max_queue"], 20)
+
+        rc, out = self.run_bridge("queue-edit", "--repo", str(repo), "--id", first,
+                                  "--title", "First task, sharpened", "--detail", "with more detail",
+                                  "--kind", "bugfix", "--priority", "2",
+                                  "--acceptance", "it returns []", "--acceptance", "a test proves it")
+        self.assertEqual(rc, 0)
+        self.assertEqual((out[0]["task"]["title"], out[0]["task"]["kind"], out[0]["task"]["priority"],
+                          out[0]["task"]["acceptance"]),
+                         ("First task, sharpened", "bugfix", 2, ["it returns []", "a test proves it"]))
+        self.assertEqual(self.sw.Queue().pending()[0]["id"], first, "editing keeps the task's identity")
+
+        rc, out = self.run_bridge("queue-edit", "--repo", str(repo), "--id", second, "--title", "First task, sharpened")
+        self.assertEqual((rc, out[0]["ok"]), (2, False))
+        self.assertIn("already has that title", out[0]["error"])
+
+        rc, out = self.run_bridge("queue-get", "--repo", str(repo), "--id", first)
+        self.assertEqual(out[0]["task"]["detail"], "with more detail")
+
+        rc, out = self.run_bridge("queue-remove", "--repo", str(repo), "--id", first)
+        self.assertEqual((rc, out[0]["ok"]), (0, True))
+        self.assertEqual([t["id"] for t in self.sw.Queue().pending()], [second])
+
+        rc, out = self.run_bridge("queue-clear", "--repo", str(repo))
+        self.assertEqual([r["title"] for r in out[0]["removed"]], ["Second task"])
+        self.assertEqual(self.sw.Queue().pending(), [])
+
+    def test_removing_a_task_others_depend_on_needs_a_confirmation(self):
+        repo, _ = self.repo()
+        self.sw.use_repo(bridge.config_for(str(repo)))   # the editor keeps a queue per repository
+        q = self.sw.Queue()
+        base = q.add("Parse the file")
+        rider = q.add("Use the parsed file", depends_on=[base["id"]])
+        rc, out = self.run_bridge("queue-remove", "--repo", str(repo), "--id", base["id"])
+        self.assertEqual((rc, out[0]["ok"]), (2, False))
+        self.assertEqual(out[0]["needs_cascade"], [{"id": rider["id"], "title": "Use the parsed file"}])
+        self.assertEqual(len(q.pending()), 2, "nothing is removed until the cascade is agreed")
+        rc, out = self.run_bridge("queue-remove", "--repo", str(repo), "--id", base["id"], "--cascade")
+        self.assertEqual(sorted(r["title"] for r in out[0]["removed"]),
+                         ["Parse the file", "Use the parsed file"])
+        self.assertEqual(q.pending(), [])
+
+    def test_the_paid_budget_is_read_and_set_through_the_bridge(self):
+        rc, out = self.run_bridge("wallet")
+        self.assertEqual((rc, out[0]["enabled"], out[0]["wallet"]["cap"]), (0, True, 5.0))
+        rc, out = self.run_bridge("wallet", "--cap", "2.5")
+        self.assertEqual(out[0]["wallet"]["cap"], 2.5)
+        self.assertEqual(json.loads(self.config.read_text())["editor_wallet"]["cap_usd"], 2.5)
+        bridge.wallet.Wallet(cap=2.5).record(1.25, "paid/x")
+        rc, out = self.run_bridge("wallet")
+        self.assertEqual((out[0]["wallet"]["spent"], out[0]["wallet"]["remaining"]), (1.25, 1.25))
+        rc, out = self.run_bridge("wallet", "--reset")
+        self.assertEqual(out[0]["wallet"]["spent"], 0.0)
+        rc, out = self.run_bridge("wallet", "--disable")
+        self.assertFalse(out[0]["enabled"])
+        self.assertIs(bridge.wallet_for(swarmd.load_cfg()), None)
 
     def test_grind_command_is_shell_quoted(self):
         rc, out = self.run_bridge("grind-cmd", "--repo", str(self.root), "--goal", "it's a game")

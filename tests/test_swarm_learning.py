@@ -561,6 +561,101 @@ class RecursionTests(SwarmBase):
                          ["breakthrough follow-up", "split child", "old normal"])
 
 
+class QueueEditTests(SwarmBase):
+    """The editor can rewrite and drop queued tasks; the queue keeps its own invariants."""
+
+    def test_editing_keeps_the_task_and_clears_its_retry_backoff(self):
+        q = swarmd.Queue()
+        t = q.add("Handle empty input", "no detail yet", acceptance=["it does not crash"])
+        q.claim()
+        self.assertEqual(q.release(t["id"], False, "tests failed")["status"], "retry")
+        self.assertGreater(q.pending()[0]["not_before"], time.time())
+        new = q.edit(t["id"], title="Handle empty input properly", detail="return [] for []",
+                     kind="bugfix", priority=2, acceptance=["parse([]) == []", "a test proves it"])
+        self.assertEqual(new["id"], t["id"])
+        self.assertEqual((new["title"], new["kind"], new["priority"]),
+                         ("Handle empty input properly", "bugfix", 2))
+        self.assertEqual(new["acceptance"], ["parse([]) == []", "a test proves it"])
+        self.assertEqual(new["attempts"], 1, "the history of the task is kept")
+        self.assertNotIn("not_before", new)
+        self.assertEqual(q.claim()["id"], t["id"], "a fixed task is ready again straight away")
+
+    def test_a_task_a_worker_is_running_is_not_rewritten_underneath_it(self):
+        q = swarmd.Queue()
+        t = q.add("Big feature")
+        q.claim()
+        with self.assertRaisesRegex(ValueError, "running this task"):
+            q.edit(t["id"], title="Something else")
+        self.assertEqual(q.pending()[0]["title"], "Big feature")
+
+    def test_an_edit_that_would_break_the_queue_is_refused(self):
+        q = swarmd.Queue()
+        a = q.add("First")
+        q.add("Second")
+        with self.assertRaisesRegex(ValueError, "already has that title"):
+            q.edit(a["id"], title="second")          # titles are the queue's other key
+        with self.assertRaisesRegex(ValueError, "needs a title"):
+            q.edit(a["id"], title="   ")
+        with self.assertRaisesRegex(ValueError, "kind must be"):
+            q.edit(a["id"], kind="harness")
+        with self.assertRaises(ValueError):
+            q.edit(a["id"], acceptance=["x" * 2001])
+        with self.assertRaises(KeyError):
+            q.edit("t-nope", title="ghost")
+        self.assertEqual([r["title"] for r in q.pending()], ["First", "Second"])
+
+    def test_a_title_freed_by_an_edit_can_be_reused(self):
+        q = swarmd.Queue()
+        a = q.add("First")
+        q.edit(a["id"], title="First, renamed")
+        self.assertEqual(q.edit(a["id"], title="First, renamed")["title"], "First, renamed")
+
+    def test_removing_a_task_takes_the_tasks_that_waited_on_it(self):
+        q = swarmd.Queue()
+        base = q.add("Parse")
+        mid = q.add("Validate", depends_on=[base["id"]])
+        far = q.add("Report", depends_on=[mid["id"]])
+        alone = q.add("Unrelated")
+        self.assertEqual([r["id"] for r in swarmd.Queue.blocked_by(base["id"], q.pending())],
+                         [mid["id"], far["id"]])
+        with self.assertRaisesRegex(ValueError, "depend on this one"):
+            q.remove(base["id"])
+        self.assertEqual(len(q.pending()), 4)
+        gone = q.remove(base["id"], cascade=True)
+        self.assertEqual({r["title"] for r in gone}, {"Parse", "Validate", "Report"})
+        self.assertEqual([r["id"] for r in q.pending()], [alone["id"]], "unrelated work is untouched")
+        with self.assertRaises(KeyError):
+            q.remove(base["id"])
+
+    def test_a_child_of_a_removed_task_still_runs(self):
+        q = swarmd.Queue(max_depth=1)
+        parent = q.add("Big piece")
+        child = q.add("Small piece", parent=parent["id"])
+        q.remove(parent["id"])
+        self.assertEqual([r["id"] for r in q.pending()], [child["id"]])
+        self.assertEqual(q.claim()["id"], child["id"])
+
+    def test_clearing_the_queue_leaves_the_task_being_worked_on(self):
+        q = swarmd.Queue()
+        q.add("One")
+        q.add("Two")
+        running = q.claim()
+        gone, kept = q.clear()
+        self.assertEqual([r["title"] for r in gone], [t for t in ("One", "Two") if t != running["title"]])
+        self.assertEqual([r["id"] for r in kept], [running["id"]])
+        self.assertEqual([r["id"] for r in q.pending()], [running["id"]])
+        self.assertEqual([r["title"] for r in q.clear(include_claimed=True)[0]], [running["title"]])
+        self.assertEqual(q.pending(), [])
+
+    def test_a_removed_task_does_not_upset_the_worker_that_had_it(self):
+        """release() on a task that was dropped mid-attempt returns None instead of raising."""
+        q = swarmd.Queue()
+        t = q.add("Doomed")
+        q.claim()
+        q.remove(t["id"])
+        self.assertIsNone(q.release(t["id"], True, "finished after it was removed"))
+
+
 class GuardTests(SwarmBase):
     def test_paid_models_are_dropped_or_refused(self):
         self.assertEqual(swarmd.pool({"models": ["a:free", "openai/gpt-x"]}), ["a:free"])

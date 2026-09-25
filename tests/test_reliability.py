@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 import flint
 from swarm import swarmd
 from swarm.budget import Budget
+from swarm.wallet import Wallet
 
 
 def agent():
@@ -196,6 +197,90 @@ class BudgetTests(unittest.TestCase):
                 with self.assertRaises(flint.BudgetPaused):
                     throttle.acquire()
             self.assertEqual(throttle.today(), 0)
+
+
+class WalletTests(unittest.TestCase):
+    """The editor's paid allowance: real credits, so the accounting has to be exact."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ledger = Path(self.tmp.name) / "wallet.json"
+
+    def purse(self, cap=5.0):
+        return Wallet(cap=cap, path=self.ledger, label="test")
+
+    def test_a_request_is_refused_once_the_pot_is_empty(self):
+        w = self.purse(cap=0.10)
+        self.assertTrue(w.check()[0])
+        w.record(0.09, "paid/x")
+        self.assertEqual((w.spent(), w.remaining()), (0.09, 0.01))
+        self.assertFalse(w.check()[0], "a request is not started on less than a cent of headroom")
+        self.assertIn("allowance spent", w.check()[1])
+        self.assertTrue(self.purse(cap=1.0).check()[0], "raising the cap makes room again")
+        self.assertFalse(Wallet(cap=0, path=self.ledger).check()[0])
+
+    def test_nothing_is_charged_twice_when_models_answer_in_parallel(self):
+        w = self.purse()
+        threads = [threading.Thread(target=lambda: self.purse().record(0.01, "paid/x")) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(w.spent(), 0.2)
+        self.assertEqual(w.snapshot()["calls"], 20)
+        self.assertEqual(w.reset()["spent"], 0.0)
+
+    def test_a_damaged_or_missing_ledger_reads_as_nothing_spent(self):
+        self.assertEqual(self.purse().spent(), 0.0)
+        self.ledger.write_text("{not json")
+        self.assertEqual(self.purse().spent(), 0.0)
+        self.assertTrue(self.purse().check()[0])
+        self.ledger.write_text(json.dumps({"spent": "nonsense"}))
+        self.assertEqual(self.purse().spent(), 0.0)
+
+    def test_the_wallet_survives_the_handoff_to_a_child_process(self):
+        w = self.purse(cap=2.5)
+        got = Wallet.from_env(w.env("cursor ask"))
+        self.assertEqual((got.cap, str(got.path), got.label), (2.5, str(self.ledger), "cursor ask"))
+        self.assertIsNone(Wallet.from_env(""))
+        self.assertIsNone(Wallet.from_env("{not json"))
+
+    def test_an_agent_charges_what_the_provider_reports_and_nothing_more(self):
+        a = agent()
+        a.wallet, a.spend_usd = self.purse(), 0.0
+        self.assertEqual(a._request_kwargs()["extra_body"], {"usage": {"include": True}})
+        with contextlib.redirect_stderr(io.StringIO()):
+            a._charge(NS(prompt_tokens=10, cost=0.0042))
+            a._charge(NS(prompt_tokens=10, model_extra={"cost": 0.001}))   # older SDK shape
+            a._charge(NS(prompt_tokens=10))                                # no cost reported
+            a._charge(None)
+        self.assertEqual((a.spend_usd, a.wallet.spent()), (0.0052, 0.0052))
+
+    def test_an_agent_without_a_wallet_spends_nothing_and_asks_for_no_usage(self):
+        a = agent()
+        self.assertIsNone(a.wallet)
+        self.assertIsNone(a._request_kwargs().get("extra_body"))
+        a._charge(NS(cost=1.0))
+        self.assertEqual(a.spend_usd, 0.0)
+
+    def test_the_stream_is_billed_even_when_the_reply_broke_off(self):
+        a = agent()
+        a.wallet, a.spend_usd = self.purse(), 0.0
+        stream = Stream([chunk("hi"), NS(choices=[], usage=NS(prompt_tokens=7, cost=0.002))])
+        a.client = NS(chat=NS(completions=NS(create=Mock(return_value=stream))))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(flint.IncompleteResponse):
+            a._stream_once()                       # no finish_reason: the provider cut it off
+        self.assertEqual((a.spend_usd, a.last_prompt_tokens), (0.002, 7))
+
+    def test_no_request_is_made_once_the_allowance_is_gone(self):
+        a = agent()
+        a.wallet = self.purse(cap=0.05)
+        a.wallet.record(0.05, "paid/x")
+        a._stream_once = Mock(side_effect=AssertionError("must not reach the provider"))
+        with self.assertRaises(flint.WalletEmpty):
+            a.complete()
+        a.throttle.acquire.assert_not_called()
 
 
 class SwarmTests(unittest.TestCase):
