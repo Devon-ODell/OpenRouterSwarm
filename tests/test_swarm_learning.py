@@ -655,6 +655,46 @@ class GuardTests(SwarmBase):
             add(title="Third", depends_on=["a task nobody queued"])
         self.assertIn("no queued or finished task matches", str(exc.exception))
 
+    def test_ctrl_c_does_not_score_the_models_that_were_mid_turn(self):
+        """Stopping the run killed each turn's process, which looked like a crashed model."""
+        repo, _ = self.repo()
+        w = self.worker(self.cfg(repo, models=["a:free", "b:free"]))
+
+        def fake(prompt, cwd, c, role, worker, budget, steps, model):
+            swarmd._stop.set()                      # as Ctrl-C does, mid-turn
+            raise swarmd.Stopped(f"{role} turn on {model} was stopped with the run")
+        self.addCleanup(swarmd._stop.clear)
+        with patch.object(swarmd, "flint", side_effect=fake), self.assertRaises(swarmd.Stopped):
+            w.do_task({"id": "t1", "title": "x", "detail": ""}, "goal")
+        self.assertEqual(w.ledger.snapshot()["arms"], {})        # nobody blamed
+        self.assertEqual(w.ledger.snapshot()["shame"], [])       # nothing hung from the rafters
+
+    def test_a_stopped_turn_is_not_a_model_error(self):
+        budget = Mock(cap=10, reserve=1)
+        budget.check.return_value = (True, 0, "ok")
+        stopping = []
+        p = Mock(returncode=1)
+        p.communicate.side_effect = lambda **kw: (swarmd._stop.set() if stopping else None) or ("", None)
+
+        class Fake:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return p
+
+            def __exit__(self, *a):
+                return False
+        run = lambda: swarmd.flint("x", self.root, {"python": "python3"}, "implementer",
+                                   "w0", budget, 1, "a:free")
+        self.addCleanup(swarmd._stop.clear)
+        with patch.object(swarmd, "process", Fake):
+            with self.assertRaises(swarmd.ModelError):    # the same exit code, run still going
+                run()
+            stopping.append(True)                         # now Ctrl-C lands during the turn
+            with self.assertRaises(swarmd.Stopped):
+                run()
+
     def test_shutdown_survives_a_child_it_is_not_allowed_to_kill(self):
         """A run ended on PermissionError from killpg, losing the shutdown and the exit."""
         p = Mock(pid=4242)

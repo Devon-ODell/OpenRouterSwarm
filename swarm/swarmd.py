@@ -479,6 +479,10 @@ class ModelError(RuntimeError):
     """The model answered badly: malformed, empty or crashed turn."""
 
 
+class Stopped(RuntimeError):
+    """The run was stopped mid-turn. The model did not fail and is not scored for it."""
+
+
 class ProviderDown(Exception):
     """The model's providers are unavailable; not a judgement of its quality."""
 
@@ -528,7 +532,7 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     model = model or (pool(c) or [DEFAULT_MODEL])[0]
     while True:
         if _stop.is_set():
-            raise RuntimeError("swarm is stopping")
+            raise Stopped("swarm is stopping")
         ok, wait, why = budget.check()
         if ok:
             break
@@ -577,6 +581,10 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     error = progress[-1200:]
     with open(logfile, "a") as f:  # keep the answer beside the progress for later review
         f.write(f"\n--- answer from {model} (exit {p.returncode}) ---\n{out}\n")
+    # Ctrl-C kills the turn's process, which would otherwise look like a crashed model and
+    # cost it twice the usual penalty weight. Stopping the run is not the model's doing.
+    if _stop.is_set() and p.returncode != 0:
+        raise Stopped(f"{role} turn on {model} was stopped with the run")
     if p.returncode in (3, 6):
         raise CapReached(error)
     if p.returncode == 4:
