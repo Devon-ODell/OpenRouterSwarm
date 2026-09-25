@@ -224,6 +224,11 @@ Exit codes from flint turns: 1 error, 3 provider daily cap, 4 credit/account
 limit, 5 step limit, 6 local budget pause, 7 provider unavailable, 8 model busy
 (rate-limited upstream), 9 model not available to this key, 130 Ctrl-C.
 
+A worktree holds only what Git tracks. A test command that relies on a built
+binary, a virtualenv or a downloaded fixture passes in your checkout and fails
+in the worktree; a baseline failure names any such file it can identify. Build
+or fetch them inside `--test-cmd`.
+
 The target must be the repository that actually holds the code. A folder that
 merely contains projects is searched one level down for a single testable
 project; a project with its own `.git` is refused, because Git keeps an

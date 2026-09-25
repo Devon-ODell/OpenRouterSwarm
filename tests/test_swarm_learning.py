@@ -634,6 +634,26 @@ class GuardTests(SwarmBase):
                 patch.object(swarmd, "free_tool_models", return_value={"a:free": {}}):
             swarmd.preflight(self.cfg(repo, models=["a:free"], test_cmd="true"))
 
+    def test_a_baseline_failure_names_what_the_worktree_is_missing(self):
+        """The real one: pytest failed on a Go binary that is gitignored, so it is not there."""
+        repo, _ = self.repo()
+        (repo / "bin").mkdir()
+        (repo / "bin" / "risktrail").write_text("#!/bin/sh\n")
+        (repo / "py" / "backtest").mkdir(parents=True)
+        (repo / "py" / "backtest" / "risk_bridge.py").write_text("x = 1\n")
+        view = self.root / "view"
+        view.mkdir()
+        (view / "py" / "backtest").mkdir(parents=True)
+        (view / "py" / "backtest" / "risk_bridge.py").write_text("x = 1\n")
+        output = ("py/backtest/risk_bridge.py:14: RuntimeError\n"
+                  "RuntimeError: Build the shared stop adapter: go build -o bin/risktrail ./cmd/risktrail\n")
+        told = swarmd.missing_in_worktree(repo, view, output)
+        self.assertIn("bin/risktrail", told)
+        self.assertIn("ignored or untracked", told)
+        self.assertNotIn("risk_bridge.py", told)          # that one is committed and present
+        self.assertEqual(swarmd.missing_in_worktree(repo, view, "all tests passed"), "")
+        self.assertEqual(swarmd.missing_in_worktree(repo, view, "/etc/passwd ../outside/x"), "")
+
     def test_queued_tasks_can_be_listed_and_dropped_by_title(self):
         """Work the swarm duplicated by hand has to be removable without editing JSON."""
         repo, _ = self.repo()

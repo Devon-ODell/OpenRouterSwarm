@@ -1802,6 +1802,35 @@ def configure(repo, test_cmd=None):
     log(f"target {repo} on {c['base_branch']}; tests: {c['test_cmd']}")
 
 
+PATHISH = re.compile(r"(?<![\w/.-])((?:[\w.+-]+/)+[\w.+-]+)")
+
+
+def missing_in_worktree(repo, view, output):
+    """Paths the failure names that exist in the owner's checkout but not in a worktree.
+
+    Git keeps ignored and untracked files out of a worktree, so a build artifact, a virtualenv
+    or a downloaded fixture the test command relies on is simply absent there: the command
+    passes where it was written and fails where the swarm runs it."""
+    repo, view, found = Path(repo), Path(view), []
+    for token in dict.fromkeys(PATHISH.findall(output or "")):
+        rel = token.lstrip("./")
+        if not rel or rel.startswith("/") or ".." in rel:
+            continue
+        try:
+            if (repo / rel).exists() and not (view / rel).exists():
+                found.append(rel)
+        except OSError:
+            continue
+        if len(found) >= 5:
+            break
+    if not found:
+        return ""
+    return ("\n  These exist in your checkout but not in the swarm's worktree, because Git does "
+            "not copy ignored or untracked files into one:\n"
+            + "\n".join(f"    {f}" for f in found)
+            + "\n  Build or fetch them as part of --test-cmd, or commit them.")
+
+
 def why_unrunnable(cmd):
     """Why a test command could not run at all, as a line to append to an error, or "".
 
@@ -1880,7 +1909,9 @@ def preflight(c):
     if not ok:
         sys.exit(f"`{c['test_cmd']}` fails on {trunk_name(c)} before any work, so every task "
                  f"would be rejected. Fix the tests or pass --test-cmd."
-                 f"{why_unrunnable(c['test_cmd'])}{other_test_cmds(c['repo'], c['test_cmd'])}"
+                 f"{why_unrunnable(c['test_cmd'])}"
+                 f"{missing_in_worktree(c['repo'], view, output)}"
+                 f"{other_test_cmds(c['repo'], c['test_cmd'])}"
                  f"\n{output[-1500:]}")
     log(f"baseline green on {trunk_name(c)}")
 
