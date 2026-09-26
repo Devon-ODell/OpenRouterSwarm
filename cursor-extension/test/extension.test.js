@@ -121,7 +121,7 @@ test('the panel script renders a streamed ask with the merged answer first', () 
   send({ type: 'askEvent', id: 'q1', event: { event: 'start', model: 'a:free' } });
   send({ type: 'askEvent', id: 'q1', event: { event: 'progress', model: 'a:free', text: 'tool: study' } });
   assert.ok(els.threads.text().includes('tool: study'));
-  send({ type: 'askEvent', id: 'q1', event: { event: 'answer', model: 'a:free', text: 'Bug at `app.py:3`', secs: 9, study_calls: 2 } });
+  send({ type: 'askEvent', id: 'q1', event: { event: 'answer', model: 'a:free', text: 'Bug at `app.py:3`', secs: 9, study_calls: 2, requests: 5 } });
   send({ type: 'askEvent', id: 'q1', event: { event: 'start', model: 'b:free', role: 'synthesis' } });
   send({ type: 'askEvent', id: 'q1', event: { event: 'synthesis', model: 'b:free', role: 'synthesis', text: 'Merged: **one bug**' } });
   send({ type: 'askEvent', id: 'q1', event: { event: 'done', answered: 1, asked: 1, requests: 5 } });
@@ -130,6 +130,8 @@ test('the panel script renders a streamed ask with the merged answer first', () 
   assert.ok(out.includes('2 MIT lookups'));
   assert.ok(out.includes('data-vote="1" data-model="a:free"'));
   assert.ok(out.includes('1/1 models answered'));
+  assert.ok(out.includes('5 requests'), 'the card shows the request count');
+  assert.ok(out.includes('5 free requests'), 'the thread footer shows the free request count');
   send({ type: 'study', id: 's1', query: 'dijkstra', hits: [{ kind: 'card', course: '6.006', lecture: 'L13', page: null, path: '/x/cards.md', text: 'relax edges' }] });
   assert.ok(els.threads.text().includes('MIT lookup: dijkstra'));
   void origBox;
