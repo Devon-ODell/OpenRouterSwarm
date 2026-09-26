@@ -9,6 +9,7 @@ flint — a tiny terminal coding agent that runs on free OpenRouter models
     python flint.py -p "fix the tests" # one-shot, prints the answer, exits
 """
 import argparse
+import calendar
 import datetime
 import difflib
 import fnmatch
@@ -321,6 +322,56 @@ class StepLimitReached(Exception):
     pass
 
 
+# Some providers pass a model's native tool-call markup through as reply text instead of
+# translating it into tool_calls. qwen3-coder's `<function=name><parameter=k>v</parameter>`
+# is the common case. Unparsed, the edit never runs, the turn ends looking like a final
+# answer, and the swarm scores the attempt "no change" — which then gets retried and split.
+_TEXT_CALL = re.compile(r"<function=([\w.\-]+)>(.*?)(?:</function>|(?=<function=)|\Z)", re.S)
+_TEXT_PARAM = re.compile(r"<parameter=([\w.\-]+)>(.*?)</parameter>", re.S)
+_TEXT_WRAP = re.compile(r"</?tool_call>")
+
+
+def recover_text_calls(content, schemas):
+    """Tool calls a model wrote into its reply text, as (calls, text_without_them).
+
+    Only a call to a known tool with every required parameter closed is recovered, so a
+    reply cut off mid-edit is left alone rather than half-applied. Each value loses the one
+    newline the format wraps it in, and no more: an edit's old_str must match byte for byte.
+    """
+    if "<function=" not in (content or ""):
+        return [], content
+    spec = {}
+    for t in schemas:
+        f = t["function"]
+        params = f.get("parameters", {})
+        spec[f["name"]] = ({k: v.get("type") for k, v in params.get("properties", {}).items()},
+                           set(params.get("required", [])))
+    calls = []
+    for m in _TEXT_CALL.finditer(content):
+        name, body = m.group(1), m.group(2)
+        if name not in spec:
+            continue
+        types, required = spec[name]
+        args = {}
+        for p in _TEXT_PARAM.finditer(body):
+            key, val = p.group(1), p.group(2)
+            if val.startswith("\n"):
+                val = val[1:]
+            if val.endswith("\n"):
+                val = val[:-1]
+            if types.get(key) in ("integer", "number", "boolean"):
+                try:
+                    val = json.loads(val.strip().lower() if types[key] == "boolean" else val.strip())
+                except ValueError:
+                    pass
+            args[key] = val
+        if required <= set(args):
+            calls.append({"id": "", "name": name, "args": json.dumps(args)})
+    if not calls:
+        return [], content
+    return calls, _TEXT_WRAP.sub("", _TEXT_CALL.sub("", content)).strip()
+
+
 class IncompleteResponse(Exception):
     def __init__(self, msg, finish_reason=None):
         super().__init__(msg)
@@ -384,22 +435,50 @@ def fmt_reset(ts):
     return f"{local:%H:%M} local (in {mins // 60}h {mins % 60}m)"
 
 
-class Spend:
-    """Dollars charged to paid models, for one swarm, per UTC day.
+def spend_period(reset_day=None, now=None):
+    """The name of the budget window containing `now`: the date the window began.
 
-    `FLINT_SPEND_FILE` names the ledger and `FLINT_SPEND_CAP` the day's limit in
-    dollars; without a file there is no dollar accounting and nothing is gated, so
-    single-agent flint behaves exactly as before. One file per target repository is
-    what lets several swarms hold separate budgets on the same OpenRouter key.
+    Without a reset day the window is the UTC calendar day, which is what a daily
+    budget has always meant. With one (say 5) the window is the month that starts on
+    the 5th, so `2026-09-26` and `2026-10-04` are both the window named `2026-09-05`.
+    A month too short for the day — the 31st of February — starts on its last day
+    instead, so no window is ever skipped."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    today = now.date() if isinstance(now, datetime.datetime) else now
+    if reset_day in (None, ""):
+        return today.isoformat()
+    day = max(1, min(31, int(reset_day)))
+
+    def began(year, month):
+        return datetime.date(year, month, min(day, calendar.monthrange(year, month)[1]))
+
+    start = began(today.year, today.month)
+    if today < start:      # this month's reset has not happened yet; we are in the last one
+        year, month = (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
+        start = began(year, month)
+    return start.isoformat()
+
+
+class Spend:
+    """Dollars charged to paid models over one budget window.
+
+    `FLINT_SPEND_FILE` names the ledger, `FLINT_SPEND_CAP` the window's limit in
+    dollars and `FLINT_SPEND_RESET_DAY` the day of the month the window restarts;
+    without a reset day the window is the UTC day, which is what this meant before.
+    Without a file there is no dollar accounting and nothing is gated, so single-agent
+    flint behaves exactly as before. Point several swarms at one file to hold them to a
+    shared budget, or give each its own to hold separate ones.
 
     Costs are what OpenRouter actually charged, read from the usage of each reply,
     not an estimate from token counts."""
 
-    def __init__(self, path=None, cap=None):
+    def __init__(self, path=None, cap=None, reset_day=None):
         path = path if path is not None else os.environ.get("FLINT_SPEND_FILE")
         self.path = Path(path).expanduser() if path else None
         cap = cap if cap is not None else os.environ.get("FLINT_SPEND_CAP")
         self.cap = float(cap) if cap not in (None, "") else None
+        reset = reset_day if reset_day is not None else os.environ.get("FLINT_SPEND_RESET_DAY")
+        self.reset_day = int(reset) if str(reset if reset is not None else "").strip().isdigit() else None
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.lock = self.path.with_suffix(".lock")
@@ -414,9 +493,9 @@ class Spend:
                 d = json.loads(self.path.read_text()) if self.path.exists() else {}
             except (json.JSONDecodeError, OSError):
                 d = {}
-            day = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-            if d.get("day") != day:
-                d.update(day=day, usd=0.0, requests=0)
+            period = spend_period(self.reset_day)
+            if d.get("period") != period:
+                d.update(period=period, usd=0.0, requests=0, recent=[])
             out = fn(d)
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps(d))
@@ -426,7 +505,7 @@ class Spend:
     def today(self):
         return self._txn(lambda d: float(d.get("usd", 0.0))) or 0.0
 
-    def add(self, usd):
+    def add(self, usd, model=""):
         """Record what a reply cost. Called once per paid reply, after it arrives."""
         try:
             usd = float(usd)
@@ -438,13 +517,20 @@ class Spend:
         def step(d):
             d["usd"] = round(float(d.get("usd", 0.0)) + usd, 6)
             d["requests"] = int(d.get("requests", 0)) + 1
+            # A cap you cannot audit is a cap you cannot trust: without this, a single
+            # wrong figure disappears into the running total and cannot be told from a
+            # month of honest usage. Bounded so the file cannot grow without limit.
+            recent = [r for r in d.get("recent", []) if isinstance(r, dict)]
+            recent.append({"iso": datetime.datetime.now().isoformat(timespec="seconds"),
+                           "model": str(model or ""), "usd": usd})
+            d["recent"] = recent[-50:]
         self._txn(step)
 
     def remaining(self):
         return None if self.cap is None or not self.path else max(0.0, self.cap - self.today())
 
     def check(self):
-        """Raise before a paid request the day's budget can no longer cover."""
+        """Raise before a paid request the window's budget can no longer cover."""
         if self.cap is None or not self.path:
             return
         spent = self.today()
@@ -701,7 +787,7 @@ class Agent:
         self.last_cost = usd
         self.total_cost = round(self.total_cost + usd, 6)
         if usd:
-            self.spend.add(usd)
+            self.spend.add(usd, self.model)
         if self.wallet is not None:
             self.spend_usd = round(self.spend_usd + usd, 6)
             snap = self.wallet.record(usd, self.model)
@@ -837,6 +923,13 @@ class Agent:
             if live:
                 live.stop()
         self.last_reasoning = reasoning
+        if not calls and content:
+            recovered, rest = recover_text_calls(content, self._request_kwargs()["tools"])
+            if recovered:
+                if self.headless:
+                    print(f"recovered {len(recovered)} tool call(s) written as reply text",
+                          file=sys.stderr, flush=True)
+                content, calls = rest, dict(enumerate(recovered))
         if finish_reason not in ("stop", "tool_calls"):
             raise IncompleteResponse(f"Model response incomplete (finish_reason={finish_reason!r}); no tools executed.",
                                      finish_reason)

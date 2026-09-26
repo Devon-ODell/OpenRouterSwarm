@@ -402,10 +402,260 @@ class SwarmTests(unittest.TestCase):
         with patch.object(swarmd, "CONFIG", config), self.assertRaisesRegex(SystemExit, "not configured"):
             swarmd.cfg()
 
+    def test_role_deadlines_preserve_legacy_fallback(self):
+        cfg = {"turn_timeout": 300, "role_timeouts": {"implementer": 900}}
+        self.assertEqual(swarmd.turn_timeout(cfg, "implementer"), 900)
+        self.assertEqual(swarmd.turn_timeout(cfg, "judge"), 300)
+        self.assertEqual(swarmd.turn_timeout({}, "implementer"), 1800)
+
+    def test_timeout_retains_output_reaps_and_reports_actual_paid_model(self):
+        budget = Mock(cap=900, reserve=300)
+        budget.check.return_value = (False, 60, "spent")
+        budget.paid_would_help.return_value = True
+        cfg = {"turn_timeout": 300, "role_timeouts": {"implementer": 900}, "daily_usd": 2}
+        p = Mock(returncode=-9)
+        def communicate(timeout=None):
+            if timeout is not None:
+                self.assertEqual(timeout, 900)
+                self.assertEqual(swarmd._active_turns["w0"], "implementer with paid-model")
+                raise subprocess.TimeoutExpired("HUGE PRIVATE PROMPT", timeout)
+            return "partial handoff", None
+        p.communicate.side_effect = communicate
+        @contextlib.contextmanager
+        def fake_process(cmd, **kw):
+            kw["stderr"].write("round 1/26\ntool: study\n")
+            yield p
+        with patch.object(swarmd, "process", fake_process), \
+             patch.object(swarmd, "paid_stand_in", return_value="paid-model"), \
+             patch.object(swarmd, "spend_left", return_value=1), \
+             patch.object(swarmd, "spend_used", return_value=1), \
+             patch.object(swarmd, "kill_group") as kill:
+            with self.assertRaises(swarmd.AgentTimeout) as caught:
+                swarmd.flint("HUGE PRIVATE PROMPT", self.root, cfg, "implementer", "w0", budget, 26, "free-model")
+        kill.assert_called_once_with(p)
+        self.assertEqual(caught.exception.model, "paid-model")
+        self.assertNotIn("HUGE PRIVATE PROMPT", str(caught.exception))
+        self.assertNotIn("w0", swarmd._active_turns)
+        self.assertIn("partial handoff", caught.exception.logfile.read_text())
+        events = swarmd._read(self.state / "journal.jsonl")
+        self.assertEqual(events[-1]["event"], "agent_timeout")
+        self.assertEqual(events[-1]["model"], "paid-model")
+
+    def test_first_timeout_splits_and_depth_limit_parks(self):
+        q = swarmd.Queue(max_depth=1)
+        task = q.add("large task")
+        result = q.release(task["id"], False, "agent_timeout", split_now=True)
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(result["status"], "split")
+        self.assertEqual(q.pending(), [])
+        child = q.add("small child", parent=task["id"])
+        self.assertEqual(q.release(child["id"], False, "agent_timeout", split_now=True)["status"], "parked")
+
+    def test_fast_class_is_explicit_and_validated(self):
+        q = swarmd.Queue()
+        self.assertEqual(q.add("mechanical", execution_class="fast")["execution_class"], "fast")
+        with self.assertRaises(ValueError):
+            q.add("bad class", execution_class="unknown")
+
+    def test_timed_out_edit_can_land_only_after_test_and_review(self):
+        repo, git = self.repo()
+        cfg = {"repo": str(repo), "base_branch": "main", "test_cmd": "true",
+               "steps": {"architect": 0, "implementer": 26, "adversary": 2}, "keep_worktrees": False}
+        worker = swarmd.Worker(0, cfg, swarmd.Queue(), Mock(), threading.Event())
+        roles = []
+        def fake_flint(prompt, cwd, c, role, *args):
+            roles.append(role)
+            if role == "implementer":
+                (cwd / "app.txt").write_text("recovered edit\n")
+                raise swarmd.AgentTimeout(role, "paid-model", 900, self.logs / "turn.log")
+            return approve(prompt) if role == "adversary" else "judged"
+        with patch.object(swarmd, "flint", side_effect=fake_flint), \
+             patch.object(worker, "gate", wraps=worker.gate) as gate:
+            ok, note = worker.do_task({"id": "task", "title": "fix", "detail": "change app"}, "goal")
+        self.assertTrue(ok, note)
+        self.assertTrue(worker.agent_timed_out)
+        self.assertIn("adversary", roles)
+        self.assertIn("candidate-0", [call.args[0] for call in gate.call_args_list])
+        self.assertEqual(git("show", "swarm/trunk:app.txt"), "recovered edit")
+        self.assertIn("Swarm-Implementer: paid-model", git("log", "-1", "--format=%B", "swarm/trunk"))
+
+    def test_timeout_without_changes_is_classified(self):
+        repo, git = self.repo()
+        cfg = {"repo": str(repo), "base_branch": "main", "test_cmd": "true",
+               "steps": {"architect": 0, "implementer": 26, "adversary": 2}}
+        worker = swarmd.Worker(0, cfg, swarmd.Queue(), Mock(), threading.Event())
+        with patch.object(swarmd, "flint", side_effect=swarmd.AgentTimeout("implementer", "test", 900, "turn.log")):
+            ok, note = worker.do_task({"id": "task", "title": "fix", "detail": "change app"}, "goal")
+        self.assertFalse(ok)
+        self.assertEqual(worker.stage, "agent_timeout")
+        self.assertEqual(git("show", "swarm/trunk:app.txt"), "baseline")
+
+    def test_timed_out_broken_edit_is_retained_but_never_lands(self):
+        repo, git = self.repo()
+        cfg = {"repo": str(repo), "base_branch": "main", "test_cmd": "test ! -f broken",
+               "max_repairs": 0, "keep_worktrees": False,
+               "steps": {"architect": 0, "implementer": 26, "adversary": 2}}
+        worker = swarmd.Worker(0, cfg, swarmd.Queue(), Mock(), threading.Event())
+        def fake_flint(prompt, cwd, c, role, *args):
+            self.assertEqual(role, "implementer")
+            (cwd / "broken").write_text("partial\n")
+            raise swarmd.AgentTimeout(role, "test", 900, "turn.log")
+        with patch.object(swarmd, "flint", side_effect=fake_flint):
+            ok, note = worker.do_task({"id": "task", "title": "fix", "detail": "change app"}, "goal")
+        self.assertFalse(ok)
+        self.assertEqual(worker.stage, "tests_failed")
+        self.assertEqual(git("show", f"{worker.branch}:broken"), "partial")
+        self.assertEqual(git("show", "swarm/trunk:app.txt"), "baseline")
+
+    def test_fast_task_omits_study_history_and_architect_but_keeps_gates(self):
+        repo, git = self.repo()
+        cfg = {"repo": str(repo), "base_branch": "main", "test_cmd": "true", "study": True,
+               "steps": {"architect": 5, "implementer": 26, "adversary": 8}}
+        worker = swarmd.Worker(0, cfg, swarmd.Queue(), Mock(), threading.Event())
+        roles = []
+        def fake_flint(prompt, cwd, c, role, name, budget, steps, model):
+            roles.append(role)
+            self.assertFalse(c["study"])
+            if role == "implementer":
+                self.assertEqual(steps, 4)
+                self.assertEqual(swarmd.turn_timeout(c, role), 300)
+                self.assertEqual(prompt.count("PROJECT RULE SENTINEL"), 1)
+                self.assertNotIn("HISTORICAL SENTINEL", prompt)
+                self.assertIn("EXACT DETAIL SENTINEL", prompt)
+                self.assertIn("ACCEPTANCE SENTINEL", prompt)
+                (cwd / "app.txt").write_text("mechanical edit\n")
+                return "done"
+            return approve(prompt) if role == "adversary" else "judged"
+        with patch.object(swarmd, "flint", side_effect=fake_flint), patch.object(swarmd, "study") as study:
+            ok, note = worker.do_task({"id": "task", "title": "edit", "detail": "EXACT DETAIL SENTINEL",
+                                      "acceptance": ["ACCEPTANCE SENTINEL"],
+                                      "execution_class": "fast", "notes": ["HISTORICAL SENTINEL"]},
+                                     "PROJECT RULE SENTINEL")
+        self.assertTrue(ok, note)
+        study.assert_not_called()
+        self.assertNotIn("architect", roles)
+        self.assertIn("adversary", roles)
+
+    def test_worker_decomposes_after_first_timeout(self):
+        repo, _ = self.repo()
+        q = swarmd.Queue(max_depth=1)
+        task = q.add("large task", "change app")
+        cfg = {"repo": str(repo), "base_branch": "main", "test_cmd": "true",
+               "steps": {"architect": 0, "implementer": 26, "adversary": 2}}
+        worker = swarmd.Worker(0, cfg, q, Mock(), threading.Event())
+        def split(task, goal):
+            worker.stop.set()
+            return 0
+        with patch.object(swarmd, "flint", side_effect=swarmd.AgentTimeout("implementer", "test", 900, "turn.log")), \
+             patch.object(worker, "decompose", side_effect=split) as decompose:
+            worker.run()
+        self.assertEqual(decompose.call_count, 1)
+        self.assertEqual(decompose.call_args.args[0]["attempts"], 1)
+        self.assertEqual(q.pending(), [])
+        self.assertEqual(swarmd._read(q.done)[-1]["status"], "split")
+
+    def test_partial_repair_after_timeout_is_retested(self):
+        repo, git = self.repo()
+        cfg = {"repo": str(repo), "base_branch": "main", "test_cmd": "test ! -f broken",
+               "max_repairs": 1, "steps": {"architect": 0, "implementer": 26, "adversary": 2}}
+        worker = swarmd.Worker(0, cfg, swarmd.Queue(), Mock(), threading.Event())
+        def fake_flint(prompt, cwd, c, role, *args):
+            if role == "implementer":
+                (cwd / "broken").write_text("broken\n")
+                return "done"
+            if role == "repair":
+                (cwd / "broken").unlink()
+                (cwd / "app.txt").write_text("repaired\n")
+                raise swarmd.AgentTimeout(role, "test", 900, "turn.log")
+            return approve(prompt) if role == "adversary" else "judged"
+        with patch.object(swarmd, "flint", side_effect=fake_flint), \
+             patch.object(worker, "gate", wraps=worker.gate) as gate:
+            ok, note = worker.do_task({"id": "task", "title": "fix", "detail": "change app"}, "goal")
+        self.assertTrue(ok, note)
+        self.assertIn("candidate-1", [call.args[0] for call in gate.call_args_list])
+        self.assertEqual(git("show", "swarm/trunk:app.txt"), "repaired")
+
+    def test_decomposition_waits_for_each_predecessor_to_land(self):
+        q = swarmd.Queue(max_depth=1)
+        parent = q.add("milestone")
+        q.release(parent["id"], False, "timeout", split_now=True)
+        worker = swarmd.Worker(0, {"test_cmd": "true", "steps": {"decomposer": 3}}, q, Mock(), threading.Event())
+        worker.call = Mock(return_value=json.dumps([
+            {"title": "core", "detail": "build core"},
+            {"title": "shell", "detail": "use core"},
+            {"title": "targets", "detail": "measure shell"}]))
+        with patch.object(swarmd, "refresh_view", return_value=self.root):
+            self.assertEqual(worker.decompose(parent, "goal"), 3)
+        core, shell, targets = q.pending()
+        self.assertEqual(shell["depends_on"], [core["id"]])
+        self.assertEqual(targets["depends_on"], [shell["id"]])
+        self.assertEqual(q.claim()["id"], core["id"])
+        q.release(core["id"], False, "failed")
+        self.assertIsNone(q.claim(), "shell must wait during the core's retry backoff")
+        q.release(core["id"], True, "landed")
+        self.assertEqual(q.claim()["id"], shell["id"])
+        q.release(shell["id"], True, "landed")
+        self.assertEqual(q.claim()["id"], targets["id"])
+
+    def test_decomposition_does_not_queue_suffix_after_missing_prerequisite(self):
+        q = swarmd.Queue(max_depth=1)
+        parent = q.add("milestone")
+        q.add("duplicate core")
+        worker = swarmd.Worker(0, {"test_cmd": "true", "steps": {"decomposer": 3}}, q, Mock(), threading.Event())
+        worker.call = Mock(return_value=json.dumps([
+            {"title": "duplicate core"}, {"title": "dependent shell"}]))
+        with patch.object(swarmd, "refresh_view", return_value=self.root):
+            self.assertEqual(worker.decompose(parent, "goal"), 0)
+        self.assertNotIn("dependent shell", [t["title"] for t in q.pending()])
+
     def test_timeout_reaps_child_process(self):
         with self.assertRaises(subprocess.TimeoutExpired):
             swarmd.sh([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.05)
         self.assertFalse(swarmd._processes)
+
+
+QWEN_EDIT = "I'll fix the tyre curve.\n\n<tool_call>\n<function=edit_file>\n<parameter=path>\ngames/x/game.js\n</parameter>\n<parameter=old_str>\n  const a = 1;\n    nested();\n</parameter>\n<parameter=new_str>\n  const a = 2;\n    nested();\n</parameter>\n</function>\n</tool_call>"
+
+
+class TextToolCallTests(unittest.TestCase):
+    """Some providers return a model's native tool-call markup as reply text. Before these
+    were recovered, every such turn looked like a final answer, applied nothing, and the
+    swarm scored it "no change" — 55 attempts in one night, retried and split in turn."""
+
+    def test_recovers_an_edit_with_its_whitespace_intact(self):
+        calls, rest = flint.recover_text_calls(QWEN_EDIT, flint.TOOL_SCHEMAS)
+        self.assertEqual([c["name"] for c in calls], ["edit_file"])
+        args = json.loads(calls[0]["args"])
+        self.assertEqual(args["path"], "games/x/game.js")
+        # only the one wrapping newline goes; indentation and inner newlines are kept
+        self.assertEqual(args["old_str"], "  const a = 1;\n    nested();")
+        self.assertEqual(args["new_str"], "  const a = 2;\n    nested();")
+        self.assertEqual(rest, "I'll fix the tyre curve.")
+
+    def test_coerces_typed_parameters(self):
+        text = ("<function=read_file>\n<parameter=path>\na.js\n</parameter>\n"
+                "<parameter=offset>\n40\n</parameter>\n<parameter=limit>\n10\n</parameter>\n</function>")
+        args = json.loads(flint.recover_text_calls(text, flint.TOOL_SCHEMAS)[0][0]["args"])
+        self.assertEqual((args["offset"], args["limit"]), (40, 10))
+
+    def test_a_reply_cut_off_mid_edit_is_not_half_applied(self):
+        cut = QWEN_EDIT.split("<parameter=new_str>")[0]      # new_str never arrived
+        self.assertEqual(flint.recover_text_calls(cut, flint.TOOL_SCHEMAS), ([], cut))
+
+    def test_unknown_tools_and_plain_prose_are_left_alone(self):
+        prose = "Done. The tests pass and nothing needed changing."
+        self.assertEqual(flint.recover_text_calls(prose, flint.TOOL_SCHEMAS), ([], prose))
+        rogue = "<function=format_disk>\n<parameter=path>\n/\n</parameter>\n</function>"
+        self.assertEqual(flint.recover_text_calls(rogue, flint.TOOL_SCHEMAS)[0], [])
+
+    def test_the_stream_runs_calls_it_finds_in_the_text(self):
+        a = agent()
+        stream = Stream([chunk(content=QWEN_EDIT[:60]), chunk(content=QWEN_EDIT[60:], finish="stop")])
+        a.client = NS(chat=NS(completions=NS(create=Mock(return_value=stream))))
+        content, calls = a._stream_once()
+        self.assertEqual([c["name"] for c in calls], ["edit_file"])
+        self.assertNotIn("<function=", content)
+        self.assertTrue(stream.closed)
 
 
 if __name__ == "__main__":

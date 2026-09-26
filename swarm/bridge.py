@@ -34,6 +34,7 @@ rate limits. Every charge is the number OpenRouter reports, recorded in ~/.flint
 the pot is checked before each request. `bridge.py wallet` reads and sets it.
 """
 import argparse
+import datetime as dt
 import json
 import os
 import re
@@ -427,6 +428,14 @@ def cmd_info(a):
     if a.quota:
         info = swarmd.account()
         out["quota"] = (info or {}).get("free_model_daily_requests")
+        # These are key-wide provider totals, never an estimate for this swarm.
+        out["provider_usage"] = {
+            "available": info is not None,
+            "source": "OpenRouter /api/v1/key", "scope": "configured API key",
+            "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            **{k: (info or {}).get(k) for k in
+               ("usage", "usage_daily", "usage_monthly", "limit_remaining")},
+        }
     emit(out)
     return 0
 
@@ -548,6 +557,18 @@ def cmd_wallet(a):
     return 0
 
 
+def _log_age():
+    """Seconds since the daemon last wrote a line, or None if it has not written today.
+
+    Silence is the only symptom a hung turn has, so the sidebar shows it next to the
+    status rather than making someone open the log to find out."""
+    path = swarmd.LOGS / f"{dt.date.today()}.log"
+    try:
+        return round(max(0.0, time.time() - path.stat().st_mtime), 1)
+    except OSError:
+        return None
+
+
 def cmd_status(a):
     c = config_for(a.repo)
     swarmd.use_repo(c)
@@ -571,6 +592,10 @@ def cmd_status(a):
           "parked": sum(t.get("status") in ("parked", "split") for t in done),
           "budget": budget, "experiment": {"verdict": exp["verdict"], "on": exp["on"]["attempts"],
                                            "off": exp["off"]["attempts"]},
+          "spend": {"used": round(swarmd.spend_used(c), 6), "cap": swarmd.spend_cap(c),
+                    "left": swarmd.spend_left(c), "resets": swarmd.spend_resets(c),
+                    "shared": swarmd.monthly(c)},
+          "stale_seconds": _log_age(),
           "wallet": (lambda w: w.snapshot() if w else None)(wallet_for(c)),
           "recent": [_journal_line(j) for j in swarmd._read(swarmd.STATE / "journal.jsonl")[-12:]]})
     return 0
@@ -630,6 +655,42 @@ def cmd_grind_cmd(a):
     if a.hours:
         parts += ["--hours", str(a.hours)]
     emit({"command": " ".join(shlex.quote(p) for p in parts)})
+    return 0
+
+
+def cmd_activity(a):
+    """The daemon's own log for this repo, tailed by byte offset.
+
+    swarmd.log() appends every line the daemon prints to LOGS/<date>.log, and that is the
+    only place a stall shows up: the journal records task boundaries, so a hung turn and a
+    quiet one look identical there. A hang is the absence of output, so the caller needs
+    the file's age as much as its new lines — `stale_seconds` is the point of this call.
+
+    The state slug is a sha1 of the repo path built in swarmd.use_repo, so the caller
+    never has to know it; it asks by repo and the bridge finds the log.
+    """
+    c = config_for(a.repo)
+    swarmd.use_repo(c)
+    day = a.day or dt.date.today().isoformat()
+    path = swarmd.LOGS / f"{day}.log"
+    out = {"repo": c["repo"], "day": day, "path": str(path), "exists": path.exists(),
+           "daemon_running": daemon_running(), "lines": [], "offset": 0, "stale_seconds": None}
+    if not path.exists():
+        emit(out)                      # no daemon has run today; not an error
+        return 0
+    size = path.stat().st_size
+    start = max(0, int(a.offset or 0))
+    if start > size:
+        start = 0                      # the file was replaced or truncated under us
+    with path.open("rb") as f:
+        f.seek(start)
+        blob = f.read()
+    # Hold back a partial last line instead of showing half of one; it arrives next call.
+    cut = blob.rfind(b"\n") + 1
+    out["offset"] = start + cut
+    out["lines"] = blob[:cut].decode("utf-8", "replace").splitlines()
+    out["stale_seconds"] = round(max(0.0, time.time() - path.stat().st_mtime), 1)
+    emit(out)
     return 0
 
 
@@ -731,6 +792,11 @@ def main(argv=None):
     s.add_argument("--test-cmd")
     s.add_argument("--hours", type=float)
     s.set_defaults(fn=cmd_grind_cmd)
+    s = sub.add_parser("activity")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--offset", type=int, default=0)
+    s.add_argument("--day", help="a past day's log (default today)")
+    s.set_defaults(fn=cmd_activity)
     sub.add_parser("stop").set_defaults(fn=cmd_stop)
     a = ap.parse_args(argv)
     signal.signal(signal.SIGTERM, _kill_children)

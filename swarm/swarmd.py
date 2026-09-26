@@ -45,7 +45,7 @@ LOGS.mkdir(exist_ok=True)
 
 DEFAULT_MODEL = "inclusionai/ling-3.0-flash-fin:free"
 KINDS = ("feature", "bugfix", "test", "refactor")
-META = ("persona", "planner_model", "priority", "depth", "parent", "origin", "acceptance", "depends_on", "root", "strategy")
+META = ("persona", "planner_model", "priority", "depth", "parent", "origin", "acceptance", "depends_on", "root", "strategy", "execution_class")
 READ_ONLY_ROLES = {"planner", "architect", "judge", "decomposer", "adversary"}
 MAX_ATTEMPTS = 2
 SECRET_ENV = re.compile(r"API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL", re.I)
@@ -65,6 +65,7 @@ _study_calls = {}
 _held = {}            # worker -> when it last said it was waiting for the allowance
 _waiting = {}         # worker -> why it is not working, or absent while it is
 _ran_on = {}          # worker -> the model its last turn actually ran on, once a stand-in took it
+_active_turns = {}   # worker -> live role and actual routed model
 NO_CORPUS = os.path.join(os.devnull, "no-corpus.db")   # cannot exist: flint then hides `study`
 
 
@@ -162,14 +163,69 @@ def paid_pool(c):
     return [m for m in (c.get("paid_models") or []) if not m.endswith(":free")]
 
 
-def spend_today(c=None):
-    """Dollars this swarm has charged to paid models today, from flint's ledger."""
+def spend_file(c=None):
+    """The ledger this swarm charges paid replies to.
+
+    A shared budget (`monthly_usd`) is one pot for every swarm on this key, so they all
+    charge the same file and none of them can spend the ceiling on its own. A
+    per-repository budget (`daily_usd`) keeps its own file, which is what it always meant."""
+    return (HERE / "state" / "spend.json") if monthly(c) else STATE / "spend.json"
+
+
+def monthly(c=None):
+    """True when this config holds a shared budget over a month rather than a day."""
+    return bool(c) and c.get("monthly_usd") not in (None, "")
+
+
+def spend_reset_day(c=None):
+    """The day of the month a shared budget restarts, or None for a daily window."""
+    if not monthly(c):
+        return None
+    day = c.get("spend_reset_day")
+    return int(day) if str(day if day is not None else "").strip().isdigit() else 1
+
+
+def spend_cap(c=None):
+    """The dollar ceiling for one window, or None when no dollar budget is set."""
+    for key in ("monthly_usd", "daily_usd"):
+        if c and c.get(key) not in (None, ""):
+            try:
+                return float(c[key])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def spend_window(c=None):
+    """The name of the current budget window.
+
+    flint owns this arithmetic and writes the ledger, so swarmd asks it rather than
+    keeping a second copy that could drift and disagree about when money came back."""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    import flint
+    return flint.spend_period(spend_reset_day(c))
+
+
+def spend_resets(c=None):
+    """The date the current window ends, so a spent budget can say when it returns."""
+    import calendar
+    day = spend_reset_day(c)
+    if day is None:
+        return None
+    start = dt.date.fromisoformat(spend_window(c))
+    year, month = (start.year + 1, 1) if start.month == 12 else (start.year, start.month + 1)
+    return dt.date(year, month, min(day, calendar.monthrange(year, month)[1])).isoformat()
+
+
+def spend_used(c=None):
+    """Dollars charged to paid models in the current budget window, from flint's ledger."""
     try:
-        d = json.loads((STATE / "spend.json").read_text())
+        d = json.loads(spend_file(c).read_text())
     except (OSError, json.JSONDecodeError):
         return 0.0
-    if d.get("day") != dt.datetime.now(dt.timezone.utc).date().isoformat():
-        return 0.0
+    if d.get("period") != spend_window(c):
+        return 0.0            # a window that has rolled over has nothing spent in it yet
     try:
         return float(d.get("usd", 0.0))
     except (TypeError, ValueError):
@@ -177,14 +233,21 @@ def spend_today(c=None):
 
 
 def spend_left(c):
-    """What is left of today's dollar budget, or None when no budget is set."""
-    cap = c.get("daily_usd")
-    if cap in (None, ""):
+    """What is left of this window's dollar budget, or None when no budget is set."""
+    cap = spend_cap(c)
+    if cap is None:
         return None
-    try:
-        return max(0.0, float(cap) - spend_today(c))
-    except (TypeError, ValueError):
-        return None
+    return max(0.0, cap - spend_used(c))
+
+
+def spend_phrase(c):
+    """How much money is left and when it comes back, for a log line."""
+    left, cap = spend_left(c), spend_cap(c)
+    if left is None or cap is None:
+        return ""
+    if not monthly(c):
+        return f"${left:.2f} of today's ${cap:.2f} left"
+    return f"${left:.2f} of this month's ${cap:.2f} left, back {spend_resets(c)}"
 
 
 def paid_stand_in(c, model):
@@ -285,7 +348,7 @@ def git(args, cwd, check=False):
     return rc, out.strip()
 
 
-def spend_ledger_paths():
+def spend_ledger_paths(c=None):
     """The spend ledger's three files: the ledger, its lock and the tmp file it is replaced
     through. A sandboxed turn on a paid model has to write these to record what it spent.
 
@@ -294,13 +357,13 @@ def spend_ledger_paths():
     This matters most when the swarm is working on its own checkout: STATE then lives inside
     the repo under test but outside the worktree, so without this the very first paid turn dies
     with a PermissionError on spend.lock and the model is blamed for it."""
-    return [STATE / f"spend{ext}" for ext in (".json", ".lock", ".tmp")]
+    return [spend_file(c).with_suffix(ext) for ext in (".json", ".lock", ".tmp")]
 
 
 def sandbox_profile(cwd, c):
     home = os.environ.get("FLINT_HOME", "~/.flint")
     return sandbox.profile([cwd, *sandbox.git_paths(cwd), home],
-                           [*spend_ledger_paths(), *c.get("sandbox_write", [])])
+                           [*spend_ledger_paths(c), *c.get("sandbox_write", [])])
 
 
 def sandboxed(cmd, cwd, c):
@@ -395,6 +458,8 @@ class Queue:
                  "title": title.strip(), "detail": detail.strip(), "kind": kind,
                  "attempts": 0, "created": time.time(), "priority": 0, "depth": 0}
             t.update({k: meta[k] for k in META if meta.get(k) is not None})
+            if t.get("execution_class", "standard") not in ("standard", "fast"):
+                raise ValueError("execution_class must be standard or fast")
             criteria(t)
             known = {r["id"]: r for r in history}
             dependencies = t.get("depends_on", [])
@@ -416,6 +481,61 @@ class Queue:
             _write(self.path, rows)
             return t
 
+    def repoint(self, old, new):
+        """Move every pending dependency on `old` onto `new`, and say how many moved.
+
+        A split parent never reaches `done`, so a task still waiting on it would wait for
+        ever. Its children carry its work, so the last of them stands in for it.
+        """
+        if not new or old == new:
+            return 0
+        with self.locked():
+            rows, moved = _read(self.path), 0
+            for r in rows:
+                deps = r.get("depends_on") or []
+                if old in deps:
+                    r["depends_on"] = [d for d in deps if d != old] + [new]
+                    moved += 1
+            if moved:
+                _write(self.path, rows)
+            return moved
+
+    def strand(self, tid, why):
+        """Park every queued task that depends on `tid`, directly or through another.
+
+        A parked task, or one split into nothing, never reaches `done`, so anything
+        waiting on it would wait for ever: invisible in the logs, and holding a queue
+        slot the planner can never reclaim. Parking the dependents with the reason makes
+        the chain visible in `swarm report`, where a person can fix and re-add it.
+        Returns the titles parked."""
+        with self.locked():
+            rows = _read(self.path)
+            dead, parked = {tid}, []
+            changed = True
+            while changed:
+                changed = False
+                for r in rows:
+                    if r["id"] in dead or r.get("claimed"):
+                        continue
+                    if dead & set(r.get("depends_on") or []):
+                        dead.add(r["id"])
+                        changed = True
+            now = time.time()
+            keep = []
+            for r in rows:
+                if r["id"] in dead and r["id"] != tid and not r.get("claimed"):
+                    r["status"], r["finished"] = "parked", now
+                    r["note"] = f"blocked: {why}"[-800:]
+                    parked.append(r)
+                else:
+                    keep.append(r)
+            if parked:
+                _write(self.path, keep)
+                with open(self.done, "a") as f:
+                    for r in parked:
+                        f.write(json.dumps(r) + "\n")
+            return [r["title"] for r in parked]
+
     def claim(self):
         with self.locked():
             rows, now = _read(self.path), time.time()
@@ -436,7 +556,7 @@ class Queue:
             return [r for r in _read(self.path) if not r.get("claimed") and r.get("not_before", 0) <= now
                     and set(r.get("depends_on", [])).issubset(complete)]
 
-    def release(self, tid, ok, note="", defer=0):
+    def release(self, tid, ok, note="", defer=0, split_now=False):
         """Returns the task with its new status: done, retry, split or parked."""
         with self.locked():
             rows, task = _read(self.path), None
@@ -459,7 +579,7 @@ class Queue:
             else:
                 # Failure notes travel with the task so the next attempt can learn from them.
                 task["notes"] = (task.get("notes", []) + [note[-800:]])[-2:]
-                if task["attempts"] < MAX_ATTEMPTS:
+                if task["attempts"] < MAX_ATTEMPTS and not split_now:
                     task["status"] = "retry"
                     # A failed attempt already cost real requests: back off 5m before retrying.
                     task["not_before"] = time.time() + 300 * task["attempts"] ** 2
@@ -642,6 +762,32 @@ class ModelError(RuntimeError):
     """The model answered badly: malformed, empty or crashed turn."""
 
 
+FAST_IMPLEMENTER = """Perform this small, fully specified edit.
+PROJECT GOAL AND RULES
+{goal}
+TASK CONTRACT
+{spec}
+Follow repository instructions and the contract. Change only what the task requires.
+Do not commit, switch branches, merge or reset Git. Do not weaken existing tests.
+No network calls from code or tests, credentials, or live orders.
+Run `{test_cmd}` and report the changes and result in under 150 words.
+The supervisor will independently test and review the result.
+"""
+
+
+class AgentTimeout(Exception):
+    """A role exceeded its wall-clock budget; partial work still needs verification."""
+
+    def __init__(self, role, model, timeout, logfile):
+        self.role, self.model = role, model
+        self.timeout, self.logfile = timeout, logfile
+        super().__init__(f"agent_timeout: {role} on {model} exceeded {timeout}s; log: {logfile}")
+
+
+def turn_timeout(c, role):
+    return c.get("role_timeouts", {}).get(role, c.get("turn_timeout", 1800))
+
+
 class Stopped(RuntimeError):
     """The run was stopped mid-turn. The model did not fail and is not scored for it."""
 
@@ -712,11 +858,11 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
             alt = paid_stand_in(c, model)
             if alt:
                 left = spend_left(c)
-                log(f"{role}: {why} — running on paid {alt}"
-                    + (f" (${left:.2f} of today's ${float(c['daily_usd']):.2f} left)"
-                       if left is not None else ""), worker)
+                log(f"{role}: {why} — routing this turn to paid {alt}; its cost is booked from OpenRouter's reported charge"
+                    + (f" ({spend_phrase(c)})" if left is not None else ""), worker)
                 journal("paid_fallback", role=role, worker=worker, model=model, to=alt,
-                        spent_today=round(spend_today(c), 6), reason=why)
+                        recorded_spend_usd=round(spend_used(c), 6), spend_window=spend_window(c),
+                        charge_confirmed=False, reason=why)
                 model = _ran_on[worker] = alt
                 break
         # The allowance can be hours from resetting; saying so once a quarter hour is enough,
@@ -739,28 +885,40 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         env["FLINT_CORPUS_DB"] = str(Path(c["corpus_db"]).expanduser())
     env["FLINT_SWARM_BUDGET"] = json.dumps(dict(
         cap=budget.cap, reserve=budget.reserve, owner_window=c.get("owner_window", ["00:00", "00:00"])))
-    # Per-repository, so several swarms on one key hold separate daily budgets. flint charges
-    # real costs here and refuses a paid request the remaining budget cannot cover.
-    env["FLINT_SPEND_FILE"] = str(STATE / "spend.json")
-    if c.get("daily_usd") not in (None, ""):
-        env["FLINT_SPEND_CAP"] = str(float(c["daily_usd"]))
+    # Shared when the budget is monthly, per-repository when it is daily. flint charges real
+    # costs here and refuses a paid request the remaining budget can no longer cover.
+    env["FLINT_SPEND_FILE"] = str(spend_file(c))
+    if spend_cap(c) is not None:
+        env["FLINT_SPEND_CAP"] = str(spend_cap(c))
+    if spend_reset_day(c) is not None:
+        env["FLINT_SPEND_RESET_DAY"] = str(spend_reset_day(c))
     cmd = [c.get("python", sys.executable), str(ROOT / "flint.py"),
            "-p", prompt, "-C", str(cwd), "-m", model,
            "--read-only" if role in READ_ONLY_ROLES else "--yolo"]
     cmd = sandboxed(cmd, cwd, c)
-    log(f"{role}: asking {model} (up to {max_steps} rounds; free models take 1-7 min)", worker)
+    timeout = turn_timeout(c, role)
+    log(f"{role}: asking {model} (up to {max_steps} rounds; timeout {timeout}s)", worker)
     t0 = time.time()
     # Keep progress/errors separate from the role's machine-readable answer.
     logfile = LOGS / f"{worker}-{role}-{time.time_ns()}.log"
-    with open(logfile, "w") as err:
-        with process(cmd, stdout=subprocess.PIPE, stderr=err,
-                     text=True, env=env) as p:
-            try:
-                out, _ = p.communicate(timeout=c.get("turn_timeout", 1800))
-            except BaseException:
-                kill_group(p)
-                p.communicate()
-                raise
+    expired = False
+    _active_turns[worker] = f"{role} with {model}"
+    try:
+        with open(logfile, "w") as err:
+            with process(cmd, stdout=subprocess.PIPE, stderr=err,
+                         text=True, env=env) as p:
+                try:
+                    out, _ = p.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    kill_group(p)
+                    out, _ = p.communicate()
+                    expired = True
+                except BaseException:
+                    kill_group(p)
+                    p.communicate()
+                    raise
+    finally:
+        _active_turns.pop(worker, None)
     progress = logfile.read_text(errors="replace")
     studied = len(re.findall(r"^tool: study$", progress, re.M))
     count_study(worker, studied)
@@ -773,6 +931,10 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     # cost it twice the usual penalty weight. Stopping the run is not the model's doing.
     if _stop.is_set() and p.returncode != 0:
         raise Stopped(f"{role} turn on {model} was stopped with the run")
+    if expired:
+        journal("agent_timeout", role=role, worker=worker, model=model,
+                timeout=timeout, secs=round(time.time() - t0), log=str(logfile))
+        raise AgentTimeout(role, model, timeout, logfile)
     if p.returncode in (3, 6):
         raise CapReached(error)
     if p.returncode == 4:
@@ -982,9 +1144,10 @@ Rules:
 Output ONLY a JSON array, no prose around it:
 [{{"title": "...", "detail": "...", "kind": "feature|bugfix|test|refactor"}}]"""
 
-DECOMPOSER = """You are the DECOMPOSER in an engineering swarm. This task failed twice.
+DECOMPOSER = """You are the DECOMPOSER in an engineering swarm. This task timed out or failed repeatedly.
 Split it into 2 or 3 smaller tasks that together achieve it, each small enough
-to succeed on its own.
+to succeed as a verified increment. Subtasks execute in array order: each depends
+on the preceding subtask landing successfully. Do not assume unlanded work exists.
 
 PROJECT GOAL
 {goal}
@@ -1130,7 +1293,7 @@ def report_progress(workers, said, every=180):
         if now - said.get(w.name, since) > every:
             said[w.name] = now
             log(f"still on '{task['title'][:60]}' ({(now - since) / 60:.0f}m): "
-                f"{_waiting.get(w.name) or getattr(w, 'doing', '?')}", w.name)
+                f"{_waiting.get(w.name) or _active_turns.get(w.name) or getattr(w, 'doing', '?')}", w.name)
 
 
 class Tally:
@@ -1159,6 +1322,7 @@ class Worker(threading.Thread):
         self.stage = None
         self.task = None
         self.last_model = None
+        self.agent_timed_out = False
 
     # -- helpers -----------------------------------------------------------
 
@@ -1194,11 +1358,17 @@ class Worker(threading.Thread):
             self.evidence.record(role, role_calls=self.role_calls, active_model=model)
             self.evidence.write(f"prompt-{self.role_calls:02d}-{role}.txt", prompt)
         c = dict(self.c, study=False) if getattr(self, "mit", None) == "off" else self.c
+        if getattr(self, "execution_class", "standard") == "fast":
+            c = dict(c, study=False)
+            if role in ("implementer", "repair"):
+                steps = min(steps, 4)
+                c["role_timeouts"] = dict(c.get("role_timeouts", {}), **{role: 300})
         self.doing = f"{role} with {model}"
         editing = role not in READ_ONLY_ROLES and self.wt is not None and Path(cwd) == Path(self.wt)
         before = self.snapshot()[0] if editing else None
         tried = set()
         while True:
+            self.doing = f"{role} with {model}"
             try:
                 out = flint(prompt, cwd, c, role, self.name, self.budget, steps, model)
                 # A paid stand-in may have taken the turn. Credit the model that actually
@@ -1213,6 +1383,14 @@ class Worker(threading.Thread):
                         self.evidence.record(role, role_calls=self.role_calls, active_model=ran,
                                              stood_in_for=asked)
                 break
+            except AgentTimeout as exc:
+                self.last_model = exc.model
+                self.agent_timed_out = True
+                if self.evidence:
+                    self.evidence.record("agent_timeout", role=role, active_model=exc.model,
+                                         timeout=exc.timeout, log=str(exc.logfile))
+                log(str(exc), self.name)
+                raise
             except ProviderDown as e:
                 log(rest(self.ledger, e), self.name)
                 tried.add(model)
@@ -1254,10 +1432,14 @@ class Worker(threading.Thread):
         self.doing, self.started = "starting", time.time()
         self.evidence, self.role_calls, self.gate_count = None, 0, 0
         self.mit = None
+        self.agent_timed_out = False
+        self.execution_class = task.get("execution_class", "standard")
         count_study(self.name, reset=True)
         note, info = "attempt interrupted before completion", {}
         try:
             self.stage, note, info = self._attempt(task, goal, info)
+        except AgentTimeout as exc:
+            self.stage, note = "agent_timeout", str(exc)
         except (CapReached, ProviderDown, NoCredits):
             self.stage = "deferred"
             raise
@@ -1355,19 +1537,24 @@ class Worker(threading.Thread):
         _, dirty = git(["status", "--porcelain"], cwd=wd, check=True)
         if not ok or dirty:
             return "baseline", "baseline tests failed or changed tracked/unignored files; no model calls spent:\n" + output, info
-        self.mit = info["mit"] = mit_arm(c)
+        fast = self.execution_class == "fast"
+        self.mit = info["mit"] = "off" if fast else mit_arm(c)
         corpus = study(f"{task['title']} {task['detail']}", c) if self.mit == "on" else ""
         info["mit_injected"] = bool(corpus)
         self.evidence.record("study", mit=self.mit, injected=bool(corpus))
-        lessons, pitfalls = self.ledger.playbook()
+        lessons, pitfalls = ([], []) if fast else self.ledger.playbook()
         # Lessons shown to this implementer share the attempt's reward (see Ledger.credit).
         info["lessons"] = [l["id"] for l in lessons + pitfalls if l.get("kind") in ("lesson", "pitfall")]
         impl = self.pick()
         if impl is None:
             raise ProviderDown(None, "every model in the pool is resting after provider failures")
         info["implementer"] = impl
-        spec = json.dumps(self.contract, indent=2) + "\nSTRATEGY: " + STRATEGIES[strategy]
-        if c["steps"].get("architect", 0):
+        prompt_contract = {k: v for k, v in self.contract.items() if k != "goal"}
+        prompt_contract["detail"] = task["detail"]
+        spec = json.dumps(prompt_contract, indent=2)
+        if not fast:
+            spec += "\nSTRATEGY: " + STRATEGIES[strategy]
+        if not fast and c["steps"].get("architect", 0):
             spec += "\nARCHITECT NOTES (the contract still controls scope):\n" + self.call(
                 "architect", ARCHITECT.format(goal=goal, title=task["title"], detail=task["detail"],
                  corpus=corpus, test_cmd=c["test_cmd"]), wd, c["steps"]["architect"], self.pick({impl}) or impl,
@@ -1383,10 +1570,12 @@ class Worker(threading.Thread):
         previous += "\n" + json.dumps(sorted(prior)[-3:])[-6000:]
         self.evidence.record("implementing", implementer=impl)
         try:
-            handoff = self.call("implementer", IMPLEMENTER.format(
+            handoff = self.call("implementer", (FAST_IMPLEMENTER if fast else IMPLEMENTER).format(
                 goal=goal, spec=spec, previous=previous, corpus=corpus, test_cmd=c["test_cmd"],
                 playbook=format_playbook(lessons, pitfalls)), wd, c["steps"]["implementer"], impl)
             self.evidence.write("implementation.txt", handoff)
+        except AgentTimeout:
+            self.evidence.record("timeout_recovery", note="verify partial implementation through normal gates")
         except StepLimit:
             self.evidence.record("step_limit", note="verify the partial implementation before continuing")
         except ModelError as exc:
@@ -1406,7 +1595,8 @@ class Worker(threading.Thread):
                 return "rejected", "agent changed commit history outside supervisor control", info
             tree, diff = self.snapshot()
             if not diff.strip():
-                return "no_change", "no implementation changes; inspect the retained handoff", info
+                stage = "agent_timeout" if self.agent_timed_out else "no_change"
+                return stage, f"no implementation changes; evidence: {self.evidence.path}", info
             if weakened_tests(diff):
                 return "weakened_tests", "existing assertions removed; manual review required", info
             ok, tests = self.gate(f"candidate-{cycle}")
@@ -1439,6 +1629,8 @@ class Worker(threading.Thread):
                                     failure=failure, test_cmd=c["test_cmd"]), wd,
                                     c["steps"].get("repair", c["steps"]["implementer"]), impl, avoid={adv})
                 self.evidence.write(f"repair-{cycle + 1}.txt", handoff)
+            except AgentTimeout:
+                self.evidence.record("timeout_recovery", note="verify partial repair through normal gates")
             except StepLimit:
                 pass
             except ModelError as exc:
@@ -1625,11 +1817,21 @@ class Worker(threading.Thread):
         if ahead == "0":  # landed on trunk, or never produced anything
             git(["branch", "-D", self.branch], cwd=repo)
 
+    def strand(self, task, how):
+        """Park what depends on a task that can no longer finish, and say so loudly."""
+        titles = self.q.strand(task["id"], f"prerequisite '{task['title'][:80]}' {how}")
+        if titles:
+            log(f"'{task['title'][:60]}' {how}; parked {len(titles)} task(s) that depended on it: "
+                + "; ".join(t[:50] for t in titles), self.name)
+            journal("stranded", id=task["id"], title=task["title"], how=how, parked=titles)
+        return titles
+
     def decompose(self, task, goal):
-        """Recursion on failure: split a task that failed twice into smaller ones."""
+        """Split after a timeout or repeated failure, within the recursion limits."""
         c = self.c
         # Between attempts: not the last attempt's evidence, role-call budget or MIT arm.
         self.evidence, self.mit = None, None
+        self.execution_class = "standard"
         model = self.ledger.pick("planner", pool(c)) or self.pick()
         if model is None:
             return 0
@@ -1640,25 +1842,33 @@ class Worker(threading.Thread):
                     goal=goal, title=task["title"], detail=task["detail"], test_cmd=c["test_cmd"],
                     notes="\n---\n".join(task.get("notes", [])) or task.get("note", "")),
                     view, c["steps"].get("decomposer", 6), model)
-            except (StepLimit, ModelError) as e:
+            except (StepLimit, ModelError, AgentTimeout) as e:
                 self.ledger.update("planner", model, 0.0)
-                log(f"decomposer {model} failed ({type(e).__name__}); '{task['title']}' stays parked", self.name)
+                log(f"decomposer {model} failed ({type(e).__name__}); '{task['title']}' was not split", self.name)
                 return 0
         subtasks = json_array(out)
         if subtasks is None:
             self.ledger.update("planner", model, 0.0)
             subtasks = []
         added = 0
+        dependencies = list(task.get("depends_on", []))
         for t in subtasks[:3]:
-            if (isinstance(t, dict) and isinstance(t.get("title"), str)
-                    and t.get("kind", "feature") in KINDS
-                    and self.q.add(t["title"], str(t.get("detail", "")), t.get("kind", "feature"),
-                                   persona=task.get("persona"), planner_model=model,
-                                   parent=task["id"], priority=1, origin="split",
-                                   depth=task.get("depth", 0) + 1)):
-                added += 1
-        log(f"split '{task['title']}' into {added} smaller task(s)", self.name)
-        journal("split", id=task["id"], title=task["title"], added=added, model=model)
+            if (not isinstance(t, dict) or not isinstance(t.get("title"), str)
+                    or t.get("kind", "feature") not in KINDS):
+                break  # Do not enqueue a dependent suffix without its prerequisite.
+            child = self.q.add(t["title"], str(t.get("detail", "")), t.get("kind", "feature"),
+                               persona=task.get("persona"), planner_model=model,
+                               parent=task["id"], priority=max(1, task.get("priority", 1)), origin="split",
+                               depends_on=dependencies, acceptance=t.get("acceptance"),
+                               depth=task.get("depth", 0) + 1)
+            if not child:
+                break
+            added += 1
+            dependencies = [child["id"]]
+        moved = self.q.repoint(task["id"], dependencies[0]) if added else 0
+        log(f"split '{task['title']}' into {added} smaller task(s)"
+            + (f"; {moved} waiting task(s) moved to the last child" if moved else ""), self.name)
+        journal("split", id=task["id"], title=task["title"], added=added, model=model, repointed=moved)
         return added
 
     # -- loop --------------------------------------------------------------
@@ -1672,11 +1882,14 @@ class Worker(threading.Thread):
             try:
                 goal = read_goal(self.c)
                 ok, note = self.do_task(task, goal)
-                final = self.q.release(task["id"], ok, note)
+                final = self.q.release(task["id"], ok, note, split_now=self.agent_timed_out)
                 journal("task", id=task["id"], title=task["title"], ok=ok, stage=self.stage,
                         worker=self.name, note=note[:300])
                 if final and final.get("status") == "split":
-                    self.decompose(final, goal)
+                    if not self.decompose(final, goal):
+                        self.strand(final, "was split into no subtasks")
+                elif final and final.get("status") == "parked":
+                    self.strand(final, "was parked after repeated failures")
                 self.tally.finished()
             except CapReached:
                 log("quota/window pause — deferring task", self.name)
@@ -1984,8 +2197,8 @@ def preflight(c):
     if c.get("paid_models") and not c.get("allow_paid"):
         sys.exit(f"paid_models {c['paid_models']} would spend credits. "
                  "Set allow_paid: true to let the swarm fall back to them, or remove them.")
-    if c.get("daily_usd") in (None, "") and paid_pool(c):
-        sys.exit("paid_models needs daily_usd: a dollar budget for one day, so the fallback "
+    if spend_cap(c) is None and paid_pool(c):
+        sys.exit("paid_models needs monthly_usd or daily_usd: a dollar budget for one window, so the fallback "
                  "cannot run up an open-ended bill.")
     stray = [m for m in (c.get("paid_models") or []) if m.endswith(":free")]
     if stray:
@@ -2017,8 +2230,9 @@ def preflight(c):
     if paid_pool(c):
         left = spend_left(c)
         log(f"paid fallback ({len(paid_pool(c))}): {', '.join(paid_pool(c))} — "
-            f"${float(c['daily_usd']):.2f}/day for this repo"
-            + (f", ${left:.2f} left today" if left is not None else "")
+            + (f"${spend_cap(c):.2f}/month shared, resetting {spend_resets(c)}" if monthly(c)
+               else f"${spend_cap(c):.2f}/day for this repo")
+            + (f", ${left:.2f} left" if left is not None else "")
             + "; used only once free capacity is gone")
     else:
         log("paid fallback: off — free models only")
@@ -2305,7 +2519,9 @@ def cmd_status(a):
                    "since": note and dt.datetime.fromtimestamp(note["started"]).isoformat(timespec="seconds"),
                    "goal": note and str(note.get("goal", ""))[:200]},
         "budget": snap,
-        "spend": {"today_usd": round(spend_today(c), 6), "daily_usd": c.get("daily_usd"),
+        "spend": {"used_usd": round(spend_used(c), 6), "cap_usd": spend_cap(c),
+                  "window": spend_window(c), "resets": spend_resets(c),
+                  "shared": monthly(c), "ledger": str(spend_file(c)),
                   "remaining_usd": (round(spend_left(c), 6) if spend_left(c) is not None else None),
                   "paid_fallback": paid_pool(c)},
         "pacing": {"allowed_now": ok, "wait_s": round(wait), "reason": why},
@@ -2333,7 +2549,8 @@ def cmd_add(a):
     try:
         depends = q.resolve(a.depends_on) if a.depends_on else None
         t = q.add(a.title, a.detail or "", a.kind, priority=a.priority, origin="human",
-                  acceptance=a.acceptance or None, depends_on=depends)
+                  acceptance=a.acceptance or None, depends_on=depends,
+                  execution_class=getattr(a, "execution_class", "standard"))
     except ValueError as e:
         sys.exit(f"not queued: {e}")
     if not t:
@@ -2404,6 +2621,8 @@ def main():
     p.add_argument("--detail", default="")
     p.add_argument("--kind", default="feature")
     p.add_argument("--priority", type=int, default=1, help="hand-added tasks jump the queue (default 1)")
+    p.add_argument("--execution-class", choices=("standard", "fast"), default="standard",
+                   help="fast: explicit mechanical edit; no study/history, at most 4 rounds and 300s")
     p.add_argument("--acceptance", action="append", metavar="TEXT",
                    help="one thing the reviewer must verify; repeat for each (default: the detail)")
     p.add_argument("--depends-on", action="append", metavar="TITLE_OR_ID", dest="depends_on",

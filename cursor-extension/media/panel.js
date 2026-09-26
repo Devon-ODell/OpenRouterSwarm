@@ -28,18 +28,45 @@
       else bits.push(`<span class="dim">○ not set up for <b>${R.esc(name)}</b></span>`);
       bits.push(`${status.queue.length} queued · ${status.landed} landed` + (status.trunk_ahead ? ` · trunk +${status.trunk_ahead}` : ''));
       const b = status.budget;
-      if (b) bits.push(`swarm budget ${b.spent_today}/${b.usable} today, resets ${R.esc(b.resets_local)}`);
+      if (b) bits.push(`free requests <b>${b.spent_today}</b>/${b.usable} today, resets ${R.esc(b.resets_local)}`);
+      const sp = status.spend;
+      if (sp && sp.cap > 0) {          // a zero cap would draw an Infinity% meter
+        const spent = sp.left != null && sp.left <= 0;
+        bits.push(`<span class="meter" title="${money(sp.used)} of ${money(sp.cap)}">`
+          + `<span class="meter-fill${spent ? ' full' : ''}" style="width:${Math.min(100, (sp.used / sp.cap) * 100).toFixed(1)}%"></span></span>`
+          + ` locally recorded response costs <b>${money(sp.used)}</b> of ${money(sp.cap)} cap`
+          + (sp.shared ? ' this month' : ' today')
+          + (sp.resets ? ` <span class="dim">· back ${R.esc(sp.resets)}</span>` : '')
+          + (spent ? ' <span class="err">— spent</span>' : ''));
+      }
       const w = status.wallet;
       if (w) {
-        bits.push(`paid budget <b>${money(w.spent)}</b> of ${money(w.cap)} used` +
+        bits.push(`editor wallet: recorded <b>${money(w.spent)}</b> of ${money(w.cap)} cap` +
           (w.remaining <= 0 ? ' <span class="err">— spent</span>' : '') +
           ` <button class="icon" id="budget" title="Change the paid budget">✎</button>`);
       } else bits.push('<span class="dim">paid models off</span> <button class="icon" id="budget" title="Set a paid budget">✎</button>');
+    }
+    if (info && info.provider_usage) {
+      const u = info.provider_usage;
+      const amount = n => typeof n === 'number' && Number.isFinite(n) ? money(n) : 'unavailable';
+      bits.push(u.available
+        ? `OpenRouter key usage: <b>${amount(u.usage_daily)}</b> today · <b>${amount(u.usage_monthly)}</b> calendar month`
+          + ` <span class="dim">(all activity on this key; checked ${R.esc(u.checked_at)})</span>`
+        : '<span class="dim">OpenRouter key usage unavailable — local ledger is not verification</span>');
     }
     if (info && info.quota) bits.push(`OpenRouter free requests ${info.quota.used}/${info.quota.limit}`);
     if (info && info.corpus) bits.push(`MIT corpus ${info.corpus.chunks.toLocaleString()} chunks`);
     if (status && status.experiment) bits.push(`MIT experiment: ${status.experiment.on} with / ${status.experiment.off} without`);
     return bits.map((b) => `<div>${b}</div>`).join('');
+  }
+
+  /** "4m12s" — the same shape the activity tab prints, so the two agree. */
+  function idleFor(seconds) {
+    const s = Math.max(0, Math.round(seconds));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    return m < 60 ? `${m}m${String(s % 60).padStart(2, '0')}s`
+      : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`;
   }
 
   function renderStatus() {
@@ -48,7 +75,13 @@
     $('start').disabled = !!running;
     $('stop').disabled = !running;
     const recent = (status && status.recent) || [];
-    $('recent').innerHTML = recent.length ? recent.slice(-6).reverse().map((r) => `<div>${R.esc(r)}</div>`).join('') : '';
+    const age = status && status.stale_seconds;
+    const quiet = running && age != null
+      ? `<div class="quiet${age >= 600 ? ' warn' : ''}">quiet ${idleFor(age)}`
+        + `<button class="icon" id="activity" title="Watch the activity log">log&nbsp;↗</button></div>`
+      : '';
+    $('recent').innerHTML = (recent.length
+      ? recent.slice(-6).reverse().map((r) => `<div>${R.esc(r)}</div>`).join('') : '') + quiet;
     const n = status ? status.queue.length : 0;
     const badge = $('qcount');
     badge.textContent = n ? String(n) : '';
@@ -262,6 +295,7 @@
   document.addEventListener('click', (e) => {
     const tabBtn = e.target.closest('.tab');
     if (tabBtn) { showTab(tabBtn.dataset.tab); return; }
+    if (e.target.closest('#activity')) { vscode.postMessage({ type: 'activity' }); return; }
     if (e.target.closest('#budget')) { vscode.postMessage({ type: 'budget' }); return; }
     if (e.target.closest('#qclear')) {
       vscode.postMessage({ type: 'queueClear', repo: status && status.repo });

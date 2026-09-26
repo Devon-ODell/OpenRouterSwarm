@@ -2,7 +2,7 @@
   "name": "flint-swarm",
   "displayName": "Flint Swarm",
   "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers with a merged verdict, a queue you can edit, and MIT OpenCourseWare lookups.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "devon-odell",
   "license": "UNLICENSED",
   "private": true,
@@ -27,7 +27,16 @@
         {
           "id": "flintSwarm",
           "title": "Flint Swarm",
-          "icon": "media/swarm.svg"
+          "icon": "media/swarm.svg",
+          "when": "flintSwarm:doesNotSupportSecondarySidebar"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "flintSwarmSecondary",
+          "title": "Flint Swarm",
+          "icon": "media/swarm.svg",
+          "when": "!flintSwarm:doesNotSupportSecondarySidebar"
         }
       ]
     },
@@ -36,7 +45,16 @@
         {
           "type": "webview",
           "id": "flintSwarm.panel",
-          "name": "Swarm"
+          "name": "Swarm",
+          "when": "flintSwarm:doesNotSupportSecondarySidebar"
+        }
+      ],
+      "flintSwarmSecondary": [
+        {
+          "type": "webview",
+          "id": "flintSwarm.panelSecondary",
+          "name": "Swarm",
+          "when": "!flintSwarm:doesNotSupportSecondarySidebar"
         }
       ]
     },
@@ -65,6 +83,17 @@
         "command": "flintSwarm.stopGrind",
         "title": "Stop the Swarm",
         "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showPanel",
+        "title": "Open the Swarm Panel",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showActivity",
+        "title": "Watch the Swarm's Activity Log",
+        "category": "Flint Swarm",
+        "icon": "$(pulse)"
       },
       {
         "command": "flintSwarm.showReport",
@@ -111,13 +140,18 @@
       ],
       "view/title": [
         {
+          "command": "flintSwarm.showActivity",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
+          "group": "navigation@0"
+        },
+        {
           "command": "flintSwarm.showQueue",
-          "when": "view == flintSwarm.panel",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
           "group": "navigation@1"
         },
         {
           "command": "flintSwarm.refresh",
-          "when": "view == flintSwarm.panel",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
           "group": "navigation@2"
         }
       ]

@@ -527,6 +527,78 @@ class RecursionTests(SwarmBase):
                           first["persona"], first["origin"]),
                          ("Parse input", 1, 1, t["id"], "builder", "split"))
 
+    def test_splitting_hands_the_parent_dependents_to_its_last_child(self):
+        """A split parent never reaches `done`, so its dependents must follow the children.
+
+        Without this, a task waiting on a parent that got decomposed waits for ever and the
+        whole chain behind it is stranded silently.
+        """
+        repo, _ = self.repo()
+        q = swarmd.Queue(max_depth=1)
+        parent = q.add("Build the thing", "all of it", persona="builder", planner_model="p:free")
+        later = q.add("Polish the thing", "after the build", depends_on=[parent["id"]])
+        q.claim()
+        q.release(parent["id"], False, "tests failed: KeyError 'x'")
+        split = q.release(parent["id"], False, "REJECT: too big")
+        self.assertEqual(split["status"], "split")
+
+        def fake(prompt, cwd, c, role, worker, budget, steps, model):
+            return json.dumps([{"title": "Part one", "detail": "a", "kind": "feature"},
+                               {"title": "Part two", "detail": "b", "kind": "feature"}])
+        w = self.worker(self.cfg(repo), q)
+        w.evidence = None
+        with patch.object(swarmd, "flint", side_effect=fake):
+            self.assertEqual(w.decompose(split, "goal"), 2)
+
+        rows = {r["id"]: r for r in q.ready()}
+        queued = swarmd._read(q.path)
+        kids = [r for r in queued if r.get("parent") == parent["id"]]
+        self.assertEqual(len(kids), 2)
+        last = kids[-1]["id"]
+        moved = [r for r in queued if r["id"] == later["id"]][0]
+        self.assertEqual(moved["depends_on"], [last],
+                         "the dependent must wait on the last child, not the split parent")
+        self.assertNotIn(later["id"], rows, "it is not ready until that child is done")
+
+    def test_a_parked_task_parks_what_depends_on_it_with_the_reason(self):
+        """A dead prerequisite must not leave its chain waiting for ever, invisibly."""
+        self.repo()
+        q = swarmd.Queue(max_depth=0)
+        base = q.add("Build the base", "b")
+        mid = q.add("Build on the base", "m", depends_on=[base["id"]])
+        top = q.add("Polish the top", "t", depends_on=[mid["id"]])
+        other = q.add("Unrelated work", "u")
+        q.claim()
+        q.release(base["id"], False, "tests failed")
+        parked = q.release(base["id"], False, "tests failed again")
+        self.assertEqual(parked["status"], "parked")
+
+        stranded = q.strand(base["id"], "prerequisite 'Build the base' was parked")
+        self.assertEqual(sorted(stranded), ["Build on the base", "Polish the top"])
+        left = {r["id"] for r in swarmd._read(q.path)}
+        self.assertEqual(left, {other["id"]}, "unrelated work stays queued")
+        done = {r["id"]: r for r in swarmd._read(q.done)}
+        for t in (mid, top):
+            self.assertEqual(done[t["id"]]["status"], "parked")
+            self.assertIn("Build the base", done[t["id"]]["note"])
+
+    def test_a_split_into_nothing_strands_no_one(self):
+        """Zero subtasks used to leave dependents on a `split` parent that never finishes."""
+        repo, _ = self.repo()
+        q = swarmd.Queue(max_depth=1)
+        parent = q.add("Too big", "everything")
+        later = q.add("After it", "a", depends_on=[parent["id"]])
+        q.claim()
+        q.release(parent["id"], False, "tests failed")
+        split = q.release(parent["id"], False, "REJECT")
+        self.assertEqual(split["status"], "split")
+        w = self.worker(self.cfg(repo), q)
+        w.evidence = None
+        with patch.object(swarmd, "flint", return_value="[]"):     # the decomposer offers nothing
+            self.assertEqual(w.decompose(split, "goal"), 0)
+        self.assertEqual(w.strand(split, "was split into no subtasks"), ["After it"])
+        self.assertNotIn(later["id"], {r["id"] for r in swarmd._read(q.path)})
+
     def test_planner_tasks_carry_credit_and_a_botched_plan_is_penalised(self):
         repo, _ = self.repo()
         c = self.cfg(repo, models=["p:free"])

@@ -1,8 +1,11 @@
 """The dollar budget and the free-first paid fallback.
 
 Free models do the work. When free capacity runs out the swarm may continue on a paid
-model, but only while that repository's own daily dollar budget lasts, so several swarms
-on one OpenRouter key cannot spend each other's money.
+model, but only while its dollar budget lasts. A budget comes in two shapes: `daily_usd`
+is one repository's own allowance for a UTC day, kept in its own ledger; `monthly_usd`
+with `spend_reset_day` is a single pot shared by every swarm on the key, restarting on a
+chosen day of the month. The shared shape exists so three swarms cannot each spend the
+whole ceiling; the per-repository shape exists so they cannot spend each other's money.
 """
 import datetime as dt
 import json
@@ -44,11 +47,11 @@ class SpendLedgerTests(unittest.TestCase):
         self.assertEqual(s.remaining(), 0.0)
 
     def test_a_ledger_from_an_earlier_day_starts_the_new_day_at_zero(self):
-        self.path.write_text(json.dumps({"day": "2020-01-01", "usd": 99.0, "requests": 7}))
+        self.path.write_text(json.dumps({"period": "2020-01-01", "usd": 99.0, "requests": 7}))
         s = self.ledger()
         self.assertEqual(s.today(), 0.0)
         s.check()
-        self.assertEqual(json.loads(self.path.read_text())["day"], UTC_TODAY)
+        self.assertEqual(json.loads(self.path.read_text())["period"], UTC_TODAY)
 
     def test_free_replies_and_unusable_costs_are_ignored(self):
         s = self.ledger()
@@ -79,10 +82,14 @@ class SpendLedgerTests(unittest.TestCase):
             model_extra = {"cost": 0.0025}
         agent = flint.Agent.__new__(flint.Agent)
         agent.spend, agent.last_cost, agent.total_cost = self.ledger(), 0.0, 0.0
+        agent.model = "poolside/laguna-s-2.1"
         agent._charge(Usage())
         agent._charge(Usage())
         self.assertAlmostEqual(agent.total_cost, 0.005)
         self.assertAlmostEqual(self.ledger().today(), 0.005)
+        # the charge names the model, so a wrong figure can be traced to its source
+        rows = json.loads(self.path.read_text())["recent"]
+        self.assertEqual([r["model"] for r in rows], ["poolside/laguna-s-2.1"] * 2)
 
 
 class ThrottleTests(unittest.TestCase):
@@ -140,7 +147,7 @@ class StandInTests(unittest.TestCase):
                   "paid_models": ["poolside/laguna-s-2.1", "inclusionai/ling-3.0-flash-fin"]}
 
     def spent(self, usd, day=UTC_TODAY):
-        (Path(self.dir.name) / "spend.json").write_text(json.dumps({"day": day, "usd": usd}))
+        (Path(self.dir.name) / "spend.json").write_text(json.dumps({"period": day, "usd": usd}))
 
     def test_the_pool_stays_free_and_the_fallback_stays_paid(self):
         self.assertTrue(all(m.endswith(":free") for m in swarmd.pool(self.c)))
@@ -162,7 +169,7 @@ class StandInTests(unittest.TestCase):
 
     def test_yesterdays_spending_does_not_count_against_today(self):
         self.spent(50.0, day="2020-01-01")
-        self.assertEqual(swarmd.spend_today(self.c), 0.0)
+        self.assertEqual(swarmd.spend_used(self.c), 0.0)
         self.assertEqual(swarmd.spend_left(self.c), 1.0)
 
     def test_without_allow_paid_there_is_no_fallback(self):
@@ -172,7 +179,7 @@ class StandInTests(unittest.TestCase):
 
     def test_a_corrupt_ledger_is_treated_as_nothing_spent(self):
         (Path(self.dir.name) / "spend.json").write_text("{not json")
-        self.assertEqual(swarmd.spend_today(self.c), 0.0)
+        self.assertEqual(swarmd.spend_used(self.c), 0.0)
 
     def test_every_free_model_resting_draws_a_paid_stand_in(self):
         w = swarmd.Worker.__new__(swarmd.Worker)
@@ -183,6 +190,108 @@ class StandInTests(unittest.TestCase):
                          "inclusionai/ling-3.0-flash-fin")
         self.spent(1.0)
         self.assertIsNone(w.pick())
+
+
+class MonthlyBudgetTests(unittest.TestCase):
+    """One shared pot over a month that restarts on a chosen day.
+
+    `monthly_usd` is deliberately not per repository: the whole point is that three
+    swarms on one key cannot each spend the ceiling. `spend_reset_day` moves the
+    boundary off the 1st so the budget can follow a real billing date.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.here = Path(self.dir.name)
+        (self.here / "state").mkdir(parents=True)
+        for attr, value in (("HERE", self.here), ("STATE", self.here / "state" / "one-repo")):
+            patcher = patch.object(swarmd, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.shared = self.here / "state" / "spend.json"
+        self.c = {"allow_paid": True, "monthly_usd": 20.0, "spend_reset_day": 5,
+                  "models": ["poolside/laguna-s-2.1:free"],
+                  "paid_models": ["poolside/laguna-s-2.1"]}
+
+    def ledger(self, usd, period=None):
+        self.shared.write_text(json.dumps(
+            {"period": period or flint.spend_period(5), "usd": usd, "requests": 1}))
+
+    def test_a_window_is_named_by_the_date_it_began(self):
+        for day, want in (("2026-09-05", "2026-09-05"), ("2026-09-26", "2026-09-05"),
+                          ("2026-10-04", "2026-09-05"), ("2026-10-05", "2026-10-05"),
+                          ("2026-01-03", "2025-12-05")):
+            self.assertEqual(flint.spend_period(5, dt.date.fromisoformat(day)), want, day)
+
+    def test_a_month_too_short_for_the_reset_day_begins_on_its_last_day(self):
+        # There is no 31st of February, so the window must not be skipped entirely.
+        self.assertEqual(flint.spend_period(31, dt.date(2026, 2, 15)), "2026-01-31")
+        self.assertEqual(flint.spend_period(31, dt.date(2026, 2, 28)), "2026-02-28")
+
+    def test_no_reset_day_keeps_the_window_a_single_utc_day(self):
+        self.assertEqual(flint.spend_period(None, dt.date(2026, 9, 26)), "2026-09-26")
+
+    def test_a_shared_budget_uses_one_ledger_and_a_daily_one_keeps_its_own(self):
+        self.assertEqual(swarmd.spend_file(self.c), self.shared)
+        self.assertEqual(swarmd.spend_file({"daily_usd": 1.0}), swarmd.STATE / "spend.json")
+        self.assertTrue(swarmd.monthly(self.c))
+        self.assertFalse(swarmd.monthly({"daily_usd": 1.0}))
+
+    def test_what_is_left_is_the_cap_less_the_shared_pot(self):
+        self.ledger(17.5)
+        self.assertEqual(swarmd.spend_cap(self.c), 20.0)
+        self.assertAlmostEqual(swarmd.spend_used(self.c), 17.5)
+        self.assertAlmostEqual(swarmd.spend_left(self.c), 2.5)
+
+    def test_an_earlier_window_does_not_count_against_this_one(self):
+        self.ledger(99.0, period="2020-01-05")
+        self.assertEqual(swarmd.spend_used(self.c), 0.0)
+        self.assertAlmostEqual(swarmd.spend_left(self.c), 20.0)
+
+    def test_a_spent_month_offers_no_paid_stand_in(self):
+        self.ledger(20.0)
+        self.assertEqual(swarmd.spend_left(self.c), 0.0)
+        self.assertIsNone(swarmd.paid_stand_in(self.c, "poolside/laguna-s-2.1:free"))
+
+    def test_the_window_ends_on_the_reset_day_of_the_following_month(self):
+        start = dt.date.fromisoformat(swarmd.spend_window(self.c))
+        end = dt.date.fromisoformat(swarmd.spend_resets(self.c))
+        self.assertEqual((start.day, end.day), (5, 5))
+        self.assertLess(start, end)
+        self.assertLessEqual((end - start).days, 31)
+
+    def test_a_daily_budget_has_no_reset_date(self):
+        self.assertIsNone(swarmd.spend_resets({"daily_usd": 1.0}))
+        self.assertIsNone(swarmd.spend_reset_day({"daily_usd": 1.0}))
+
+    def test_monthly_overrides_a_stray_daily_figure(self):
+        self.assertEqual(swarmd.spend_cap(dict(self.c, daily_usd=1.0)), 20.0)
+
+    def test_the_ledger_records_what_each_model_cost(self):
+        s = flint.Spend(str(self.shared), 20.0, reset_day=5)
+        s.add(0.004, "poolside/laguna-s-2.1")
+        s.add(1.5, "qwen/qwen3.8-27b")
+        rows = json.loads(self.shared.read_text())["recent"]
+        self.assertEqual([r["model"] for r in rows],
+                         ["poolside/laguna-s-2.1", "qwen/qwen3.8-27b"])
+        self.assertEqual(rows[-1]["usd"], 1.5)
+        self.assertAlmostEqual(s.today(), 1.504)
+
+    def test_the_audit_trail_cannot_grow_without_limit(self):
+        s = flint.Spend(str(self.shared), 200.0, reset_day=5)
+        for i in range(60):
+            s.add(0.001, f"model-{i}")
+        rows = json.loads(self.shared.read_text())["recent"]
+        self.assertEqual(len(rows), 50)
+        self.assertEqual(rows[-1]["model"], "model-59")
+
+    def test_a_new_window_clears_the_audit_trail_with_the_total(self):
+        s = flint.Spend(str(self.shared), 20.0, reset_day=5)
+        s.add(1.0, "m")
+        self.ledger(1.0, period="2020-01-05")
+        self.assertEqual(s.today(), 0.0)
+        self.assertEqual(json.loads(self.shared.read_text())["recent"], [])
 
 
 class OwnerWindowTests(unittest.TestCase):
@@ -402,7 +511,7 @@ class PlannerGateTests(unittest.TestCase):
 
     def spent_usd(self, usd):
         (Path(self.dir.name) / "spend.json").write_text(
-            json.dumps({"day": UTC_TODAY, "usd": usd}))
+            json.dumps({"period": UTC_TODAY, "usd": usd}))
 
     def test_free_capacity_lets_a_turn_start(self):
         self.assertTrue(swarmd.can_take_a_turn(self.c, self.budget(0)))

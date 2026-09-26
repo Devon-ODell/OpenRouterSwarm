@@ -249,3 +249,32 @@ be empty where that code should be.
 ```sh
 .venv/bin/python -m unittest discover -s tests -v
 ```
+
+
+### Role deadlines and mechanical tasks
+
+`role_timeouts` overrides `turn_timeout` per role (seconds). For example, use
+`{"implementer": 900, "repair": 900, "adversary": 300, "judge": 300}`.
+An omitted role keeps the existing `turn_timeout` behavior.
+Timeouts are logged as `agent_timeout` with the role, actual model, deadline,
+and retained turn log; partial output is kept in that log. Partial implementation
+or repair edits pass through the normal tests and review before they can land.
+An unsuccessful attempt that timed out is decomposed before another full retry;
+at the recursion limit it is parked. A zero-child decomposition leaves the parent marked `split`
+for inspection, rather than automatically retrying the same oversized task.
+
+A task that can no longer finish — parked, or split into no subtasks — takes its dependents
+with it: every queued task waiting on it, directly or through another, is parked with
+`blocked: prerequisite '<title>' ...` as its note and a `stranded` journal line. Without this a
+dead prerequisite left its whole chain waiting for ever, invisibly, holding queue slots the
+planner could not reclaim. When a split does produce subtasks, anything that waited on the
+parent is moved onto the last subtask instead.
+
+For a fully specified mechanical edit, use `swarm add TITLE --detail DETAIL
+--execution-class fast` (or queue metadata `"execution_class": "fast"`). Fast tasks
+keep the project rules, acceptance criteria, tests and review gates, but omit
+study material, historical playbooks and architect calls. Implementation and
+repair turns are capped at four rounds and 300 seconds. Classification is
+explicit: ordinary feature tasks keep their existing workflow.
+
+These settings and supervisor changes take effect when the daemon next starts.

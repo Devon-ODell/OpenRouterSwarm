@@ -61,5 +61,14 @@
   "plan_cooldown": 600,
   "turn_timeout": 1800,
   "test_timeout": 900,
-  "max_diff": 24000
+  "max_diff": 24000,
+  "role_timeouts": {
+    "implementer": 900,
+    "repair": 900,
+    "architect": 300,
+    "planner": 300,
+    "adversary": 300,
+    "judge": 300,
+    "decomposer": 300
+  }
 }

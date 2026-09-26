@@ -10,8 +10,18 @@ const fs = require('fs');
 const EXT = path.resolve(__dirname, '..');
 const manifest = JSON.parse(fs.readFileSync(path.join(EXT, 'package.json'), 'utf8'));
 const registered = {};
+const providers = [];
+const contexts = {};
+const terminals = [];
 let provider = null;
 const disposable = { dispose() {} };
+
+/** Enough of vscode.EventEmitter for a pseudoterminal: fire() reaches the listener. */
+class EventEmitter {
+  constructor() { this.listeners = []; this.event = (fn) => { this.listeners.push(fn); return disposable; }; }
+  fire(v) { this.listeners.forEach((fn) => fn(v)); }
+  dispose() { this.listeners = []; }
+}
 
 class Range {
   constructor(a, b, c, d) { this.start = { line: a, character: b }; this.end = { line: c, character: d }; }
@@ -26,11 +36,26 @@ const vscode = {
   window: {
     activeTextEditor: undefined,
     createStatusBarItem: () => ({ show() {}, dispose() {} }),
-    registerWebviewViewProvider: (id, p) => { assert.strictEqual(id, 'flintSwarm.panel'); provider = p; return disposable; },
+    registerWebviewViewProvider: (id, p) => { providers.push(id); provider = p; return disposable; },
+    createTerminal: (opts) => {
+      const term = { name: opts.name, pty: opts.pty, out: [], exitStatus: undefined,
+        show() {}, dispose() { this.exitStatus = { code: 0 }; } };
+      opts.pty.onDidWrite((s) => term.out.push(s));
+      terminals.push(term);
+      return term;
+    },
     onDidChangeActiveTextEditor: () => disposable,
     showWarningMessage: () => Promise.resolve(undefined),
   },
-  commands: { registerCommand: (id, fn) => { registered[id] = fn; return disposable; }, executeCommand: () => Promise.resolve() },
+  commands: {
+    registerCommand: (id, fn) => { registered[id] = fn; return disposable; },
+    executeCommand: (cmd, key, value) => {
+      if (cmd === 'setContext') contexts[key] = value;
+      return Promise.resolve();
+    },
+  },
+  version: '1.108.0',
+  EventEmitter,
   Uri: { joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts), toString() { return 'vscode-resource:' + this.fsPath; } }) },
   StatusBarAlignment: { Left: 1 }, ProgressLocation: { Notification: 15 }, ViewColumn: { One: 1 },
   SymbolKind: { 5: 'Class', 11: 'Function', Class: 5, Function: 11 }, Range, Position: class { constructor(l, c) { this.line = l; this.character = c; } },
@@ -48,7 +73,33 @@ test('every contributed command is registered, and menus only use contributed co
   assert.deepStrictEqual(Object.keys(registered).sort(), declared);
   const used = [...Object.values(manifest.contributes.menus).flat(), ...manifest.contributes.keybindings].map((m) => m.command);
   used.forEach((c) => assert.ok(declared.includes(c), c));
-  assert.ok(fs.existsSync(path.join(EXT, manifest.contributes.viewsContainers.activitybar[0].icon)));
+  for (const group of Object.values(manifest.contributes.viewsContainers)) {
+    group.forEach((c) => assert.ok(fs.existsSync(path.join(EXT, c.icon)), c.icon));
+  }
+});
+
+test('the panel is contributed to the secondary sidebar, with the activity bar as fallback', () => {
+  const { activitybar, secondarySidebar } = manifest.contributes.viewsContainers;
+  // Claude Code and Codex both sit in the secondary sidebar; this is what puts Flint there
+  // beside them instead of on its own activity-bar pin.
+  assert.strictEqual(secondarySidebar[0].when, '!flintSwarm:doesNotSupportSecondarySidebar');
+  assert.strictEqual(activitybar[0].when, 'flintSwarm:doesNotSupportSecondarySidebar');
+  const views = manifest.contributes.views;
+  assert.deepStrictEqual(Object.keys(views), [activitybar[0].id, secondarySidebar[0].id]);
+  // Exactly one of the two resolves at a time, so both are registered.
+  assert.deepStrictEqual(providers.sort(), ['flintSwarm.panel', 'flintSwarm.panelSecondary']);
+  // Every title-bar button has to show on whichever view the host gave us.
+  manifest.contributes.menus['view/title'].forEach((m) => {
+    assert.ok(m.when.includes('flintSwarm.panel') && m.when.includes('flintSwarm.panelSecondary'), m.command);
+  });
+});
+
+test('the secondary sidebar is used from 1.106 on, and the fallback flag is set below it', () => {
+  const supports = ext._test.supportsSecondarySidebar;
+  assert.ok(supports('1.106.0') && supports('1.108.2') && supports('2.0.0'));
+  assert.ok(!supports('1.105.3') && !supports('1.90.0') && !supports(''));
+  // 1.108.0 in the mock, so the fallback flag must NOT have been set
+  assert.strictEqual(contexts['flintSwarm:doesNotSupportSecondarySidebar'], undefined);
 });
 
 test('JSON lines are parsed across chunk boundaries', () => {
@@ -144,6 +195,8 @@ const QUEUE_STATUS = {
   repo: '/r/demo', is_target: true, daemon_running: true, landed: 2, max_queue: 20,
   kinds: ['feature', 'bugfix', 'test', 'refactor'], recent: [], budget: null, experiment: null,
   wallet: { cap: 5, spent: 0.1234, remaining: 4.8766, calls: 3 },
+  spend: { used: 2.199104, cap: 20, left: 17.800896, resets: '2026-10-05', shared: true },
+  stale_seconds: 900,
   queue: [
     { id: 't1', title: 'Handle empty input', kind: 'bugfix', priority: 2, attempts: 1, claimed: false,
       origin: 'cursor', not_before: 0, created: 10, acceptance: ['parse([]) returns []'], depends_on: [],
@@ -221,10 +274,100 @@ test('Clear all and the budget pencil reach the extension', () => {
   assert.deepStrictEqual(sent, [{ type: 'queueClear', repo: '/r/demo' }, { type: 'budget' }]);
 });
 
+test('the monthly budget shows as a meter, and silence shows as a clock', () => {
+  const { els, send } = panelHarness;
+  send({ type: 'status', data: QUEUE_STATUS });
+  const out = els.status.text();
+  assert.ok(out.includes('$2.20') && out.includes('$20.00'), 'both sides of the cap are shown');
+  assert.ok(out.includes('this month') && out.includes('back 2026-10-05'), 'the window is named');
+  assert.ok(/class="meter-fill"[^>]*width:11\.0%/.test(out), 'the meter is filled by proportion');
+  // 900s of silence on a running daemon is what a hang looks like
+  const quiet = els.recent.text();
+  assert.ok(quiet.includes('quiet 15m00s'), quiet);
+  assert.ok(quiet.includes('class="quiet warn"'), 'past ten minutes it is marked');
+  assert.ok(quiet.includes('id="activity"'), 'and offers the activity log');
+});
+
+test('a spent month is called out and the meter is full', () => {
+  const { els, send } = panelHarness;
+  send({ type: 'status', data: { ...QUEUE_STATUS, spend: { used: 20, cap: 20, left: 0, resets: '2026-10-05', shared: true } } });
+  const out = els.status.text();
+  assert.ok(out.includes('— spent'));
+  assert.ok(out.includes('meter-fill full'));
+  send({ type: 'status', data: QUEUE_STATUS });   // leave the harness as the others expect
+});
+
+test('provider usage is separate from local costs and missing values never become zero', () => {
+  const { els, send } = panelHarness;
+  send({ type: 'info', data: { provider_usage: { available: true, usage_daily: 1.23, usage_monthly: 4.56, checked_at: '2026-09-26T12:00:00Z' } } });
+  let out = els.status.text();
+  assert.ok(out.includes('OpenRouter key usage') && out.includes('$1.23') && out.includes('$4.56'));
+  assert.ok(out.includes('locally recorded response costs') && out.includes('all activity on this key'));
+  send({ type: 'info', data: { provider_usage: { available: false } } });
+  out = els.status.text();assert.ok(out.includes('usage unavailable'));assert.ok(!out.includes('OpenRouter key usage: <b>$0'));
+  send({ type: 'info', data: {} });
+});
+
+test('the stylesheet is built on one spacing and radius scale', () => {
+  const css = fs.readFileSync(path.join(EXT, 'media', 'panel.css'), 'utf8');
+  ['--sp-1: 4px', '--sp-2: 8px', '--sp-3: 12px', '--sp-4: 16px',
+   '--r-sm: 4px', '--r-md: 6px', '--r-lg: 8px'].forEach((tok) => assert.ok(css.includes(tok), tok));
+  // the input-border fallback chain, so a theme setting only one still shows an edge
+  assert.ok(/--edge:.*inlineChatInput-border.*input-border.*widget-border/.test(css));
+  assert.ok(css.includes('.meter-fill') && css.includes('.quiet.warn'));
+});
+
 test('the row controls are revealed by hover and by keyboard focus', () => {
   const css = fs.readFileSync(path.join(EXT, 'media', 'panel.css'), 'utf8');
   assert.ok(/\.qactions\s*{[^}]*visibility:\s*hidden/.test(css));
   assert.ok(css.includes('.qrow:hover .qactions') && css.includes('.qrow:focus-within .qactions'));
+});
+
+test('the idle clock reads at a glance', () => {
+  const f = ext._test.idleFor;
+  assert.strictEqual(f(0), '0s');
+  assert.strictEqual(f(45), '45s');
+  assert.strictEqual(f(252), '4m12s');
+  assert.strictEqual(f(3600), '1h00m');
+  assert.strictEqual(f(3725), '1h02m');
+  assert.strictEqual(f(-5), '0s', 'a clock skew must not print a negative age');
+});
+
+test('the activity tab tails by offset and shows silence as well as lines', async () => {
+  // A hung swarm writes nothing, so the tab has to report elapsed time on its own.
+  const calls = [];
+  const replies = [
+    { exists: true, day: 'D1', path: '/l/D1.log', offset: 10, lines: ['a', 'b'], stale_seconds: 2, daemon_running: true },
+    { exists: true, day: 'D1', path: '/l/D1.log', offset: 10, lines: [], stale_seconds: 900, daemon_running: true },
+  ];
+  let last = replies[replies.length - 1];
+  const stub = async (args) => { calls.push(args); last = replies.shift() || last; return last; };
+  {
+    await ext._test.showActivity('/r/demo', stub);
+    const term = terminals[terminals.length - 1];
+    assert.strictEqual(term.name, 'Flint Swarm: activity');
+    term.pty.open();
+    await new Promise((r) => setTimeout(r, 30));
+    const out = term.out.join('');
+    assert.ok(out.includes('Flint Swarm — activity'), 'the tab names itself');
+    assert.ok(out.includes('\r\n'), 'a terminal needs CRLF, not bare newlines');
+    assert.ok(/--repo/.test(calls.flat().join(' ')) && /--offset/.test(calls.flat().join(' ')));
+    assert.ok(out.includes('quiet '), 'the heartbeat prints even when the log grew');
+    term.out.length = 0;
+    await new Promise((r) => setTimeout(r, 30));
+    term.pty.close();          // closing the tab must stop the timer
+    const after = calls.length;
+    await new Promise((r) => setTimeout(r, 120));
+    assert.strictEqual(calls.length, after, 'a closed tab stops polling');
+  }
+});
+
+test('the HUD command is contributed with an icon and reaches the title bar', () => {
+  const cmd = manifest.contributes.commands.find((c) => c.command === 'flintSwarm.showActivity');
+  assert.ok(cmd && cmd.icon, 'the HUD needs an icon to appear as a title-bar button');
+  assert.ok(manifest.contributes.menus['view/title'].some((m) => m.command === 'flintSwarm.showActivity'));
+  assert.ok(typeof registered['flintSwarm.showActivity'] === 'function');
+  assert.ok(typeof registered['flintSwarm.showPanel'] === 'function');
 });
 
 test('a real bridge call returns MIT hits with absolute paths', async () => {

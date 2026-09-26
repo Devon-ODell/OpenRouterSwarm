@@ -469,6 +469,76 @@ async function openFile(msg) {
   await vscode.window.showTextDocument(doc, { selection: new vscode.Range(pos, pos), preview: true, viewColumn: vscode.ViewColumn.One });
 }
 
+// ---------------------------------------------------------------- activity HUD
+
+// A read-only terminal tab that tails the daemon's own log. The sidebar already shows the
+// last few journal lines, but the journal only records task boundaries — a hung turn and a
+// quiet one look the same there. What gives a hang away is elapsed time with no new output,
+// so this prints how long the log has been silent on every poll, whether or not it grew.
+const IDLE_WARN_S = 600;        // ten minutes of silence is worth a colour
+
+/** "4m12s" — a duration short enough to read at a glance in a status line. */
+function idleFor(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m${String(s % 60).padStart(2, '0')}s`
+    : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`;
+}
+
+let activityTerminal = null;
+
+async function showActivity(repo, fetch) {
+  const ask = fetch || bridgeJson;          // a seam, so the poll loop is testable offline
+  repo = repo || repoFor(currentEditor() && currentEditor().document.uri);
+  if (!repo) { vscode.window.showWarningMessage('Open a file in a Git repository first.'); return; }
+  if (activityTerminal && activityTerminal.exitStatus === undefined) {
+    activityTerminal.show(false);     // one tab per window; reuse the open one
+    return;
+  }
+  const writer = new vscode.EventEmitter();
+  const write = (s) => writer.fire(s.replace(/\n/g, '\r\n'));
+  let timer = null, offset = 0, day = null, quiet = 0, started = false;
+
+  const poll = async () => {
+    let a;
+    try {
+      a = await ask(['activity', '--repo', repo, '--offset', String(offset)]);
+    } catch (e) {
+      write(`\x1b[31m${e.message}\x1b[0m\n`);
+      return;
+    }
+    if (a.day !== day) { day = a.day; offset = 0; quiet = 0; started = false; }
+    if (!a.exists) {
+      if (!started) { write('\x1b[2mNo log for today yet — the swarm has not run.\x1b[0m\n'); started = true; }
+      return;
+    }
+    if (!started) { write(`\x1b[2m${a.path}\x1b[0m\n`); started = true; }
+    offset = a.offset;
+    for (const line of a.lines) write(line + '\n');
+    // The heartbeat is the point: it proves the tab is live even when the log is not.
+    const stale = a.stale_seconds == null ? 0 : a.stale_seconds;
+    if (a.lines.length) quiet = 0; else quiet++;
+    const colour = stale >= IDLE_WARN_S ? '31' : '2';
+    const state = a.daemon_running ? 'running' : '\x1b[33mno daemon\x1b[0m';
+    if (a.lines.length || quiet % 5 === 1) {
+      write(`\x1b[${colour}m── quiet ${idleFor(stale)} · ${state}\x1b[${colour}m ──\x1b[0m\n`);
+    }
+  };
+
+  const pty = {
+    onDidWrite: writer.event,
+    open: () => {
+      write('\x1b[1mFlint Swarm — activity\x1b[0m  \x1b[2m(read-only; close the tab to stop)\x1b[0m\n');
+      poll();
+      timer = setInterval(poll, 3000);
+    },
+    close: () => { if (timer) clearInterval(timer); timer = null; writer.dispose(); },
+  };
+  activityTerminal = vscode.window.createTerminal({ name: 'Flint Swarm: activity', pty });
+  activityTerminal.show(false);
+}
+
 // ---------------------------------------------------------------- status
 
 let refreshing = null;
@@ -520,7 +590,11 @@ class SwarmPanel {
   }
 
   async reveal() {
-    await vscode.commands.executeCommand('flintSwarm.panel.focus');
+    // Whichever container the host gave us; focusing the absent one is a harmless no-op.
+    for (const id of ['flintSwarm.panelSecondary', 'flintSwarm.panel']) {
+      try { await vscode.commands.executeCommand(`${id}.focus`); } catch { /* not this one */ }
+      if (this.view) break;
+    }
     if (this.view) this.view.show(true);
   }
 
@@ -591,6 +665,8 @@ class SwarmPanel {
       await queueRemove(m);
     } else if (m.type === 'queueClear') {
       await clearQueue(m);
+    } else if (m.type === 'activity') {
+      await showActivity();
     } else if (m.type === 'budget') {
       await setBudget();
     } else if (m.type === 'refresh') {
@@ -601,18 +677,32 @@ class SwarmPanel {
 
 // ---------------------------------------------------------------- lifecycle
 
+// The secondary sidebar arrived in VS Code 1.106. Claude Code and Codex both contribute
+// there and fall back to the activity bar below that version, keyed off a context flag they
+// set themselves; Flint Swarm does the same so all three sit in the same sidebar.
+function supportsSecondarySidebar(version) {
+  const [major, minor] = String(version || '').split('.').map(Number);
+  return (major || 0) > 1 || ((major || 0) === 1 && (minor || 0) >= 106);
+}
+
 function activate(context) {
   panel = new SwarmPanel(context);
+  if (!supportsSecondarySidebar(vscode.version)) {
+    vscode.commands.executeCommand('setContext', 'flintSwarm:doesNotSupportSecondarySidebar', true);
+  }
   lastEditor = vscode.window.activeTextEditor || null;
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   statusItem.text = '$(organization) Swarm';
   statusItem.tooltip = 'Flint swarm: ask about the code you are working on';
-  statusItem.command = 'flintSwarm.panel.focus';
+  statusItem.command = 'flintSwarm.showPanel';
   statusItem.show();
   const reg = (id, fn) => context.subscriptions.push(vscode.commands.registerCommand(id, fn));
   context.subscriptions.push(
     statusItem,
+    // Only one of these two views exists at a time, decided by the context key above;
+    // registering both means the panel works either way without a reload.
     vscode.window.registerWebviewViewProvider('flintSwarm.panel', panel, { webviewOptions: { retainContextWhenHidden: true } }),
+    vscode.window.registerWebviewViewProvider('flintSwarm.panelSecondary', panel, { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.window.onDidChangeActiveTextEditor((e) => { if (e && e.document.uri.scheme === 'file') lastEditor = e; }),
   );
   reg('flintSwarm.askSelection', cmdAsk);
@@ -620,6 +710,8 @@ function activate(context) {
   reg('flintSwarm.studySelection', cmdStudy);
   reg('flintSwarm.startGrind', () => startGrind());
   reg('flintSwarm.stopGrind', stopGrind);
+  reg('flintSwarm.showPanel', () => panel.reveal());
+  reg('flintSwarm.showActivity', () => showActivity());
   reg('flintSwarm.showReport', showReport);
   reg('flintSwarm.showQueue', showQueue);
   reg('flintSwarm.clearQueue', () => clearQueue());
@@ -638,4 +730,5 @@ function deactivate() {
 }
 
 module.exports = { activate, deactivate,
-  _test: { parseLines, innermost, flintRoot, where, bridgeJson, bridgeLast, PRESETS } };
+  _test: { parseLines, innermost, flintRoot, where, bridgeJson, bridgeLast, PRESETS,
+    idleFor, supportsSecondarySidebar, showActivity } };

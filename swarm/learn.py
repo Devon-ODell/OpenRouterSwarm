@@ -38,6 +38,7 @@ BUSY_MAX = 1800
 # Failure stages and their reward. None means "not the implementer's doing": no update.
 # Faulty code earns nothing; how hard it hurts is set by PENALTY_WEIGHT below.
 STAGE_REWARD = {
+    "agent_timeout": None, # wall-clock exhaustion is not a proven code defect
     "no_change": 0.0,       # produced nothing
     "model_error": 0.0,     # malformed or empty responses
     "weakened_tests": 0.0,  # tried to cheat the gate
