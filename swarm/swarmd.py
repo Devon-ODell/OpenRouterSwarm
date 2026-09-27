@@ -3618,9 +3618,18 @@ def preflight(c):
                      f"    swarm grind {shlex.quote(str(Path(c['repo']) / blind[0]))} --goal '...'")
     ensure_trunk(c)
     sync_trunk(c)
+    # The same cache the attempt gate uses. Startup runs this suite — 115s in the studio — and
+    # the daemon now restarts itself whenever the harness is edited, so an unchanged trunk was
+    # about to be re-proved several times an hour.
+    _, head = git(["rev-parse", trunk_name(c)], cwd=c["repo"])
+    key = baseline_key(c, head)
+    if baseline_cache(key, ttl=c.get("baseline_ttl", 86_400)):
+        log(f"baseline: cached pass for {trunk_name(c)} at {head[:12]}")
+        return
     with _view_lock:
         view = refresh_view(c)
         ok, output = run_gate(view, c)
+    baseline_cache(key, passed=ok)
     if not ok:
         sys.exit(f"`{c['test_cmd']}` fails on {trunk_name(c)} before any work, so every task "
                  f"would be rejected. Fix the tests or pass --test-cmd."

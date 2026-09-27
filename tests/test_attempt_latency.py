@@ -248,3 +248,41 @@ class WholeTurnBudgetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreflightBaselineTests(unittest.TestCase):
+    """Startup proves trunk is green too, and pays the same 115 seconds for it.
+
+    That mattered little when a restart was a person's decision; it matters now that the daemon
+    restarts itself whenever the harness is edited.
+    """
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.root = Path(d.name)
+        p = patch.object(swarmd, "STATE", self.root)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_preflight(self, gate_result=(True, "")):
+        c = {"repo": str(self.root), "test_cmd": "true", "models": ["a:free"],
+             "base_branch": "main"}
+        with patch.object(swarmd, "account", return_value=None), \
+             patch.object(swarmd, "ensure_trunk"), patch.object(swarmd, "sync_trunk"), \
+             patch.object(swarmd, "refresh_view", return_value=self.root), \
+             patch.object(swarmd, "git", return_value=(0, "abc123def456")), \
+             patch.object(swarmd, "log"), \
+             patch.object(swarmd, "run_gate", return_value=gate_result) as gate:
+            swarmd.preflight(c)
+        return gate
+
+    def test_the_first_start_runs_it_and_the_next_does_not(self):
+        self.assertEqual(self.run_preflight().call_count, 1)
+        self.assertEqual(self.run_preflight().call_count, 0, "an unchanged trunk was re-proved")
+
+    def test_a_failing_baseline_is_not_cached(self):
+        with self.assertRaises(SystemExit):
+            self.run_preflight((False, "boom"))
+        self.assertIsNone(swarmd.baseline_cache(
+            swarmd.baseline_key({"test_cmd": "true"}, "abc123def456")))
