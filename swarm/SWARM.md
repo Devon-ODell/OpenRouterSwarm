@@ -232,6 +232,11 @@ startup too, so a counter left over from before a restart is settled first.
 
 `owner_window` (disabled by default) pauses the swarm during set local hours.
 
+Stopping is per repository. `bridge.py stop --repo P` signals the pid in that
+repository's `state/<slug>/daemon.pid`, and only after `ps` confirms it is still
+that repository's daemon; swarms on other repositories keep working. `--all` is
+the machine-wide sweep, and now has to be asked for by name.
+
 ## Safety
 
 Agents and the test command run under a macOS `sandbox-exec` profile: writes

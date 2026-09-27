@@ -19,7 +19,7 @@ Every command prints JSON. `ask` streams one JSON object per line as models fini
     bridge.py vote     --model M --useful 1|0
     bridge.py wallet   [--cap 5] [--reset] [--enable | --disable] [--account]
     bridge.py grind-cmd --repo PATH [--goal G] [--test-cmd T] [--hours H]
-    bridge.py stop
+    bridge.py stop     --repo PATH | --all
 
 `ask` runs read-only flint agents (read_file, list_files, search, study; no edits, no shell)
 in the macOS sandbox, several free models in parallel, then one more model merges their
@@ -709,8 +709,14 @@ def cmd_activity(a):
     return 0
 
 
-def cmd_stop(a):
-    """SIGINT to running swarm daemons (the same as Ctrl-C in their terminal)."""
+def proc_args(pid):
+    """That pid's command line, or "" when it is gone."""
+    return subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def stop_every_swarm():
+    """SIGINT to every swarm daemon on this machine, whatever repository it works on."""
     out = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True, text=True).stdout
     me, stopped = os.getpid(), []
     for line in out.splitlines():
@@ -721,7 +727,45 @@ def cmd_stop(a):
                 stopped.append(int(pid))
             except (ProcessLookupError, PermissionError):
                 pass
-    emit({"stopped": stopped})
+    emit({"ok": True, "scope": "all", "stopped": stopped})
+    return 0
+
+
+def cmd_stop(a):
+    """SIGINT to one repository's swarm daemon (the same as Ctrl-C in its terminal).
+
+    The pid comes from that repository's own STATE/daemon.pid, written by the daemon while it
+    holds the repository's lock, and is signalled only after ps confirms it is still a swarm
+    for this repository. The machine-wide sweep is now `--all` and nothing else: as the default
+    it meant the Stop button on the studio also stopped the hedge-fund and kraken swarms.
+    """
+    if a.all:
+        return stop_every_swarm()
+    if not a.repo:
+        emit({"ok": False, "error": "stop needs --repo, or --all to stop every swarm on this machine"})
+        return 2
+    c = config_for(a.repo)
+    swarmd.use_repo(c)
+    repo = str(Path(c["repo"]).expanduser().resolve())
+    note = swarmd.daemon_note()          # None once the process that wrote it is gone
+    if not note:
+        emit({"ok": True, "repo": repo, "stopped": [],
+              "reason": "no swarm daemon is running on this repository"})
+        return 0
+    pid, args = int(note["pid"]), proc_args(int(note["pid"]))
+    noted = str(note.get("repo") or "")
+    # A pid file outlives the run that wrote it, so the pid may belong to something else now.
+    if "swarmd.py" not in args or (noted and noted != repo) or (not noted and repo not in args):
+        emit({"ok": False, "repo": repo, "pid": pid, "stopped": [],
+              "error": f"pid {pid} is not this repository's swarm daemon; not signalling it"})
+        return 2
+    try:
+        os.kill(pid, signal.SIGINT)
+    except (ProcessLookupError, PermissionError) as e:
+        emit({"ok": False, "repo": repo, "pid": pid, "stopped": [],
+              "error": f"{type(e).__name__}: {e}"})
+        return 2
+    emit({"ok": True, "repo": repo, "stopped": [pid]})
     return 0
 
 
@@ -812,7 +856,11 @@ def main(argv=None):
     s.add_argument("--offset", type=int, default=0)
     s.add_argument("--day", help="a past day's log (default today)")
     s.set_defaults(fn=cmd_activity)
-    sub.add_parser("stop").set_defaults(fn=cmd_stop)
+    s = sub.add_parser("stop")
+    s.add_argument("--repo", help="the repository whose daemon to stop")
+    s.add_argument("--all", action="store_true",
+                   help="stop every swarm daemon on this machine, whatever repository it works on")
+    s.set_defaults(fn=cmd_stop)
     a = ap.parse_args(argv)
     signal.signal(signal.SIGTERM, _kill_children)
     try:

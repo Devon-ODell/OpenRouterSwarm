@@ -2432,7 +2432,8 @@ def start(c, hours=None, max_tasks=None, awake=False):
         except BlockingIOError:
             sys.exit(f"another swarm daemon is already running on this repository.{holder()}")
         (STATE / "daemon.pid").write_text(json.dumps(
-            {"pid": os.getpid(), "started": time.time(), "goal": read_goal(c)[:200]}))
+            {"pid": os.getpid(), "started": time.time(), "goal": read_goal(c)[:200],
+             "repo": str(Path(c["repo"]).expanduser().resolve()), "config": str(CONFIG)}))
         _stop.clear()
         preflight(c)
         if awake:

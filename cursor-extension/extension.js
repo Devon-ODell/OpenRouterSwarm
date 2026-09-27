@@ -430,12 +430,18 @@ async function startGrind(repo) {
   }
 }
 
-async function stopGrind() {
-  const ok = await vscode.window.showWarningMessage('Stop the swarm? Work in progress is kept on its branch.', { modal: true }, 'Stop');
+async function stopGrind(repo) {
+  repo = repo || repoFor(currentEditor() && currentEditor().document.uri);
+  if (!repo) { vscode.window.showWarningMessage('Open a file in a Git repository first.'); return; }
+  const name = path.basename(repo);
+  const ok = await vscode.window.showWarningMessage(
+    `Stop the swarm on ${name}? Work in progress is kept on its branch, and swarms on other repositories keep running.`,
+    { modal: true }, 'Stop');
   if (ok !== 'Stop') return;
   try {
-    const res = await bridgeJson(['stop']);
-    vscode.window.showInformationMessage(res.stopped.length ? `Sent stop to ${res.stopped.length} swarm process(es).` : 'No running swarm found.');
+    const res = await bridgeJson(['stop', '--repo', repo]);
+    if (res.ok === false) vscode.window.showErrorMessage(`Flint swarm: ${res.error}`);
+    else vscode.window.showInformationMessage(res.stopped.length ? `Stopped the swarm on ${name}.` : `No swarm is running on ${name}.`);
   } catch (e) {
     vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
   }
@@ -654,7 +660,7 @@ class SwarmPanel {
     } else if (m.type === 'start') {
       await startGrind();
     } else if (m.type === 'stop') {
-      await stopGrind();
+      await stopGrind(m.repo);
     } else if (m.type === 'report') {
       await showReport();
     } else if (m.type === 'queueGet') {

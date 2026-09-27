@@ -369,7 +369,8 @@
   $('queue').addEventListener('click', () => vscode.postMessage({ type: 'queue', title: $('question').value.trim(), withCode: $('withCode').checked }));
   $('lookup').addEventListener('click', () => vscode.postMessage({ type: 'study', query: $('question').value.trim(), withCode: $('withCode').checked }));
   $('start').addEventListener('click', () => vscode.postMessage({ type: 'start' }));
-  $('stop').addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
+  // Name the repository the panel is showing: stop means this swarm, not every swarm on the machine.
+  $('stop').addEventListener('click', () => vscode.postMessage({ type: 'stop', repo: status && status.repo }));
   $('report').addEventListener('click', () => vscode.postMessage({ type: 'report' }));
 
   renderStatus();
