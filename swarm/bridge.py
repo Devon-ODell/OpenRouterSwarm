@@ -665,6 +665,7 @@ def cmd_status(a):
     emit({"repo": c["repo"], "is_target": is_target(c["repo"]), "daemon_running": daemon_running(),
           "now": swarmd.read_now(), "health": swarmd.health(24),
           "config_path": str(swarmd.CONFIG), "config_kind": swarmd.config_kind(),
+          "config_warnings": swarmd.config_warnings(c),
           "config_tuned_available": str(tuned) if tuned.is_file() else None,
           "trunk": swarmd.trunk_name(c), "trunk_ahead": int(ahead) if str(ahead or "").isdigit() else None,
           "queue": [queue_row(t, pending) for t in pending],

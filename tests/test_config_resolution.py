@@ -196,3 +196,87 @@ if __name__ == "__main__":
     unittest.main()
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfigWarningTests(unittest.TestCase):
+    """A config is read in silence, so everything that will not do what it looks like it does
+    has to be said out loud at startup."""
+
+    def cfg(self, **kw):
+        return {"repo": "/tmp/x", "test_cmd": "true", "models": ["a:free"], **kw}
+
+    def test_an_unknown_key_is_named(self):
+        out = swarmd.config_warnings(self.cfg(plan_cooldownn=600))
+        self.assertTrue(any("plan_cooldownn" in w for w in out), out)
+        self.assertTrue(any("typo or a rename" in w for w in out), out)
+
+    def test_every_key_the_shipped_template_uses_is_known(self):
+        template = json.loads((Path(swarmd.HERE) / "config.example.json").read_text())
+        self.assertFalse([w for w in swarmd.config_warnings(template) if "unknown setting" in w])
+
+    def test_every_key_the_studio_config_uses_is_known(self):
+        studio = json.loads(
+            (Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.json").read_text())
+        self.assertFalse([w for w in swarmd.config_warnings(studio) if "unknown setting" in w])
+
+    def test_a_private_key_is_left_alone(self):
+        self.assertFalse(swarmd.config_warnings(self.cfg(_comment="why this is tuned so")))
+
+    def test_rounds_that_cannot_fit_their_timeout_are_flagged(self):
+        """26 rounds at ~47s could never fit 900s, and every implementer was SIGKILLed."""
+        out = swarmd.config_warnings(self.cfg(steps={"implementer": 26},
+                                              role_timeouts={"implementer": 900}))
+        self.assertTrue(any("steps.implementer is 26" in w and "900s timeout" in w for w in out), out)
+
+    def test_rounds_that_do_fit_are_not_flagged(self):
+        self.assertFalse(swarmd.config_warnings(self.cfg(steps={"implementer": 12},
+                                                         role_timeouts={"implementer": 900})))
+
+    def test_an_all_paid_pool_under_allow_paid_is_flagged(self):
+        out = swarmd.config_warnings(self.cfg(models=["qwen/qwen3-coder"], allow_paid=True))
+        self.assertTrue(any("every turn is paid" in w for w in out), out)
+
+    def test_a_pool_with_a_free_model_is_not(self):
+        self.assertFalse(swarmd.config_warnings(
+            self.cfg(models=["a:free", "qwen/qwen3-coder"], allow_paid=True)))
+
+    def test_paid_ids_without_allow_paid_are_someone_elses_problem(self):
+        """preflight refuses that outright; this is not the place to say it twice."""
+        self.assertFalse(swarmd.config_warnings(self.cfg(models=["qwen/qwen3-coder"])))
+
+    def test_the_warnings_are_logged_and_journalled(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        lines = []
+        with patch.object(swarmd, "STATE", Path(d.name)), \
+             patch.object(swarmd, "log", lambda m, worker="swarm": lines.append(m)):
+            swarmd.warn_about_config(self.cfg(nonsense=1), record=True)
+            rows = [json.loads(l) for l in
+                    (Path(d.name) / "journal.jsonl").read_text().splitlines() if l.strip()]
+        self.assertTrue(any("WARNING config" in l for l in lines), lines)
+        self.assertEqual(rows[0]["event"], "config_warnings")
+
+    def test_a_clean_config_journals_nothing(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        with patch.object(swarmd, "STATE", Path(d.name)), patch.object(swarmd, "log"):
+            swarmd.warn_about_config(self.cfg(), record=True)
+        self.assertFalse((Path(d.name) / "journal.jsonl").exists())
+
+
+class ConfigChangelogTests(unittest.TestCase):
+    """The JSON holds values; the reasons live beside it."""
+
+    def test_the_studio_config_is_values_not_history(self):
+        c = json.loads(
+            (Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.json").read_text())
+        self.assertNotIn("_comment", c)
+        for key, value in c.items():
+            self.assertLess(len(str(value)), 600, f"{key} reads like prose, not a setting")
+
+    def test_the_history_is_kept_where_it_can_be_corrected(self):
+        log = Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.CHANGELOG.md"
+        self.assertTrue(log.is_file())
+        text = log.read_text()
+        self.assertIn("qwen/qwen3-coder", text)
+        self.assertIn("Corrections", text, "the stale claims are corrected, not just moved")

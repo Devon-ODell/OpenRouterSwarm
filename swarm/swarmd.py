@@ -3291,8 +3291,58 @@ def why_unrunnable(cmd):
             + (f" — macOS ships `{instead}`, not `{first}`." if instead else "."))
 
 
+# Every key the swarm reads. Anything else in a config is a typo or something that was
+# renamed, and both fail silently: the setting simply never takes effect.
+KNOWN_KEYS = frozenset({
+    "repo", "base_branch", "trunk", "test_cmd", "validation_commands", "test_timeout",
+    "python", "goal_file", "workers", "tick", "models", "paid_models", "allow_paid",
+    "model", "steps", "role_timeouts", "turn_timeout", "max_repairs", "max_diff",
+    "max_depth", "max_queue", "max_children", "max_descendants", "plan_batch",
+    "plan_cooldown", "reviewer_exclude", "daily_cap", "reserve", "owner_window",
+    "daily_usd", "monthly_usd", "spend_reset_day", "allowance_recheck", "editor_wallet",
+    "corpus_db", "corpus_root", "corpus_k", "study", "inject_corpus", "mit_experiment",
+    "sandbox", "sandbox_write", "keep_worktrees", "notify", "baseline_ttl", "personas",
+    "execution_class", "_comment"})
+# Seconds a round of tool use really takes on these models, from the studio's own turns.
+SECONDS_PER_ROUND = 47
+
+
+def config_warnings(c):
+    """Everything about this config that will not do what it looks like it does.
+
+    A config is read in silence: an unknown key never takes effect, a step budget that cannot
+    fit its timeout gets the turn SIGKILLed mid-work, and a pool of paid ids under allow_paid
+    means every turn is paid however much free allowance is left."""
+    out = []
+    unknown = sorted(k for k in c if k not in KNOWN_KEYS and not k.startswith("_"))
+    if unknown:
+        out.append(f"unknown setting(s) {', '.join(unknown)} — nothing reads these, so they "
+                   "do nothing; check for a typo or a rename")
+    for role, steps in (c.get("steps") or {}).items():
+        budget = turn_timeout(c, role)
+        need = int(steps or 0) * SECONDS_PER_ROUND
+        if need > budget:
+            out.append(f"steps.{role} is {steps}, which at ~{SECONDS_PER_ROUND}s a round needs "
+                       f"~{need}s, past this role's {budget}s timeout: the turn gets killed "
+                       f"mid-work and its partial answer is lost")
+    models = c.get("models") or []
+    if c.get("allow_paid") and models and not any(str(m).endswith(":free") for m in models):
+        out.append(f"`models` has no :free model ({', '.join(map(str, models))}) and allow_paid "
+                   "is true, so every turn is paid even while the free allowance is untouched")
+    return out
+
+
+def warn_about_config(c, record=False):
+    for line in config_warnings(c):
+        log(f"WARNING config: {line}")
+    if record and config_warnings(c):
+        journal("config_warnings", warnings=config_warnings(c), path=str(CONFIG))
+    return config_warnings(c)
+
+
 def preflight(c):
     """Fail fast, before spending requests, on anything that would waste the night."""
+    warn_about_config(c, record=True)
     paid = [m for m in (c.get("models") or [c.get("model")]) if m and not m.endswith(":free")]
     if paid and not c.get("allow_paid"):
         sys.exit(f"refusing non-free models {paid}: they spend credits. "
@@ -3682,6 +3732,7 @@ def cmd_status(a):
     print(json.dumps({
         "repo": c["repo"], "trunk": trunk_name(c), "trunk_ahead": ahead,
         "config_path": str(CONFIG), "config_kind": config_kind(),
+        "config_warnings": config_warnings(c),
         "config_tuned_available": str(per_repo_config(c["repo"])) if per_repo_config(c["repo"]).is_file() else None,
         "daemon": {"running": bool(note),
                    "pid": note and note.get("pid"),
