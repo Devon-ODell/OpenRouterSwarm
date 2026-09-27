@@ -2595,7 +2595,12 @@ class Worker(threading.Thread):
                 log("quota/window pause — deferring task", self.name)
                 self.q.release(task["id"], False, "quota/window pause", defer=60,
                                failure_class="harness")
-                self.stop.wait(600)
+                # 22 of these in one day, ten minutes each, while the local count read
+                # 1025/1000 and OpenRouter reported fewer requests used. Ask before sleeping,
+                # and sleep no longer than the interval at which the next ask is due.
+                if recheck_allowance(self.c, self.budget):
+                    continue
+                self.stop.wait(min(600, allowance_recheck(self.c) or 600))
             except ProviderDown as e:
                 self.q.release(task["id"], False, f"provider unavailable: {str(e)[:200]}", defer=30,
                                failure_class="harness")

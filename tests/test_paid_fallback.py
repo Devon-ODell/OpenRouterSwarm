@@ -780,3 +780,71 @@ class AllowanceRecheckTests(unittest.TestCase):
         self.assertNotIn("poolside/laguna-s-2.1", cmds[0])
         rows = [json.loads(l) for l in (swarmd.STATE / "journal.jsonl").read_text().splitlines()]
         self.assertEqual([r for r in rows if r["event"] == "paid_fallback"], [])
+
+
+class QuotaPauseTests(unittest.TestCase):
+    """The ten-minute sleep a quota pause used to take, 22 times in one day.
+
+    The local counter only climbs until midnight, so it can read 1025/1000 while OpenRouter
+    reports 964 used. Sleeping ten minutes on that number wastes free capacity that exists.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path as P
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.root = P(d.name)
+        (self.root / "logs").mkdir()
+        for attr, value in (("STATE", self.root), ("LOGS", self.root / "logs")):
+            p = patch.object(swarmd, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def worker(self, **cfg):
+        import threading
+        from unittest.mock import Mock
+        q = swarmd.Queue()
+        q.add("a task", "do it")
+        c = {"repo": str(self.root), "test_cmd": "true", "models": ["a:free"], **cfg}
+        w = swarmd.Worker(0, c, q, Mock(), threading.Event())
+        return w, q
+
+    def run_once(self, recheck_returns, **cfg):
+        """One pass of the worker loop that hits a quota pause."""
+        w, q = self.worker(**cfg)
+        waits, asked = [], []
+
+        def wait(seconds):
+            waits.append(seconds)
+            w.stop.set()                       # one pass is enough
+            return True
+        def recheck(c, budget):
+            asked.append(True)
+            return recheck_returns
+        with patch.object(w, "do_task", side_effect=swarmd.CapReached("spent")), \
+             patch.object(swarmd, "read_goal", return_value="goal"), \
+             patch.object(swarmd, "watch_config", return_value=[]), \
+             patch.object(swarmd, "recheck_allowance", side_effect=recheck), \
+             patch.object(w.stop, "wait", side_effect=wait):
+            w.run()
+        return waits, asked
+
+    def test_openrouter_is_asked_before_the_sleep(self):
+        waits, asked = self.run_once(False, allowance_recheck=300)
+        self.assertTrue(asked)
+        self.assertEqual(waits[:1], [300])
+
+    def test_the_allowance_coming_back_skips_the_sleep_entirely(self):
+        waits, asked = self.run_once(True, allowance_recheck=300)
+        self.assertTrue(asked)
+        self.assertNotIn(300, waits)
+        self.assertNotIn(600, waits)
+
+    def test_without_the_setting_it_is_still_at_most_ten_minutes(self):
+        waits, _ = self.run_once(False)
+        self.assertEqual(waits[:1], [600])
+
+    def test_a_longer_interval_never_lengthens_the_sleep(self):
+        waits, _ = self.run_once(False, allowance_recheck=3600)
+        self.assertEqual(waits[:1], [600])
