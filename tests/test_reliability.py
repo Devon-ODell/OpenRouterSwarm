@@ -536,23 +536,57 @@ class SwarmTests(unittest.TestCase):
         self.assertNotIn("architect", roles)
         self.assertIn("adversary", roles)
 
-    def test_worker_decomposes_after_first_timeout(self):
+    def test_a_timeout_that_produced_nothing_does_not_split_the_task(self):
+        """A timeout with no diff is our wall clock, not the task being too big.
+
+        It used to split on the first one: there is nothing to divide, so the pieces are the
+        decomposer's guesses, and every deep-game milestone died this way."""
         repo, _ = self.repo()
         q = swarmd.Queue(max_depth=1)
-        task = q.add("large task", "change app")
+        q.add("large task", "change app")
         cfg = {"repo": str(repo), "base_branch": "main", "test_cmd": "true",
                "steps": {"architect": 0, "implementer": 26, "adversary": 2}}
         worker = swarmd.Worker(0, cfg, q, Mock(), threading.Event())
-        def split(task, goal):
+        seen = {}
+
+        def capture(tid, ok, note="", defer=0, split_now=False, failure_class="task"):
+            seen.update(ok=ok, note=note, split_now=split_now, failure_class=failure_class)
             worker.stop.set()
-            return 0
+            return None
         with patch.object(swarmd, "flint", side_effect=swarmd.AgentTimeout("implementer", "test", 900, "turn.log")), \
-             patch.object(worker, "decompose", side_effect=split) as decompose:
+             patch.object(q, "release", side_effect=capture), \
+             patch.object(worker, "decompose") as decompose:
             worker.run()
-        self.assertEqual(decompose.call_count, 1)
-        self.assertEqual(decompose.call_args.args[0]["attempts"], 1)
-        self.assertEqual(q.pending(), [])
-        self.assertEqual(swarmd._read(q.done)[-1]["status"], "split")
+        self.assertEqual(worker.stage, "agent_timeout")
+        self.assertEqual(seen["failure_class"], "harness")
+        self.assertFalse(seen["split_now"])
+        decompose.assert_not_called()
+
+    def test_a_timeout_that_produced_a_diff_can_still_split(self):
+        """Work that exists and did not finish is the case splitting was meant for."""
+        repo, _ = self.repo()
+        q = swarmd.Queue(max_depth=1)
+        q.add("large task", "change app")
+        # Passes at baseline, fails once the half-finished change is there.
+        cfg = {"repo": str(repo), "base_branch": "main", "test_cmd": "test ! -f broken",
+               "max_repairs": 0, "steps": {"architect": 0, "implementer": 26, "adversary": 2}}
+        worker = swarmd.Worker(0, cfg, q, Mock(), threading.Event())
+        seen = {}
+
+        def fake(prompt, cwd, c, role, *args):
+            (cwd / "broken").write_text("half a change\n")
+            raise swarmd.AgentTimeout(role, "test", 900, "turn.log")
+
+        def capture(tid, ok, note="", defer=0, split_now=False, failure_class="task"):
+            seen.update(split_now=split_now, failure_class=failure_class)
+            worker.stop.set()
+            return None
+        with patch.object(swarmd, "flint", side_effect=fake), \
+             patch.object(q, "release", side_effect=capture):
+            worker.run()
+        self.assertEqual(worker.stage, "tests_failed")
+        self.assertEqual(seen["failure_class"], "task")
+        self.assertTrue(seen["split_now"])
 
     def test_partial_repair_after_timeout_is_retested(self):
         repo, git = self.repo()

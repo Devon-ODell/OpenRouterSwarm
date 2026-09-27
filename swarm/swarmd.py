@@ -62,6 +62,7 @@ _stop = threading.Event()
 _sync_failed = {}
 _study_lock = threading.Lock()
 _study_calls = {}
+_edit_calls = {}      # worker -> edit_file/write_file calls its turns made this attempt
 _held = {}            # worker -> when it last said it was waiting for the allowance
 _waiting = {}         # worker -> why it is not working, or absent while it is
 _ran_on = {}          # worker -> the model its last turn actually ran on, once a stand-in took it
@@ -627,8 +628,15 @@ class Queue:
             return [r for r in _read(self.path) if not r.get("claimed") and r.get("not_before", 0) <= now
                     and set(r.get("depends_on", [])).issubset(complete)]
 
-    def release(self, tid, ok, note="", defer=0, split_now=False):
-        """Returns the task with its new status: done, retry, split or parked."""
+    MAX_HARNESS_FAILURES = 3
+
+    def release(self, tid, ok, note="", defer=0, split_now=False, failure_class="task"):
+        """Returns the task with its new status: done, retry, split, parked or held.
+
+        `failure_class` decides whether this failure counts against the task at all. A harness
+        failure — rounds, wall clock, a restart, a sandbox, a provider — is not evidence that the
+        task is too big, and it used to cost the task one of its two lives all the same: 90 of
+        121 finished tasks were split or parked, every deep-game milestone among them."""
         with self.locked():
             rows, task = _read(self.path), None
             for r in rows:
@@ -639,14 +647,29 @@ class Queue:
                 return None
             rows = [r for r in rows if r["id"] != tid]
             task.pop("claimed", None)
-            task["attempts"] = task.get("attempts", 0) + (0 if defer else 1)
-            task["note"] = note[-800:]
+            harness = not ok and not defer and failure_class == "harness"
+            task["attempts"] = task.get("attempts", 0) + (0 if defer or harness else 1)
+            if not harness:
+                task["note"] = note[-800:]
             if defer:
                 task["status"] = "retry"
                 task["not_before"] = time.time() + defer
                 rows.append(task)
             elif ok:
                 task["status"] = "done"
+            elif harness:
+                # This says nothing about the task, so it costs the task nothing and teaches the
+                # next attempt nothing. It is still counted: a task that only ever fails this way
+                # needs a person, not another turn.
+                task["harness_failures"] = task.get("harness_failures", 0) + 1
+                task["harness_note"] = note[-400:]
+                if task["harness_failures"] < self.MAX_HARNESS_FAILURES:
+                    task["status"] = "retry"
+                    task["not_before"] = time.time() + 120
+                    rows.append(task)
+                else:
+                    task["status"] = "parked"
+                    task["note"] = f"needs harness look: {note[-500:]}"
             else:
                 # Failure notes travel with the task so the next attempt can learn from them.
                 task["notes"] = (task.get("notes", []) + [note[-800:]])[-2:]
@@ -1053,6 +1076,19 @@ def count_study(worker, n=0, reset=False):
         return _study_calls[worker]
 
 
+def count_edits(worker, n=0, reset=False):
+    """Edit calls one worker's turns made since its attempt began.
+
+    An attempt that ends with no diff means two different things. A model that called edit_file
+    and still changed nothing got it wrong; a model that never reached an edit ran out of the
+    rounds this harness gave it. Only the first is the model's failure."""
+    with _study_lock:
+        if reset:
+            return _edit_calls.pop(worker, 0)
+        _edit_calls[worker] = _edit_calls.get(worker, 0) + n
+        return _edit_calls[worker]
+
+
 def mit_arm(c, rng=random):
     """Which side of the MIT-corpus experiment an attempt is on: "on" (excerpts in the prompt
     and the study tool), "off" (neither), or "none" when there is no corpus to test."""
@@ -1260,6 +1296,7 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     progress = logfile.read_text(errors="replace")
     studied = len(re.findall(r"^tool: study$", progress, re.M))
     count_study(worker, studied)
+    count_edits(worker, len(re.findall(r"^tool: (?:edit_file|write_file)$", progress, re.M)))
     journal("turn", role=role, worker=worker, model=model, rc=p.returncode,
             secs=round(time.time() - t0), chars=len(out), log=str(logfile), study_calls=studied)
     error = progress[-1200:]
@@ -1779,8 +1816,10 @@ class Worker(threading.Thread):
         self.evidence, self.role_calls, self.gate_count = None, 0, 0
         self.mit = None
         self.agent_timed_out = False
+        self.failure_class = "task"
         self.execution_class = task.get("execution_class", "standard")
         count_study(self.name, reset=True)
+        count_edits(self.name, reset=True)
         note, info = "attempt interrupted before completion", {}
         try:
             self.stage, note, info = self._attempt(task, goal, info)
@@ -1797,6 +1836,8 @@ class Worker(threading.Thread):
             except Exception as exc:
                 # Preserve the outcome and artifact if shutdown/Git prevents cleanup.
                 log(f"cleanup deferred for {self.branch}: {exc}", self.name)
+        self.failure_class = ("task" if self.stage == "accepted" else
+                              failure_class(self.stage, note, edited=info.get("edit_calls")))
         if info.get("implementer"):
             try:
                 self._reinforce(task, self.stage, info)
@@ -1805,6 +1846,8 @@ class Worker(threading.Thread):
                 log(f"learning update failed; task outcome retained: {exc}", self.name)
             # One row per attempt that spent model calls: the MIT experiment's raw data.
             journal("attempt", id=task["id"], title=task["title"], stage=self.stage,
+                    failure_class=None if self.stage == "accepted" else self.failure_class,
+                    edit_calls=info.get("edit_calls"),
                     mit=info.get("mit"), injected=info.get("mit_injected", False),
                     study_calls=count_study(self.name, reset=True), role_calls=self.role_calls,
                     implementer=info["implementer"], reviewer=info.get("reviewer"),
@@ -1943,8 +1986,11 @@ class Worker(threading.Thread):
                 return "rejected", "agent changed commit history outside supervisor control", info
             tree, diff = self.snapshot()
             if not diff.strip():
+                info["edit_calls"] = tried = count_edits(w)
                 stage = "agent_timeout" if self.agent_timed_out else "no_change"
-                return stage, f"no implementation changes; evidence: {self.evidence.path}", info
+                how = (f"{tried} edit call(s) changed nothing" if tried
+                       else "the turn never reached an edit")
+                return stage, f"no implementation changes: {how}; evidence: {self.evidence.path}", info
             if weakened_tests(diff):
                 return "weakened_tests", "existing assertions removed; manual review required", info
             ok, tests = self.gate(f"candidate-{cycle}")
@@ -2058,6 +2104,14 @@ class Worker(threading.Thread):
 
     def _reinforce(self, task, stage, info):
         L, impl = self.ledger, info["implementer"]
+        if stage != "accepted" and failure_class(stage, info.get("note", ""),
+                                                 edited=info.get("edit_calls")) == "harness":
+            # The model answered; this swarm lost the turn. Scoring it down at penalty weight
+            # teaches the bandit about our step limits, not about the model.
+            journal("harness_failure", id=task["id"], title=task["title"], stage=stage,
+                    implementer=impl, edit_calls=info.get("edit_calls"))
+            log(f"{task['id']}: {stage} — harness failure, not scored against {impl}", self.name)
+            return
         scores = info.get("scores")
         text = f"{task['title']} {task.get('detail', '')}"
         nov = novelty(text, L.accepted_texts()) if stage == "accepted" else 0.0
@@ -2174,13 +2228,16 @@ class Worker(threading.Thread):
             journal("stranded", id=task["id"], title=task["title"], how=how, parked=titles)
         return titles
 
-    def decompose(self, task, goal):
-        """Split after a timeout or repeated failure, within the recursion limits."""
+    def decompose(self, task, goal, avoid=()):
+        """Split after a timeout or repeated failure, within the recursion limits.
+
+        A split that returns no subtasks strands the task and everything waiting on it, so one
+        empty answer is retried on a different model before the task is given up on."""
         c = self.c
         # Between attempts: not the last attempt's evidence, role-call budget or MIT arm.
         self.evidence, self.mit = None, None
         self.execution_class = "standard"
-        model = self.ledger.pick("planner", pool(c)) or self.pick()
+        model = self.ledger.pick("planner", pool(c), exclude=set(avoid)) or self.pick(set(avoid))
         if model is None:
             return 0
         with _view_lock:
@@ -2192,8 +2249,8 @@ class Worker(threading.Thread):
                     view, c["steps"].get("decomposer", 6), model)
             except (StepLimit, ModelError, AgentTimeout) as e:
                 self.ledger.update("planner", model, 0.0)
-                log(f"decomposer {model} failed ({type(e).__name__}); '{task['title']}' was not split", self.name)
-                return 0
+                log(f"decomposer {model} failed ({type(e).__name__}) on '{task['title']}'", self.name)
+                return self.retry_split(task, goal, model, avoid, f"{type(e).__name__}")
         subtasks = json_array(out)
         if subtasks is None:
             self.ledger.update("planner", model, 0.0)
@@ -2213,11 +2270,24 @@ class Worker(threading.Thread):
                 break
             added += 1
             dependencies = [child["id"]]
-        moved = self.q.repoint(task["id"], dependencies[0]) if added else 0
+        if not added:
+            return self.retry_split(task, goal, model, avoid, "no usable subtasks")
+        moved = self.q.repoint(task["id"], dependencies[0])
         log(f"split '{task['title']}' into {added} smaller task(s)"
             + (f"; {moved} waiting task(s) moved to the last child" if moved else ""), self.name)
         journal("split", id=task["id"], title=task["title"], added=added, model=model, repointed=moved)
         return added
+
+    def retry_split(self, task, goal, model, avoid, why):
+        """One more decomposition on a different model. Returns 0 once that has been tried."""
+        if avoid:
+            log(f"'{task['title']}' was not split: {why} from {model} as well", self.name)
+            journal("split_failed", id=task["id"], title=task["title"], why=why,
+                    models=[*avoid, model])
+            return 0
+        log(f"decomposer {model}: {why}; trying another model before giving up on "
+            f"'{task['title']}'", self.name)
+        return self.decompose(task, goal, avoid={*avoid, model})
 
     # -- loop --------------------------------------------------------------
 
@@ -2230,8 +2300,12 @@ class Worker(threading.Thread):
             try:
                 goal = read_goal(self.c)
                 ok, note = self.do_task(task, goal)
-                final = self.q.release(task["id"], ok, note, split_now=self.agent_timed_out)
+                # A timeout only forces a split when there was work to be too big for. With no
+                # diff there is nothing to divide, and the timeout is ours, not the task's.
+                final = self.q.release(task["id"], ok, note, failure_class=self.failure_class,
+                                       split_now=self.agent_timed_out and self.stage != "agent_timeout")
                 journal("task", id=task["id"], title=task["title"], ok=ok, stage=self.stage,
+                        failure_class=None if ok else self.failure_class,
                         worker=self.name, note=note[:300])
                 if final and final.get("status") == "split":
                     if not self.decompose(final, goal):
@@ -2241,10 +2315,12 @@ class Worker(threading.Thread):
                 self.tally.finished()
             except CapReached:
                 log("quota/window pause — deferring task", self.name)
-                self.q.release(task["id"], False, "quota/window pause", defer=60)
+                self.q.release(task["id"], False, "quota/window pause", defer=60,
+                               failure_class="harness")
                 self.stop.wait(600)
             except ProviderDown as e:
-                self.q.release(task["id"], False, f"provider unavailable: {str(e)[:200]}", defer=30)
+                self.q.release(task["id"], False, f"provider unavailable: {str(e)[:200]}", defer=30,
+                               failure_class="harness")
                 if self.pick() is None:
                     # No model can take a turn. Sleep until the first one is back, not blindly.
                     _, until = next_wake(self.ledger, self.c)
@@ -2260,14 +2336,16 @@ class Worker(threading.Thread):
                 self.stop.set()
             except Exception as e:
                 if self.stop.is_set():
-                    self.q.release(task["id"], False, "run stopped; changes retained", defer=1)
+                    self.q.release(task["id"], False, "run stopped; changes retained", defer=1,
+                                   failure_class="harness")
                     return
                 log(f"error on {task['id']}: {e}", self.name)
                 journal("error", id=task["id"], err=str(e)[:500],
                         tb=traceback.format_exc()[-1200:])
                 # A turn that timed out is still a failed attempt: let it split like any other,
                 # or the task is shelved with no smaller pieces to try.
-                final = self.q.release(task["id"], False, str(e)[:400])
+                # An unexpected exception in the supervisor is ours, not the task's.
+                final = self.q.release(task["id"], False, str(e)[:400], failure_class="harness")
                 if final and final.get("status") == "split":
                     try:
                         self.decompose(final, read_goal(self.c))

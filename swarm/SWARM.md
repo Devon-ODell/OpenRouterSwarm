@@ -245,6 +245,15 @@ limit it gets one round offering only `edit_file` and `write_file` before the
 tool-free final answer, and an edit it writes as reply markup is applied rather
 than discarded.
 
+A failed attempt is classified before it costs anything. A **task** failure (the
+tests failed, the reviewer proved a defect) spends one of the task's two
+attempts and then splits or parks it. A **model** failure (no usable output, or
+an edit call that changed nothing) counts the same way against the model that
+made it. A **harness** failure — a step limit, a wall-clock timeout, a sandbox,
+a restart, a provider that did not answer — spends nothing: the task comes back
+in two minutes, the model is not scored for it, and after three of them the task
+is parked with `needs harness look` for a person rather than split into guesses.
+
 `owner_window` (disabled by default) pauses the swarm during set local hours.
 
 Stopping is per repository. `bridge.py stop --repo P` signals the pid in that

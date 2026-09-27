@@ -896,8 +896,12 @@ class GuardTests(SwarmBase):
         self.assertTrue(swarmd._stop.is_set())
         swarmd._stop.clear()
 
-    def test_a_task_that_errors_on_its_last_attempt_is_still_split(self):
-        """A timed-out turn is a failed attempt; without this the task is shelved whole."""
+    def test_a_process_that_died_does_not_cost_the_task_its_last_attempt(self):
+        """A crashed or timed-out turn is this harness failing, not the task being too big.
+
+        It used to spend the task's last attempt and split it, so the pieces were a decomposer's
+        guesses about work that had never been attempted. The task keeps its attempt and comes
+        back in two minutes."""
         repo, _ = self.repo()
         q = swarmd.Queue(max_depth=1)
         task = q.add("Enforce TRAIL in the pair backtest", "trailing stop", kind="bugfix")
@@ -913,10 +917,12 @@ class GuardTests(SwarmBase):
         # than spinning forever.
         with patch.object(w.stop, "wait", side_effect=lambda *a: w.stop.set()):
             w.run()
-        self.assertTrue(w.decompose.called, "a failed last attempt was not split")
-        split = w.decompose.call_args[0][0]
-        self.assertEqual((split["id"], split["status"]), (task["id"], "split"))
-        self.assertIn("timed out", split["note"])
+        w.decompose.assert_not_called()
+        held = q.pending()[0]
+        self.assertEqual((held["id"], held["status"], held["attempts"]), (task["id"], "retry", 1))
+        self.assertEqual(held["harness_failures"], 1)
+        self.assertIn("timed out", held["harness_note"])
+        self.assertNotIn("timed out", held.get("notes", []), "a crash teaches the next attempt nothing")
 
     def test_a_second_daemon_is_told_how_to_stop_the_first(self):
         """"Already running" is useless on its own when the running one has the wrong goal."""
