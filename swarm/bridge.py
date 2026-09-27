@@ -13,7 +13,11 @@ Every command prints JSON. `ask` streams one JSON object per line as models fini
     bridge.py queue-edit   --repo PATH --id ID [--title T] [--detail D] [--kind K]
                            [--priority N] [--acceptance TEXT ...]
                            [--allow-test-changes | --no-allow-test-changes]
+    bridge.py queue-retry   --repo PATH --id ID
+    bridge.py queue-requeue --repo PATH --id ID
     bridge.py queue-remove --repo PATH --id ID [--cascade]
+    bridge.py landed   --repo PATH [--limit 20]
+    bridge.py parked   --repo PATH [--limit 20]
     bridge.py queue-clear  --repo PATH [--include-claimed]
     bridge.py study    --query Q [-k 6]
     bridge.py report   --repo PATH [--hours 24]
@@ -504,6 +508,73 @@ def cmd_queue_edit(a):
     return 0
 
 
+def cmd_queue_retry(a):
+    """Clear a task's retry backoff so the next free worker takes it."""
+    c, q = _queue(a.repo)
+    try:
+        t = q.retry_now(a.id)
+    except KeyError:
+        emit({"ok": False, "error": f"no queued task with id {a.id}"})
+        return 2
+    emit({"ok": True, "task": queue_row(t, q.pending(), full=True)})
+    return 0
+
+
+def cmd_queue_requeue(a):
+    """Put a parked or split task back in the queue, with its attempts cleared."""
+    c, q = _queue(a.repo)
+    try:
+        t = q.requeue(a.id)
+    except KeyError:
+        emit({"ok": False, "error": f"no finished task with id {a.id}"})
+        return 2
+    except ValueError as e:
+        emit({"ok": False, "error": str(e)})
+        return 2
+    emit({"ok": True, "task": queue_row(t, q.pending(), full=True)})
+    return 0
+
+
+def cmd_landed(a):
+    """The swarm's own trunk commits, newest first, with model, reward and goal item."""
+    c = config_for(a.repo)
+    swarmd.use_repo(c)
+    emit({"ok": True, "repo": c["repo"], "trunk": swarmd.trunk_name(c),
+          "commits": swarmd.landed_commits(c, a.limit or 20)})
+    return 0
+
+
+def cmd_parked(a):
+    """Tasks the swarm gave up on, and whose failure each was."""
+    c = config_for(a.repo)
+    swarmd.use_repo(c)
+    last = {j["id"]: j for j in swarmd._read(swarmd.STATE / "journal.jsonl")
+            if j["event"] == "task"}
+    rows = []
+    for d in reversed(swarmd._read(swarmd.STATE / "done.jsonl")):
+        if d.get("status") not in ("parked", "split"):
+            continue
+        j = last.get(d["id"], {})
+        raw = j.get("note") or d.get("note") or ""
+        rows.append({
+            "id": d["id"], "title": d.get("title", ""), "status": d["status"],
+            "finished": d.get("finished", 0), "attempts": d.get("attempts", 0),
+            "harness_failures": d.get("harness_failures", 0),
+            "stage": j.get("stage"),
+            # With no recorded outcome there is nothing to classify, and guessing "task" is the
+            # very mistake that split 45 tasks for failures that were never theirs.
+            "failure_class": j.get("failure_class") or (swarmd.failure_class(
+                j["stage"], raw, edited=j.get("edit_calls")) if j.get("stage") else None),
+            "why": swarmd.reportable(raw)[:400],
+            "handoff": next((str(p / "HANDOFF.md") for p in
+                             sorted((swarmd.STATE / "attempts").glob(f"{d['id']}-*"), reverse=True)
+                             if (p / "HANDOFF.md").is_file()), None)})
+        if len(rows) >= (a.limit or 20):
+            break
+    emit({"ok": True, "repo": c["repo"], "parked": rows})
+    return 0
+
+
 def cmd_queue_remove(a):
     c, q = _queue(a.repo)
     rows = q.pending()
@@ -592,6 +663,7 @@ def cmd_status(a):
                            owner_window=c.get("owner_window", ["00:00", "00:00"])).snapshot()
     tuned = swarmd.per_repo_config(c["repo"])
     emit({"repo": c["repo"], "is_target": is_target(c["repo"]), "daemon_running": daemon_running(),
+          "now": swarmd.read_now(), "health": swarmd.health(24),
           "config_path": str(swarmd.CONFIG), "config_kind": swarmd.config_kind(),
           "config_tuned_available": str(tuned) if tuned.is_file() else None,
           "trunk": swarmd.trunk_name(c), "trunk_ahead": int(ahead) if str(ahead or "").isdigit() else None,
@@ -810,7 +882,13 @@ def main(argv=None):
             s.add_argument("--detail", default="")
             s.add_argument("--kind", default="feature", choices=swarmd.KINDS)
             s.add_argument("--priority", type=int, default=1)
+    for name, fn in (("landed", cmd_landed), ("parked", cmd_parked)):
+        s = sub.add_parser(name)
+        s.add_argument("--repo", required=True)
+        s.add_argument("--limit", type=int, default=20)
+        s.set_defaults(fn=fn)
     for name, fn in (("queue-get", cmd_queue_get), ("queue-edit", cmd_queue_edit),
+                     ("queue-retry", cmd_queue_retry), ("queue-requeue", cmd_queue_requeue),
                      ("queue-remove", cmd_queue_remove)):
         s = sub.add_parser(name)
         s.add_argument("--repo", required=True)

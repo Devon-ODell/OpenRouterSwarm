@@ -399,6 +399,7 @@ async function cmdStudy() {
 }
 
 let swarmTerminal = null;
+let daemonRunning = false;      // paces the refresh loop: 10s while it runs, 60s when it does not
 
 async function startGrind(repo) {
   repo = repo || repoFor(currentEditor() && currentEditor().document.uri);
@@ -430,17 +431,19 @@ async function startGrind(repo) {
   }
 }
 
-async function stopGrind(repo) {
+async function stopGrind(repo, drain) {
   repo = repo || repoFor(currentEditor() && currentEditor().document.uri);
   if (!repo) { vscode.window.showWarningMessage('Open a file in a Git repository first.'); return; }
   const name = path.basename(repo);
-  // Stopping now kills the turn in flight and loses the model work already paid for, so the
-  // gentler option is offered first.
-  const ok = await vscode.window.showWarningMessage(
-    `Stop the swarm on ${name}? Swarms on other repositories keep running.`,
-    { modal: true }, 'Finish this task first', 'Stop now');
-  if (ok !== 'Stop now' && ok !== 'Finish this task first') return;
-  const drain = ok === 'Finish this task first';
+  if (drain === undefined) {
+    // Stopping now kills the turn in flight and loses model work already paid for, so the
+    // gentler option is offered first.
+    const ok = await vscode.window.showWarningMessage(
+      `Stop the swarm on ${name}? Swarms on other repositories keep running.`,
+      { modal: true }, 'Finish this task first', 'Stop now');
+    if (ok !== 'Stop now' && ok !== 'Finish this task first') return;
+    drain = ok === 'Finish this task first';
+  }
   try {
     const res = await bridgeJson(drain ? ['stop', '--repo', repo, '--drain'] : ['stop', '--repo', repo]);
     if (res.ok === false) vscode.window.showErrorMessage(`Flint swarm: ${res.error}`);
@@ -451,6 +454,86 @@ async function stopGrind(repo) {
     vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
   }
   setTimeout(refreshStatus, 3000);
+}
+
+/** Drain, wait for the daemon to go, then start again on the same config. */
+async function restartGrind(repo) {
+  repo = repo || repoFor(currentEditor() && currentEditor().document.uri);
+  if (!repo) { vscode.window.showWarningMessage('Open a file in a Git repository first.'); return; }
+  const name = path.basename(repo);
+  const ok = await vscode.window.showWarningMessage(
+    `Restart the swarm on ${name}? It finishes the task in flight first, then starts again on the same config.`,
+    { modal: true }, 'Restart');
+  if (ok !== 'Restart') return;
+  try {
+    const res = await bridgeJson(['stop', '--repo', repo, '--drain']);
+    if (res.ok === false) { vscode.window.showErrorMessage(`Flint swarm: ${res.error}`); return; }
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Waiting for ${name} to finish its task…` },
+      async () => {
+        // A task can take minutes. Give it ten, then say so rather than starting a second daemon.
+        for (let i = 0; i < 120; i++) {
+          const s = await bridgeJson(['status', '--repo', repo]);
+          if (!s.daemon_running) return;
+          await new Promise((r) => setTimeout(r, 5000));
+        }
+        throw new Error('it is still working after 10 minutes; start it yourself when it stops');
+      });
+    const { command } = await bridgeJson(['grind-cmd', '--repo', repo, '--goal', 'GOAL.md']);
+    if (swarmTerminal && swarmTerminal.exitStatus === undefined) swarmTerminal.dispose();
+    swarmTerminal = vscode.window.createTerminal({ name: `Flint Swarm: ${name}`, cwd: flintRoot() });
+    swarmTerminal.show(true);
+    swarmTerminal.sendText(command);
+    setTimeout(refreshStatus, 8000);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
+  }
+}
+
+async function showLanded(repo) {
+  repo = repo || repoFor(currentEditor() && currentEditor().document.uri);
+  if (!repo) return;
+  try {
+    panel.post({ type: 'landed', ...(await bridgeJson(['landed', '--repo', repo, '--limit', '20'])) });
+  } catch (e) {
+    panel.post({ type: 'notice', text: e.message, level: 'error' });
+  }
+}
+
+/** `git show <sha>` for a landed commit, in a read-only editor. */
+async function showCommit(m) {
+  if (!m.repo || !m.sha) return;
+  try {
+    const stdout = await new Promise((resolve, reject) => {
+      cp.execFile('git', ['-C', m.repo, 'show', '--stat', '--patch', m.sha],
+        { maxBuffer: 8 * 1024 * 1024 }, (err, out) => err ? reject(err) : resolve(out));
+    });
+    const doc = await vscode.workspace.openTextDocument({ content: stdout, language: 'diff' });
+    await vscode.window.showTextDocument(doc, { preview: true });
+  } catch (e) {
+    vscode.window.showErrorMessage(`Flint swarm: could not show ${m.sha.slice(0, 8)}: ${e.message}`);
+  }
+}
+
+async function queueRetry(m) {
+  try {
+    const res = await bridgeJson(['queue-retry', '--repo', m.repo, '--id', m.id]);
+    if (res.ok === false) vscode.window.showErrorMessage(`Flint swarm: ${res.error}`);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
+  }
+  await refreshStatus();
+}
+
+async function queueRequeue(m) {
+  try {
+    const res = await bridgeJson(['queue-requeue', '--repo', m.repo, '--id', m.id]);
+    if (res.ok === false) vscode.window.showErrorMessage(`Flint swarm: ${res.error}`);
+    else vscode.window.showInformationMessage(`Back in the queue: ${res.task.title}`);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
+  }
+  await refreshStatus();
 }
 
 async function showReport() {
@@ -561,6 +644,10 @@ function refreshStatus() {
       if (repo) {
         const s = await bridgeJson(['status', '--repo', repo]);
         panel.post({ type: 'status', data: s });
+        daemonRunning = !!s.daemon_running;
+        try {
+          panel.post({ type: 'parked', ...(await bridgeJson(['parked', '--repo', repo, '--limit', '20'])) });
+        } catch { /* the queue tab still works without it */ }
         statusItem.text = s.daemon_running ? `$(sync~spin) Swarm · ${s.queue.length} queued` : '$(organization) Swarm';
         statusItem.tooltip = (s.daemon_running ? `Flint swarm running on ${s.repo}`
           : 'Flint swarm: ask about the code you are working on')
@@ -617,10 +704,11 @@ class SwarmPanel {
 <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="stylesheet" href="${uri('panel.css')}"></head>
 <body>
 <div id="status"></div>
-<div class="row"><button id="start" class="secondary">Start swarm</button><button id="stop" class="secondary">Stop</button><button id="report" class="secondary">Report</button></div>
+<div class="row"><button id="start" class="secondary">Start swarm</button><button id="stop" class="secondary" title="Kill the turn in flight">Stop now</button><button id="drain" class="secondary" title="Finish the task in flight, then stop">Stop after this task</button><button id="restart" class="secondary" title="Drain, then start again on the same config">Restart</button><button id="report" class="secondary">Report</button></div>
 <nav id="tabs" role="tablist">
   <button class="tab" id="tab-ask" data-tab="ask" role="tab" aria-selected="true">Swarm</button>
   <button class="tab" id="tab-queue" data-tab="queue" role="tab" aria-selected="false">Queue<span id="qcount" class="badge" hidden></span></button>
+  <button class="tab" id="tab-landed" data-tab="landed" role="tab" aria-selected="false">Landed</button>
 </nav>
 <div id="notice" class="notice"></div>
 <section id="pane-ask" role="tabpanel">
@@ -635,6 +723,12 @@ class SwarmPanel {
 <section id="pane-queue" role="tabpanel" hidden>
   <div id="queueHead"></div>
   <div id="queueList"></div>
+  <div id="parkedHead"></div>
+  <div id="parkedList"></div>
+</section>
+<section id="pane-landed" role="tabpanel" hidden>
+  <div id="landedHead"></div>
+  <div id="landedList"></div>
 </section>
 <script nonce="${nonce}" src="${uri('render.js')}"></script>
 <script nonce="${nonce}" src="${uri('panel.js')}"></script>
@@ -665,7 +759,17 @@ class SwarmPanel {
     } else if (m.type === 'start') {
       await startGrind();
     } else if (m.type === 'stop') {
-      await stopGrind(m.repo);
+      await stopGrind(m.repo, m.drain);
+    } else if (m.type === 'restart') {
+      await restartGrind(m.repo);
+    } else if (m.type === 'landed') {
+      await showLanded(m.repo);
+    } else if (m.type === 'queueRetry') {
+      await queueRetry(m);
+    } else if (m.type === 'queueRequeue') {
+      await queueRequeue(m);
+    } else if (m.type === 'showCommit') {
+      await showCommit(m);
     } else if (m.type === 'report') {
       await showReport();
     } else if (m.type === 'queueGet') {
@@ -728,8 +832,21 @@ function activate(context) {
   reg('flintSwarm.clearQueue', () => clearQueue());
   reg('flintSwarm.setBudget', setBudget);
   reg('flintSwarm.refresh', () => { lastInfo = 0; return refreshStatus(); });
-  const timer = setInterval(() => { if (panel.view && panel.view.visible) refreshStatus(); }, 60 * 1000);
-  context.subscriptions.push({ dispose: () => clearInterval(timer) });
+  // While a daemon runs there is something new to show every few seconds — the round it is on,
+  // the model, how long the turn has taken. When nothing runs, once a minute is plenty.
+  let timer = null;
+  const pace = () => {
+    const every = daemonRunning ? 10 * 1000 : 60 * 1000;
+    if (timer && timer.every === every) return;
+    if (timer) clearInterval(timer.id);
+    const id = setInterval(() => {
+      if (panel.view && panel.view.visible) refreshStatus();
+      pace();
+    }, every);
+    timer = { id, every };
+  };
+  pace();
+  context.subscriptions.push({ dispose: () => timer && clearInterval(timer.id) });
   if (!flintRoot()) {
     vscode.window.showWarningMessage('Flint Swarm cannot find your flint checkout. Set "Flint Swarm: Flint Path" in Settings.', 'Open Settings')
       .then((a) => { if (a) vscode.commands.executeCommand('workbench.action.openSettings', 'flintSwarm.flintPath'); });

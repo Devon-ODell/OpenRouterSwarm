@@ -271,6 +271,18 @@ a restart, a provider that did not answer — spends nothing: the task comes bac
 in two minutes, the model is not scored for it, and after three of them the task
 is parked with `needs harness look` for a person rather than split into guesses.
 
+The Cursor panel's first line says what the swarm is doing — the task, the role,
+the model, the round it is on and how long the turn has taken — from
+`state/<slug>/now.json`, which the daemon rewrites on every tick. Under it: how
+the last 24 hours went (attempts, landed, landed %, the top failure classes,
+what it cost and what it cost per landed commit, red when almost nothing is
+landing), and which config is loaded, red when a tuned one exists and was not.
+Stop now, Stop after this task and Restart are three buttons; the Queue tab
+shows each task's last failure class and offers Retry now, with a section for
+split and parked tasks offering Requeue and their handoff; the Landed tab lists
+the swarm's own trunk commits with model, reward and goal item, and opens one as
+a diff. It refreshes every 10 seconds while a daemon runs and every 60 otherwise.
+
 `swarm service install --repo P [--hours H] [--autostart]` writes a launchd
 agent (`~/Library/LaunchAgents/com.flint.swarm.<slug>.plist`) that restarts a
 crashed daemon, with the repository's own config already selected.

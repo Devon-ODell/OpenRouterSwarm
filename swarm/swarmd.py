@@ -73,6 +73,7 @@ _held = {}            # worker -> when it last said it was waiting for the allow
 _waiting = {}         # worker -> why it is not working, or absent while it is
 _ran_on = {}          # worker -> the model its last turn actually ran on, once a stand-in took it
 _active_turns = {}   # worker -> live role and actual routed model
+_turn_logs = {}      # worker -> the log the live turn is writing, for its round counter
 _recheck_lock = threading.Lock()
 _rechecked = {"at": 0.0, "said": False}   # last OpenRouter allowance check, and whether "still spent" was logged
 NO_CORPUS = os.path.join(os.devnull, "no-corpus.db")   # cannot exist: flint then hides `study`
@@ -958,6 +959,40 @@ class Queue:
             _write(self.path, [new if r["id"] == tid else r for r in rows])
             return new
 
+    def retry_now(self, tid):
+        """Clear a task's retry backoff so the next free worker takes it. Returns the task."""
+        with self.locked():
+            rows = _read(self.path)
+            task = next((r for r in rows if r["id"] == tid), None)
+            if task is None:
+                raise KeyError(tid)
+            task.pop("not_before", None)
+            _write(self.path, rows)
+            return task
+
+    def requeue(self, tid):
+        """Put a finished task — parked, split or done — back in the queue, fresh.
+
+        A task parked for three harness failures was never shown to be wrong, so it comes back
+        with its attempt count cleared rather than one strike from being parked again."""
+        with self.locked():
+            done = _read(self.done)
+            task = next((r for r in reversed(done) if r["id"] == tid), None)
+            if task is None:
+                raise KeyError(tid)
+            rows = _read(self.path)
+            if any(r["id"] == tid for r in rows):
+                raise ValueError("that task is already in the queue")
+            if len(rows) >= self.max_queue:
+                raise ValueError("the queue is full")
+            task = dict(task, attempts=0, harness_failures=0, origin="human")
+            for key in ("status", "finished", "not_before", "claimed", "note", "harness_note"):
+                task.pop(key, None)
+            rows.append(task)
+            _write(self.path, rows)
+            _write(self.done, [r for r in done if r["id"] != tid])
+            return task
+
     def recover(self, accepted=None):
         """Only called after acquiring the exclusive daemon lock."""
         with self.locked():
@@ -1514,6 +1549,7 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     logfile = LOGS / f"{worker}-{role}-{time.time_ns()}.log"
     expired = False
     _active_turns[worker] = f"{role} with {model}"
+    _turn_logs[worker] = logfile
     try:
         with open(logfile, "w") as err:
             with process(cmd, stdout=subprocess.PIPE, stderr=err,
@@ -1530,6 +1566,7 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
                     raise
     finally:
         _active_turns.pop(worker, None)
+        _turn_logs.pop(worker, None)
     progress = logfile.read_text(errors="replace")
     studied = len(re.findall(r"^tool: study$", progress, re.M))
     count_study(worker, studied)
@@ -2056,6 +2093,131 @@ def sync_trunk(c):
 
 
 # ------------------------------------------------------------------ worker
+
+ROUND_LINE = re.compile(r"^round (\d+)/(\d+):", re.M)
+
+
+def turn_round(worker):
+    """(round, of) for the turn this worker is running, from the lines flint prints, or None."""
+    path = _turn_logs.get(worker)
+    try:
+        tail = Path(path).read_text(errors="replace")[-4000:]
+    except (OSError, TypeError):
+        return None
+    hits = ROUND_LINE.findall(tail)
+    return (int(hits[-1][0]), int(hits[-1][1])) if hits else None
+
+
+def write_now(workers, c=None):
+    """What the swarm is doing, for the panel's first line.
+
+    The panel's top line was a list of counters — free requests, a spend meter, a corpus chunk
+    count — none of which says whether the swarm is working or what on."""
+    rows = []
+    for w in workers:
+        task, since = getattr(w, "task", None), getattr(w, "started", 0)
+        if not (task and since and w.is_alive()):
+            continue
+        rounds = turn_round(w.name)
+        rows.append({
+            "worker": w.name, "task": task.get("id"), "title": str(task.get("title", ""))[:120],
+            "role": (getattr(w, "doing", "") or "").split(" with ")[0] or None,
+            "model": _ran_on.get(w.name) or (getattr(w, "doing", "") or "").split(" with ")[-1],
+            "round": rounds and rounds[0], "rounds": rounds and rounds[1],
+            "since": since, "seconds": round(time.time() - since),
+            "waiting": _waiting.get(w.name), "doing": getattr(w, "doing", None)})
+    note = {"at": time.time(), "workers": rows}
+    if not rows and c is not None:
+        ledger = Ledger(STATE / "learn.json")
+        resting = ledger.resting()
+        if resting and all(m in {m for m, _, _ in resting} for m in pool(c)):
+            first = min(u for _, u, _ in resting)
+            note["idle"] = "all models resting"
+            note["back"] = first
+        elif _waiting:
+            note["idle"] = sorted(_waiting.values())[0]
+    tmp = (STATE / "now.json").with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(note))
+        tmp.replace(STATE / "now.json")
+    except OSError:
+        pass                              # a status line is never worth failing a run over
+    return note
+
+
+TRAILER = re.compile(r"^Swarm-([\w-]+):\s*(.*)$", re.M)
+
+
+def landed_commits(c, limit=20):
+    """The trunk commits this swarm landed, newest first, with who wrote them and what for."""
+    # Trunk itself, not base..trunk: once trunk is merged, base..trunk is empty and the swarm's
+    # own history would read as nothing landed. A Swarm-Task trailer is what makes it the
+    # swarm's, so the merge cannot hide it either.
+    rc, out = git(["log", f"--format=%H%x1f%h%x1f%s%x1f%at%x1f%b%x1e", "-n", str(limit * 4),
+                   trunk_name(c)], cwd=c["repo"])
+    if rc != 0 or not out.strip():
+        return []
+    rows = [r for r in _read(STATE / "journal.jsonl") if r["event"] in ("attempt", "reward")]
+    by_task = {}
+    for r in rows:
+        by_task.setdefault(r.get("id"), {}).update(
+            {k: v for k, v in r.items() if k in ("reward", "goal_item", "usd", "implementer")})
+    commits = []
+    for chunk in out.split(""):
+        parts = chunk.strip().split("")
+        if len(parts) < 4:
+            continue
+        sha, short, subject, at = parts[0], parts[1], parts[2], parts[3]
+        trailers = dict(TRAILER.findall(parts[4] if len(parts) > 4 else ""))
+        if "Task" not in trailers:
+            continue                  # someone's own commit that trunk happens to contain
+        meta = by_task.get(trailers.get("Task"), {})
+        commits.append({
+            "sha": sha, "short": short, "at": int(at) if at.isdigit() else 0,
+            "subject": re.sub(r"^swarm: ", "", subject),
+            "task": trailers.get("Task"),
+            "model": trailers.get("Implementer") or meta.get("implementer"),
+            "reviewer": trailers.get("Reviewer"),
+            "reward": meta.get("reward"), "goal_item": meta.get("goal_item"),
+            "usd": meta.get("usd")})
+        if len(commits) >= limit:
+            break
+    return commits
+
+
+def health(hours=24):
+    """The numbers that say whether the swarm is working well, over the last `hours`.
+
+    None of this was anywhere: the panel showed free requests and a corpus chunk count while the
+    landed rate sat at 10% for a day and a half."""
+    since = time.time() - hours * 3600
+    rows = [r for r in _read(STATE / "journal.jsonl") if r.get("t", 0) >= since]
+    attempts = [r for r in rows if r["event"] == "attempt"]
+    landed = [a for a in attempts if a.get("stage") == "accepted"]
+    classes = {}
+    for a in attempts:
+        if a.get("stage") != "accepted":
+            cls = a.get("failure_class") or failure_class(a.get("stage") or "", a.get("note") or "")
+            classes[cls] = classes.get(cls, 0) + 1
+    usd = round(sum(a.get("usd") or 0.0 for a in attempts), 6)
+    return {"hours": hours, "attempts": len(attempts), "landed": len(landed),
+            "landed_rate": round(len(landed) / len(attempts), 4) if attempts else None,
+            "failures": sorted(classes.items(), key=lambda kv: -kv[1])[:3],
+            "usd": usd,
+            "usd_per_landed": round(usd / len(landed), 6) if landed and usd else None,
+            # Ten attempts is the fewest worth judging a rate on.
+            "unhealthy": bool(attempts and len(attempts) >= 10
+                              and len(landed) / len(attempts) < 0.15)}
+
+
+def read_now(max_age=180):
+    """The daemon's last `now` note, or None when it is missing or stale."""
+    try:
+        note = json.loads((STATE / "now.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return note if time.time() - note.get("at", 0) <= max_age else None
+
 
 def report_progress(workers, said, every=180):
     """Say that a working worker is alive, and on what. A turn can be silent for minutes —
@@ -3267,6 +3429,7 @@ def start(c, hours=None, max_tasks=None, awake=False):
                 timer.cancel()
             shutdown()
             (STATE / "daemon.pid").unlink(missing_ok=True)
+            (STATE / "now.json").unlink(missing_ok=True)
             log("stopped. `swarm report` summarises the run.")
 
 
@@ -3312,6 +3475,7 @@ def run_daemon(c, max_tasks=None):
                 last_sync = time.time()
                 sync_usage(account())
             report_progress(workers, said)
+            write_now(workers, c)
             if time.time() - last_beat > 3600:
                 last_beat = time.time()
                 log(f"heartbeat {json.dumps(budget.snapshot())}")

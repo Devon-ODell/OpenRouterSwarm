@@ -7,6 +7,7 @@
   const saved = vscode.getState() || {};
   const threads = saved.threads || [];          // [{id, kind, question, where, repo, cards:{}, order:[], done}]
   let status = saved.status || null, info = saved.info || null;
+  let landed = saved.landed || null, parked = saved.parked || null;
   let tab = saved.tab || 'ask';
   const open = new Set();                       // queue rows expanded to show their detail
   let editing = null;                           // {id, task} while a task is being rewritten
@@ -14,19 +15,85 @@
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
-  const save = () => vscode.setState({ threads: threads.slice(-20), status, info, tab });
+  const save = () => vscode.setState({ threads: threads.slice(-20), status, info, tab, landed, parked });
   // Cents are the unit that matters under a dollar: the first few questions cost fractions of one.
   const money = (n) => '$' + Number(n || 0).toFixed(Math.abs(Number(n) || 0) < 1 ? 4 : 2);
+
+  /** "4m10s" for a duration in seconds. */
+  function forHuman(seconds) { return idleFor(seconds); }
+
+  /** A clock time from an epoch, for "back 20:00". */
+  function atTime(epoch) {
+    if (!epoch) return null;
+    const d = new Date(epoch * 1000);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+
+  /** The first line: what the swarm is doing right now, in words. */
+  function nowLine() {
+    const now = status && status.now;
+    if (!status) return '';
+    if (!status.daemon_running) {
+      return status.is_target
+        ? '<span class="dim">○ Stopped.</span> Start it to work on this repository.'
+        : '<span class="dim">○ No swarm is set up for this repository.</span>';
+    }
+    if (!now) return '<span class="ok">● Running</span> <span class="dim">· waiting for its first status line…</span>';
+    const w = (now.workers || [])[0];
+    if (!w) {
+      if (now.idle && now.back) return `<span class="warn">◐ ${R.esc(now.idle)}</span> · first back ${R.esc(atTime(now.back))}`;
+      if (now.idle) return `<span class="warn">◐ ${R.esc(now.idle)}</span>`;
+      return '<span class="ok">● Running</span> <span class="dim">· between tasks</span>';
+    }
+    if (w.waiting) {
+      return `<span class="warn">◐ ${R.esc(w.waiting)}</span>`
+        + (now.back ? ` · back ${R.esc(atTime(now.back))}` : '');
+    }
+    const role = (w.role || 'working').replace(/^./, (ch) => ch.toUpperCase());
+    const rounds = w.round ? ` · round ${w.round}/${w.rounds}` : '';
+    return `<span class="ok">●</span> ${R.esc(role)} <b>"${R.esc(String(w.title).slice(0, 60))}"</b>`
+      + (w.model ? ` · <span class="dim">${R.esc(w.model)}</span>` : '') + rounds
+      + ` · ${forHuman(w.seconds)}`;
+  }
+
+  /** How the last 24 hours went. Red when almost nothing is landing. */
+  function healthLine() {
+    const h = status && status.health;
+    if (!h || !h.attempts) return '<span class="dim">No attempts in the last 24h.</span>';
+    const rate = h.landed_rate == null ? '–' : `${Math.round(h.landed_rate * 100)}%`;
+    const bits = [`${h.attempts} attempts · <b>${h.landed} landed</b> (${rate})`];
+    if (h.failures && h.failures.length) {
+      bits.push(h.failures.map(([k, n]) => `${R.esc(k)} ${n}`).join(' · '));
+    }
+    if (h.usd) {
+      bits.push(`${money(h.usd)} spent`
+        + (h.usd_per_landed ? ` · ${money(h.usd_per_landed)} per landed commit` : ''));
+    }
+    const cls = h.unhealthy ? 'err' : 'dim';
+    return `<span class="${cls}">24h: ${bits.join(' — ')}</span>`
+      + (h.unhealthy ? ' <span class="err">— almost nothing is landing</span>' : '');
+  }
+
+  /** Which settings are in force. Red when the tuned file exists and was not loaded. */
+  function configLine() {
+    if (!status || !status.config_path) return '';
+    const wrong = status.config_tuned_available && status.config_tuned_available !== status.config_path;
+    const name = status.config_path.split('/').pop();
+    return `<span class="${wrong ? 'err' : 'dim'}" title="${R.esc(status.config_path)}">`
+      + `config: ${R.esc(name)} (${R.esc(status.config_kind || '?')})</span>`
+      + (wrong ? ` <span class="err">— this repository has a tuned config that is NOT loaded</span>` : '');
+  }
 
   function statusHtml() {
     if (!status && !info) return '<span class="dim">Loading swarm status…</span>';
     const bits = [];
     if (status) {
       const name = status.repo.split('/').pop();
-      if (status.daemon_running) bits.push(`<span class="ok">● running</span> on <b>${R.esc(name)}</b>`);
-      else if (status.is_target) bits.push(`<span class="dim">○ stopped</span> · set up for <b>${R.esc(name)}</b>`);
-      else bits.push(`<span class="dim">○ not set up for <b>${R.esc(name)}</b></span>`);
-      bits.push(`${status.queue.length} queued · ${status.landed} landed` + (status.trunk_ahead ? ` · trunk +${status.trunk_ahead}` : ''));
+      bits.push(nowLine());
+      bits.push(healthLine());
+      bits.push(`<b>${R.esc(name)}</b> · ${status.queue.length} queued · ${status.landed} landed`
+        + (status.trunk_ahead ? ` · trunk +${status.trunk_ahead}` : ''));
+      bits.push(configLine());
       const b = status.budget;
       if (b) bits.push(`free requests <b>${b.spent_today}</b>/${b.usable} today, resets ${R.esc(b.resets_local)}`);
       const sp = status.spend;
@@ -34,7 +101,7 @@
         const spent = sp.left != null && sp.left <= 0;
         bits.push(`<span class="meter" title="${money(sp.used)} of ${money(sp.cap)}">`
           + `<span class="meter-fill${spent ? ' full' : ''}" style="width:${Math.min(100, (sp.used / sp.cap) * 100).toFixed(1)}%"></span></span>`
-          + ` locally recorded response costs <b>${money(sp.used)}</b> of ${money(sp.cap)} cap`
+          + ` $ spent this month (OpenRouter-reported) <b>${money(sp.used)}</b> of ${money(sp.cap)} cap`
           + (sp.shared ? ' this month' : ' today')
           + (sp.resets ? ` <span class="dim">· back ${R.esc(sp.resets)}</span>` : '')
           + (spent ? ' <span class="err">— spent</span>' : ''));
@@ -55,9 +122,12 @@
         : '<span class="dim">OpenRouter key usage unavailable — local ledger is not verification</span>');
     }
     if (info && info.quota) bits.push(`OpenRouter free requests ${info.quota.used}/${info.quota.limit}`);
-    if (info && info.corpus) bits.push(`MIT corpus ${info.corpus.chunks.toLocaleString()} chunks`);
-    if (status && status.experiment) bits.push(`MIT experiment: ${status.experiment.on} with / ${status.experiment.off} without`);
-    return bits.map((b) => `<div>${b}</div>`).join('');
+    // The corpus chunk count and the experiment arms are only worth a line while an experiment
+    // is actually running; otherwise they are two numbers nobody is going to act on.
+    const experimenting = info && info.mit_experiment && info.mit_experiment.enabled;
+    if (experimenting && info.corpus) bits.push(`MIT corpus ${info.corpus.chunks.toLocaleString()} chunks`);
+    if (experimenting && status && status.experiment) bits.push(`MIT experiment: ${status.experiment.on} with / ${status.experiment.off} without`);
+    return bits.filter(Boolean).map((b) => `<div>${b}</div>`).join('');
   }
 
   /** "4m12s" — the same shape the activity tab prints, so the two agree. */
@@ -74,6 +144,8 @@
     const running = status && status.daemon_running;
     $('start').disabled = !!running;
     $('stop').disabled = !running;
+    $('drain').disabled = !running;
+    $('restart').disabled = !running;
     const recent = (status && status.recent) || [];
     const age = status && status.stale_seconds;
     const quiet = running && age != null
@@ -91,13 +163,14 @@
   // ---------------------------------------------------------------- tabs
 
   function renderTab() {
-    for (const name of ['ask', 'queue']) {
+    for (const name of ['ask', 'queue', 'landed']) {
       $('pane-' + name).hidden = tab !== name;
       const t = $('tab-' + name);
       t.classList.toggle('active', tab === name);
       t.setAttribute('aria-selected', tab === name ? 'true' : 'false');
     }
-    if (tab === 'queue') renderQueue();
+    if (tab === 'queue') { renderQueue(); renderParked(); }
+    if (tab === 'landed') renderLanded();
   }
 
   function showTab(name) {
@@ -106,6 +179,41 @@
     renderTab();
     save();
     if (name === 'queue') vscode.postMessage({ type: 'refresh' });
+    if (name === 'landed') vscode.postMessage({ type: 'landed', repo: status && status.repo });
+  }
+
+  // ---------------------------------------------------------------- landed
+
+  function landedRow(cmt) {
+    const bits = [cmt.model ? `<span class="dim">${R.esc(cmt.model)}</span>` : null,
+      cmt.reward != null ? `reward <b>${Number(cmt.reward).toFixed(2)}</b>` : null,
+      cmt.goal_item ? `goal item ${cmt.goal_item}` : null,
+      cmt.usd ? money(cmt.usd) : null].filter(Boolean).join(' · ');
+    const row = el('div', 'qrow');
+    row.dataset.sha = cmt.sha;
+    row.appendChild(el('div', 'qmain',
+      `<span class="qtitle">${R.esc(cmt.subject)}</span>` +
+      `<span class="qmeta"><code>${R.esc(cmt.short)}</code> · ${bits}</span>`));
+    row.appendChild(el('div', 'qactions',
+      `<button class="icon lshow" title="Open this commit as a diff">diff</button>`));
+    return row;
+  }
+
+  function renderLanded() {
+    const head = $('landedHead'), list = $('landedList');
+    if (!landed) {
+      head.innerHTML = '<span class="dim">Loading what landed…</span>';
+      list.innerHTML = '';
+      return;
+    }
+    head.innerHTML = `<div class="qhead"><span>${landed.length} commit(s) on <b>`
+      + `${R.esc(String(status && status.trunk || 'trunk'))}</b></span></div>`;
+    list.innerHTML = '';
+    if (!landed.length) {
+      list.innerHTML = '<p class="dim">Nothing has landed yet.</p>';
+      return;
+    }
+    for (const cmt of landed) list.appendChild(landedRow(cmt));
   }
 
   // ---------------------------------------------------------------- queue
@@ -120,6 +228,10 @@
     const bits = [R.esc(t.kind)];
     if (t.origin) bits.push(R.esc(t.origin));
     if (t.attempts) bits.push(`${t.attempts} attempt${t.attempts > 1 ? 's' : ''}`);
+    // A harness failure cost the task no attempt, so say so rather than leaving it looking clean.
+    if (t.harness_failures) bits.push(`<span class="warn">${t.harness_failures} harness failure${t.harness_failures > 1 ? 's' : ''}</span>`);
+    if (t.failure_class) bits.push(`last failure: <b>${R.esc(t.failure_class)}</b>`);
+    if (t.allow_test_changes) bits.push('<span class="tag">may change tests</span>');
     if (t.depends_on && t.depends_on.length) bits.push(`waits for ${t.depends_on.length}`);
     if (t.blocks && t.blocks.length) bits.push(`blocks ${t.blocks.length}`);
     const wait = waitFor(t);
@@ -137,6 +249,7 @@
       `<span class="qtitle">${R.esc(t.title)}</span>` +
       `<span class="qmeta">${queueMeta(t)}</span>`));
     row.appendChild(el('div', 'qactions',
+      (waitFor(t) ? `<button class="icon qretry" title="Try this task now, without waiting out the backoff">↻</button>` : '') +
       `<button class="icon qedit" title="Edit this task">✎</button>` +
       `<button class="icon qdel" title="Remove this task from the queue">✕</button>`));
     if (open.has(t.id)) {
@@ -190,6 +303,28 @@
       (b.claimed - a.claimed) || (b.priority - a.priority) || (a.created - b.created));
     for (const t of order) {
       list.appendChild(editing && editing.id === t.id ? editForm(editing.task) : queueRow(t));
+    }
+  }
+
+  function renderParked() {
+    const head = $('parkedHead'), list = $('parkedList');
+    const rows = parked || [];
+    head.innerHTML = rows.length
+      ? `<div class="qhead"><span>${rows.length} split or parked — the swarm gave these up</span></div>` : '';
+    list.innerHTML = '';
+    for (const t of rows) {
+      const row = el('div', 'qrow');
+      row.dataset.id = t.id;
+      const bits = [R.esc(t.status)];
+      if (t.failure_class) bits.push(`<b>${R.esc(t.failure_class)}</b>`);
+      if (t.stage) bits.push(R.esc(t.stage));
+      if (t.why) bits.push(R.esc(String(t.why).slice(0, 120)));
+      row.appendChild(el('div', 'qmain',
+        `<span class="qtitle">${R.esc(t.title)}</span><span class="qmeta">${bits.join(' · ')}</span>`));
+      row.appendChild(el('div', 'qactions',
+        `<button class="icon prequeue" title="Put this task back in the queue, attempts cleared">↻</button>`
+        + (t.handoff ? `<button class="icon pwhy" data-path="${R.esc(t.handoff)}" title="Open the handoff for this attempt">why</button>` : '')));
+      list.appendChild(row);
     }
   }
 
@@ -270,9 +405,11 @@
       // A task that was rewritten or removed elsewhere must not stay open in a stale form.
       if (editing && !status.queue.some((t) => t.id === editing.id)) editing = null;
       renderStatus();
-      if (tab === 'queue') renderQueue();
+      if (tab === 'queue') { renderQueue(); renderParked(); }
     } else if (msg.type === 'info') { info = msg.data; renderStatus(); }
-    else if (msg.type === 'tab') { tab = msg.tab === 'queue' ? 'queue' : 'ask'; renderTab(); }
+    else if (msg.type === 'landed') { landed = msg.commits || []; save(); if (tab === 'landed') renderLanded(); }
+    else if (msg.type === 'parked') { parked = msg.parked || []; save(); if (tab === 'queue') renderParked(); }
+    else if (msg.type === 'tab') { tab = ['queue', 'landed'].includes(msg.tab) ? msg.tab : 'ask'; renderTab(); }
     else if (msg.type === 'queueTask') { editing = { id: msg.task.id, task: msg.task }; editError = null; showTab('queue'); renderQueue(); }
     else if (msg.type === 'queueSaved') { editing = null; editError = null; renderQueue(); }
     else if (msg.type === 'queueError') { editError = msg.error; renderQueue(); }
@@ -301,9 +438,28 @@
       vscode.postMessage({ type: 'queueClear', repo: status && status.repo });
       return;
     }
+    const landedRowEl = e.target.closest('#landedList .qrow');
+    if (landedRowEl) {
+      vscode.postMessage({ type: 'showCommit', sha: landedRowEl.dataset.sha, repo: status && status.repo });
+      return;
+    }
+    const parkedRowEl = e.target.closest('#parkedList .qrow');
+    if (parkedRowEl) {
+      const why = e.target.closest('.pwhy');
+      if (why) { vscode.postMessage({ type: 'open', path: why.dataset.path, repo: status && status.repo }); return; }
+      if (e.target.closest('.prequeue')) {
+        vscode.postMessage({ type: 'queueRequeue', id: parkedRowEl.dataset.id, repo: status && status.repo });
+        return;
+      }
+      return;
+    }
     const row = e.target.closest('.qrow');
     if (row) {
       const id = row.dataset.id, t = queued(id);
+      if (e.target.closest('.qretry')) {
+        vscode.postMessage({ type: 'queueRetry', id, repo: status && status.repo });
+        return;
+      }
       if (e.target.closest('.qdel')) {
         vscode.postMessage({ type: 'queueRemove', id, repo: status && status.repo,
           title: t ? t.title : '', claimed: !!(t && t.claimed), blocks: (t && t.blocks) || [] });
@@ -369,6 +525,8 @@
   $('queue').addEventListener('click', () => vscode.postMessage({ type: 'queue', title: $('question').value.trim(), withCode: $('withCode').checked }));
   $('lookup').addEventListener('click', () => vscode.postMessage({ type: 'study', query: $('question').value.trim(), withCode: $('withCode').checked }));
   $('start').addEventListener('click', () => vscode.postMessage({ type: 'start' }));
+  $('drain').addEventListener('click', () => vscode.postMessage({ type: 'stop', repo: status && status.repo, drain: true }));
+  $('restart').addEventListener('click', () => vscode.postMessage({ type: 'restart', repo: status && status.repo }));
   // Name the repository the panel is showing: stop means this swarm, not every swarm on the machine.
   $('stop').addEventListener('click', () => vscode.postMessage({ type: 'stop', repo: status && status.repo }));
   $('report').addEventListener('click', () => vscode.postMessage({ type: 'report' }));
