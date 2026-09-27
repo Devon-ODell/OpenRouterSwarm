@@ -61,12 +61,17 @@ class GoalItemsTests(unittest.TestCase):
                 "1. The four deep games\n2. Better existing games\n")
         self.assertEqual(swarmd.goal_items(text), [])
 
-    def test_the_studios_goal_file_ranks_nothing_today(self):
-        studio = Path("/Users/devonodell/Desktop/internetmoney/video-games/openRouter-Studio/GOAL.md")
-        if not studio.is_file():
-            self.skipTest("the studio checkout is not on this machine")
+    def test_the_unranked_studio_goal_stays_inert(self):
+        # Preserve the original regression with its original input. The live checkout
+        # now has owner-ranked priorities and must not make an offline test date-dependent.
+        studio = Path(__file__).parent / "fixtures" / "studio_goal_unranked.md"
         self.assertEqual(swarmd.goal_items(studio.read_text()), [],
                          "this must stay inert until the owner ranks the work")
+
+    def test_activating_the_roadmap_ranks_it_first(self):
+        goal = "## Work on now\n1. **The arcade depth roadmap**\n2. Keep what shipped working.\n"
+        self.assertEqual(swarmd.goal_items(goal),
+                         ["The arcade depth roadmap", "Keep what shipped working."])
 
 
 class GoalItemWeightTests(unittest.TestCase):

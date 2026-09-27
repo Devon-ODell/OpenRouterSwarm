@@ -310,6 +310,20 @@ class ShiftDeadlineTests(unittest.TestCase):
             self.assertAlmostEqual(float(os.environ["FLINT_RUN_DEADLINE"]),
                                    time.time() + 8 * 3600, delta=30)
 
+    def test_preflight_time_counts_toward_the_deadline(self):
+        clock = [1000.0]
+        def preflight(c):
+            clock[0] += 120
+        with patch.dict(os.environ, {"FLINT_RUN_DEADLINE": "3880"}), \
+             patch.object(swarmd.time, "time", side_effect=lambda: clock[0]), \
+             patch.object(swarmd, "preflight", side_effect=preflight), \
+             patch.object(swarmd, "run_daemon"), patch.object(swarmd, "read_goal", return_value="g"), \
+             patch.object(swarmd, "log"), patch.object(swarmd.threading, "Timer") as timer, \
+             tempfile.TemporaryDirectory() as d, patch.object(swarmd, "STATE", Path(d)):
+            self.addCleanup(swarmd._stop.clear)
+            swarmd.start({"repo": ".", "workers": 1}, hours=0.8)
+            self.assertEqual(timer.call_args.args[0], 2760)
+
     def test_a_restarted_daemon_past_its_deadline_does_not_start(self):
         with patch.dict(os.environ, {"FLINT_RUN_DEADLINE": str(time.time() - 60)}), \
              patch.object(swarmd, "log") as log, patch.object(swarmd, "run_daemon") as run:

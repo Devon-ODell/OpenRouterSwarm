@@ -149,7 +149,7 @@ RELOADABLE = frozenset({
     "validation_commands", "test_cmd", "keep_worktrees"})
 # Changing these under a running daemon would strand worktrees, state or threads.
 RESTART_ONLY = frozenset({"repo", "trunk", "workers", "sandbox_write", "base_branch", "python",
-                          "goal_file"})
+                          "goal_file", "roadmap_file"})
 _cfg_lock = threading.Lock()
 # 0 until a daemon takes its baseline in run_daemon. Reloading is that daemon's business: any
 # other process holds a config it assembled itself, and pouring the file over it would replace
@@ -2951,6 +2951,8 @@ class Worker(threading.Thread):
 
     def follow_up(self, task, scores, r, breakthrough):
         """Recursion on success: strong work spawns the next step it made possible."""
+        if self.c.get("roadmap_file"):
+            return  # Future packets are dispatched only by their recorded roadmap gates.
         if not scores or not (breakthrough or r >= 0.75):
             return
         if len(self.q.pending()) >= self.c.get("max_queue", 20):
@@ -3024,6 +3026,8 @@ class Worker(threading.Thread):
         A split that returns no subtasks strands the task and everything waiting on it, so one
         empty answer is retried on a different model before the task is given up on."""
         c = self.c
+        if c.get("roadmap_file"):
+            return 0  # A coordinator must repoint dependencies before splitting a packet.
         # Between attempts: not the last attempt's evidence, role-call budget or MIT arm.
         self.evidence, self.mit = None, None
         self.execution_class = "standard"
@@ -3502,7 +3506,7 @@ def why_unrunnable(cmd):
 # renamed, and both fail silently: the setting simply never takes effect.
 KNOWN_KEYS = frozenset({
     "repo", "base_branch", "trunk", "test_cmd", "validation_commands", "test_timeout",
-    "python", "goal_file", "workers", "tick", "models", "paid_models", "allow_paid",
+    "python", "goal_file", "roadmap_file", "workers", "tick", "models", "paid_models", "allow_paid",
     "model", "steps", "role_timeouts", "turn_timeout", "max_repairs", "max_diff",
     "max_depth", "max_queue", "max_children", "max_descendants", "plan_batch",
     "plan_cooldown", "reviewer_exclude", "daily_cap", "reserve", "owner_window",
@@ -3670,6 +3674,70 @@ def holder():
             f"  Stop it:   kill -INT {d['pid']}   (or Ctrl-C in its terminal)")
 
 
+def dispatch_roadmap(c, q):
+    """Dispatch only committed packets whose dependencies and owner gates are evidenced.
+
+    The coordinator ledger stays authoritative for human gates. Live queue/commit
+    evidence is reported separately so workers cannot accept their own gates.
+    """
+    repo, trunk = Path(c["repo"]), trunk_name(c)
+    def committed(path):
+        _, raw = git(["show", f"{trunk}:{path}"], cwd=repo, check=True)
+        return json.loads(raw)
+    rows = committed(c["roadmap_file"])["tasks"]
+    ledger = committed("docs/roadmap/EXECUTION.json")
+    if ledger.get("implementation_started") is not True:
+        raise ValueError("roadmap implementation has not been activated")
+    with q.locked():
+        pending, done = _read(q.path), _read(q.done)
+    history = {r["title"]: r for r in done + pending}
+    accepted = {}
+    for packet in rows:
+        pid = packet["id"]
+        evidence = ledger.get("packets", {}).get(pid, {})
+        commit = evidence.get("accepted_commit")
+        if evidence.get("status") == "accepted" and evidence.get("evidence"):
+            if packet["dispatch"] == "coordinator":
+                accepted[pid] = evidence
+            elif commit and git(["merge-base", "--is-ancestor", commit, trunk], cwd=repo)[0] == 0:
+                accepted[pid] = evidence
+        queued = history.get(packet["title"], {})
+        match = re.search(r"integrated ([0-9a-f]{40}) on", queued.get("note", ""))
+        if queued.get("status") == "done" and match:
+            commit = match.group(1)
+            if git(["merge-base", "--is-ancestor", commit, trunk], cwd=repo)[0] == 0:
+                accepted[pid] = {"status": "accepted", "queue_id": queued["id"],
+                                 "accepted_commit": commit, "evidence": queued["note"]}
+    added, blocked = [], {}
+    for packet in rows:
+        pid = packet["id"]
+        if packet["dispatch"] != "swarm" or pid in accepted or packet["title"] in history:
+            continue
+        missing = [dep for dep in packet["depends_on"] if dep not in accepted]
+        missing += [gate for gate in packet.get("coordinator_gates", [])
+                    if not ledger.get("gates", {}).get(gate, {}).get("evidence")]
+        if missing:
+            blocked[pid] = missing
+            continue
+        if len(pending) + len(added) >= 5:
+            continue
+        detail = (packet["detail"] + "\n\nREAD: docs/roadmap/README.md and this packet in "
+                  + c["roadmap_file"] + "\nVERIFICATION:\n" + "\n".join(packet.get("commands", [])))
+        task = q.add(packet["title"], detail, "feature", origin="roadmap",
+                     priority=packet["priority"], execution_class=packet["execution_class"],
+                     acceptance=packet["acceptance"], serves=1)
+        if task:
+            added.append(task)
+            log(f"roadmap {pid}: queued {task['id']}")
+    report = {"updated": dt.datetime.now().isoformat(), "accepted": accepted,
+              "blocked": blocked, "pending": [{"id": t["id"], "title": t["title"]}
+                                               for t in pending + added]}
+    tmp = STATE / "roadmap-execution.tmp"
+    tmp.write_text(json.dumps(report, indent=2) + "\n")
+    tmp.replace(STATE / "roadmap-execution.json")
+    return added
+
+
 def hours_left(hours):
     """Hours until this shift ends, honouring a deadline carried across a self-restart.
 
@@ -3711,7 +3779,14 @@ def start(c, hours=None, max_tasks=None, awake=False):
             keep_awake()
         timer = None
         if hours:
-            timer = threading.Timer(hours * 3600, shutdown)
+            # Preflight can run a multi-minute baseline suite. It consumes the shift,
+            # too; neither startup verification nor self-restarts may extend the deadline.
+            seconds = hours * 3600
+            try:
+                seconds = min(seconds, max(0, float(os.environ["FLINT_RUN_DEADLINE"]) - time.time()))
+            except (KeyError, ValueError):
+                pass
+            timer = threading.Timer(seconds, shutdown)
             timer.daemon = True
             timer.start()
         signal.signal(signal.SIGTERM, lambda *_: shutdown())
@@ -3760,6 +3835,8 @@ def run_daemon(c, max_tasks=None, hours=None):
             f"`swarm stop --drain` or `kill -USR1 {os.getpid()}` stops after this task")
     except ValueError:
         pass                                # not the main thread; a bounded run in a test
+    if c.get("roadmap_file"):
+        dispatch_roadmap(c, q)
     workers = [Worker(i, c, q, budget, stop, ledger, tally) for i in range(c["workers"])]
     for w in workers:
         w.start()
@@ -3799,7 +3876,7 @@ def run_daemon(c, max_tasks=None, hours=None):
             if time.time() - last_bugs > 300:
                 last_bugs = time.time()
                 try:
-                    new = import_bugs(c, q)
+                    new = [] if c.get("roadmap_file") else import_bugs(c, q)
                     if new:
                         log(f"queued {len(new)} player bug report(s): "
                             + "; ".join(t["title"][:60] for t in new))
@@ -3813,7 +3890,12 @@ def run_daemon(c, max_tasks=None, hours=None):
             # Planning costs requests like anything else, so it is rate-limited
             # and backs off when it stops producing new work.
             cooldown = c.get("plan_cooldown", 600) * (2 ** min(dry_runs, 4))
-            if (len(q.ready()) < c["workers"] and time.time() - last_plan > cooldown
+            if c.get("roadmap_file"):
+                try:
+                    dispatch_roadmap(c, q)
+                except Exception as exc:
+                    log(f"roadmap dispatch blocked: {exc}")
+            if (not c.get("roadmap_file") and len(q.ready()) < c["workers"] and time.time() - last_plan > cooldown
                     and can_take_a_turn(c, budget)):
                 last_plan = time.time()
                 try:

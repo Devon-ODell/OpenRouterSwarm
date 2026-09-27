@@ -402,3 +402,22 @@ repair turns are capped at four rounds and 300 seconds. Classification is
 explicit: ordinary feature tasks keep their existing workflow.
 
 These settings and supervisor changes take effect when the daemon next starts.
+
+## Running a coordinator-approved roadmap
+
+Set `roadmap_file` to a committed task file such as `docs/roadmap/tasks.json`.
+The daemon reads it and `docs/roadmap/EXECUTION.json` from `swarm/trunk`, never
+from uncommitted edits. Implementation must be explicitly activated in the ledger.
+Only swarm packets with accepted dependencies and recorded coordinator/ownership
+evidence are queued, with at most five pending packets. Accepted worker results
+must name a commit present on trunk before they unlock their successors.
+
+In this mode the model planner, generated follow-ups, automatic decomposition
+and bug-report import cannot add work outside the roadmap. Failed packets stay
+blocked for coordinator review; future waves cannot bypass them. Coordinator
+gates still require real evidence entered by the coordinator. Live packet status,
+accepted commits and missing gates are in the repository's swarm state directory
+as `roadmap-execution.json`; the committed ledger records coordinator decisions.
+
+Use `grind /path/to/repo --hours 8 --goal GOAL.md` for a bounded shift. Preflight
+verification counts toward the deadline, which survives daemon code restarts.
