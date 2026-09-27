@@ -235,3 +235,55 @@ class PlanIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoleModelsTests(unittest.TestCase):
+    """Keeping a model out of the roles it is bad at, without losing it entirely.
+
+    nvidia/nemotron-3-ultra-550b-a55b:free on 2026-09-27 used all 12 rounds and exited rc=5 on
+    F02's implementer, then used all 12 again on the repair and was killed at the 900s limit. It
+    explores without converging. It is still worth having where the product is one short verdict.
+    """
+
+    def cfg(self, **kw):
+        return {"models": ["a:free", "b:free", "slow:free"], **kw}
+
+    def test_a_role_with_no_override_gets_the_whole_pool(self):
+        c = self.cfg(role_models={"implementer": ["a:free"]})
+        self.assertEqual(swarmd.pool(c, "adversary"), ["a:free", "b:free", "slow:free"])
+        self.assertEqual(swarmd.pool(c), ["a:free", "b:free", "slow:free"])
+
+    def test_an_override_narrows_that_role(self):
+        c = self.cfg(role_models={"implementer": ["a:free", "b:free"]})
+        self.assertEqual(swarmd.pool(c, "implementer"), ["a:free", "b:free"])
+
+    def test_an_override_cannot_add_a_model_the_pool_does_not_have(self):
+        """Otherwise a role override becomes a way to smuggle in an unreviewed provider."""
+        c = self.cfg(role_models={"implementer": ["a:free", "smuggled:free"]})
+        self.assertEqual(swarmd.pool(c, "implementer"), ["a:free"])
+
+    def test_an_override_cannot_introduce_a_paid_model(self):
+        c = self.cfg(role_models={"implementer": ["paid/x"]}, allow_paid=False)
+        self.assertNotIn("paid/x", swarmd.pool(c, "implementer"))
+
+    def test_a_typo_falls_back_to_the_pool_rather_than_stalling_the_role(self):
+        """A role narrowed to nothing reads as "every model is resting" and stops the run."""
+        c = self.cfg(role_models={"implementer": ["misspelled:free"]})
+        self.assertEqual(swarmd.pool(c, "implementer"), ["a:free", "b:free", "slow:free"])
+
+    def test_the_studio_keeps_its_looping_model_out_of_edits_only(self):
+        path = Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.json"
+        if not path.is_file():
+            self.skipTest("no tuned studio config on this machine")
+        c = json.loads(path.read_text())
+        slow = "nvidia/nemotron-3-ultra-550b-a55b:free"
+        if slow not in (c.get("models") or []):
+            self.skipTest("that model is no longer in the studio pool")
+        for role in ("implementer", "repair"):
+            self.assertNotIn(slow, swarmd.pool(c, role), role)
+        for role in ("adversary", "judge", "planner"):
+            self.assertIn(slow, swarmd.pool(c, role), role)
+
+    def test_role_models_reloads_without_a_restart(self):
+        self.assertIn("role_models", swarmd.RELOADABLE)
+        self.assertIn("role_models", swarmd.KNOWN_KEYS)

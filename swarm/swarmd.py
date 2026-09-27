@@ -142,7 +142,7 @@ def config_kind(path=None):
 # "These settings take effect when the daemon next starts" cost 25 daemon starts in 26 hours
 # and killed 54 attempts in flight — 5.6 hours of work.
 RELOADABLE = frozenset({
-    "models", "paid_models", "steps", "role_timeouts", "turn_timeout", "test_timeout",
+    "models", "role_models", "paid_models", "steps", "role_timeouts", "turn_timeout", "test_timeout",
     "max_repairs", "reviewer_exclude", "plan_cooldown", "plan_batch", "allowance_recheck",
     "monthly_usd", "daily_usd", "spend_reset_day", "daily_cap", "reserve", "owner_window",
     "max_queue", "max_depth", "inject_corpus", "allow_paid", "study", "tick", "max_diff",
@@ -292,10 +292,21 @@ def wt_root():
     return HERE / "wt" / SLUG
 
 
-def pool(c):
+def pool(c, role=None):
     """The free models the swarm works with. Paid ids in `models` are dropped unless
-    allow_paid is set, so a stray paid entry can never quietly spend credits."""
+    allow_paid is set, so a stray paid entry can never quietly spend credits.
+
+    ``role_models`` can narrow a role to a proven subset of the general pool.  It
+    deliberately narrows rather than extends ``models``: a role override cannot
+    quietly introduce an unreviewed or paid provider.
+    """
     ms = c.get("models") or [c.get("model") or DEFAULT_MODEL]
+    scoped = (c.get("role_models") or {}).get(role) if role else None
+    if scoped is not None:
+        narrowed = [m for m in scoped if m in set(ms)]
+        # An override that names nothing in the pool would leave the role with no model at
+        # all, which reads as "every model is resting" and stalls the run for a typo.
+        ms = narrowed or ms
     return [m for m in ms if c.get("allow_paid") or m.endswith(":free")]
 
 
@@ -2435,13 +2446,17 @@ class Worker(threading.Thread):
 
     # -- helpers -----------------------------------------------------------
 
-    def pick(self, exclude=()):
+    def pick(self, exclude=(), role="implementer"):
         """Implementers by Thompson sampling. Reviewers and judges come from the
         same posterior, excluding the implementer so nobody grades their own work.
 
+        `role` is the job this model is being drawn for, so `role_models` can keep a model
+        out of the roles it is bad at while leaving it in the ones it is good at. The
+        posterior is still the implementer's: one model's record is one record.
+
         When every free model is resting, a paid stand-in keeps the attempt alive rather
         than abandoning work already done — but only while the day's budget allows."""
-        m = self.ledger.pick("implementer", pool(self.c), exclude=exclude)
+        m = self.ledger.pick("implementer", pool(self.c, role), exclude=exclude)
         if m is not None:
             return m
         left = spend_left(self.c)
@@ -2505,7 +2520,8 @@ class Worker(threading.Thread):
                 tried.add(model)
                 if editing and self.snapshot()[0] != before:
                     raise
-                nxt = self.pick(set(avoid) | tried | (self.no_review() if role == "adversary" else set()))
+                nxt = self.pick(set(avoid) | tried | (self.no_review() if role == "adversary" else set()),
+                                role=role)
                 if nxt is None:
                     raise
                 log(f"handing {role} to {nxt}", self.name)
@@ -2719,7 +2735,8 @@ class Worker(threading.Thread):
         if not fast and c["steps"].get("architect", 0):
             spec += "\nARCHITECT NOTES (the contract still controls scope):\n" + self.call(
                 "architect", ARCHITECT.format(goal=goal, title=task["title"], detail=task["detail"],
-                 corpus=corpus, test_cmd=c["test_cmd"]), wd, c["steps"]["architect"], self.pick({impl}) or impl,
+                 corpus=corpus, test_cmd=c["test_cmd"]), wd, c["steps"]["architect"],
+                 self.pick({impl}, role="architect") or impl,
                 avoid={impl})
         # What earlier attempts hit, as lines to act on. Parent handoffs stay artifacts on disk,
         # not mutable model memory, so only their outcome is repeated here.
@@ -2751,7 +2768,7 @@ class Worker(threading.Thread):
                 return "model_error", str(exc), info
             # After a handoff the model that actually wrote the code is its author.
             impl = info["implementer"] = self.last_model or impl
-        adv = self.pick({impl} | self.no_review()) or impl
+        adv = self.pick({impl} | self.no_review(), role="adversary") or impl
         info["reviewer"] = adv
         info["same_model_review"] = adv == impl
         seen = set()
@@ -2824,7 +2841,7 @@ class Worker(threading.Thread):
         self.evidence.record("integrated", commit=info["commit"])
         log(f"{task['id']}: landed on {trunk_name(c)}; evidence: {self.evidence.path}", w)
         # A third model scores the landed change; its lesson and follow-ups feed the playbook.
-        info["judge"] = self.pick({impl, adv}) or adv
+        info["judge"] = self.pick({impl, adv}, role="judge") or adv
         _, landed_diff = git(["diff", "--unified=3", self.review_base, "HEAD"], cwd=wd)
         info["scores"] = self.judge(task, goal, landed_diff,
                                     "APPROVE: " + str((info.get("review") or {}).get("summary", "")),
@@ -3031,7 +3048,8 @@ class Worker(threading.Thread):
         # Between attempts: not the last attempt's evidence, role-call budget or MIT arm.
         self.evidence, self.mit = None, None
         self.execution_class = "standard"
-        model = self.ledger.pick("planner", pool(c), exclude=set(avoid)) or self.pick(set(avoid))
+        model = (self.ledger.pick("planner", pool(c, "decomposer"), exclude=set(avoid))
+                 or self.pick(set(avoid), role="decomposer"))
         if model is None:
             return 0
         with _view_lock:
@@ -3189,7 +3207,7 @@ def plan(c, q, budget, n=6, ledger=None):
     ensure_trunk(c)
     goal = read_goal(c)
     persona = ledger.pick("persona", list(PERSONAS)) or "builder"
-    model = ledger.pick("planner", pool(c))
+    model = ledger.pick("planner", pool(c, "planner"))
     if model is None:
         log(f"planner: {all_resting(ledger, c)}; will retry")
         return 0
@@ -3513,7 +3531,7 @@ KNOWN_KEYS = frozenset({
     "daily_usd", "monthly_usd", "spend_reset_day", "allowance_recheck", "editor_wallet",
     "corpus_db", "corpus_root", "corpus_k", "study", "inject_corpus", "mit_experiment",
     "sandbox", "sandbox_write", "keep_worktrees", "notify", "baseline_ttl", "personas",
-    "restart_on_change", "restart_min_interval",
+    "restart_on_change", "restart_min_interval", "role_models",
     "execution_class", "_comment"})
 # Seconds a round of tool use really takes on these models, from the studio's own turns.
 SECONDS_PER_ROUND = 47
