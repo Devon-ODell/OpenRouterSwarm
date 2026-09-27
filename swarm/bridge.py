@@ -688,6 +688,8 @@ def cmd_status(a):
           # A roadmap run whose packets are all held looks exactly like an idle one from the
           # queue alone. The report says which packet is held, why, and what releases it.
           "roadmap": swarmd.read_roadmap() if c.get("roadmap_file") else None,
+          # Spare-time work: what it last found, and what is standing it down right now.
+          "idle": swarmd.idle_state(),
           "queue": [queue_row(t, pending) for t in pending],
           "max_queue": c.get("max_queue", 20),
           "kinds": list(swarmd.KINDS),

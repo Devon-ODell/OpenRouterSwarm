@@ -3406,6 +3406,240 @@ def plan(c, q, budget, n=6, ledger=None):
     return added
 
 
+# ------------------------------------------------------------------ spare time
+
+# A shift that runs out of queued work sleeps the rest of itself away. This fills that time
+# and only that time: everything below stands down the moment real work exists.
+IDLE_MIN_SECONDS = 1800       # less of the shift left than this and a new task cannot finish
+IDLE_IMPROVEMENT = """There is no assigned work queued for this repository right now. Find ONE \
+improvement worth making with the spare time, or say that there is none.
+
+THE GOAL THIS REPOSITORY SERVES
+{goal}
+
+WHAT HAS LANDED RECENTLY
+{landed}
+
+ALREADY QUEUED, TRIED OR PROPOSED — do not repeat any of these
+{seen}
+
+WHAT COUNTS AS A GOOD ANSWER
+This is spare time, not a mandate, and the bar is higher than for assigned work
+because nobody asked for it. Propose something small, self-contained and
+verifiable: a missing test for behaviour that already exists, an error path that
+reports nothing a person could act on, a documented behaviour the code no longer
+has, a crash on an input the code clearly meant to handle.
+
+Do not propose a redesign, a new subsystem, a new dependency, a rename spanning
+many files, or a change whose value is a matter of taste. If nothing clears that
+bar, say so — "nothing worth doing" is a correct and useful answer, and a far
+better one than inventing work.
+
+Read the repository with your tools before you answer. Name real files.
+
+Reply with ONE JSON object and nothing else. Either:
+
+{{"title": "short imperative title", "kind": "feature|bugfix|test|refactor",
+  "detail": "what to change and why, naming the files it touches",
+  "acceptance": ["an observable that is true only once this is done", "..."],
+  "why_now": "one sentence"}}
+
+or, if there is nothing worth doing:
+
+{{"title": null, "why_not": "one sentence"}}
+
+Whatever you propose must be verifiable with: {test_cmd}
+"""
+
+
+def json_object(text):
+    """The first JSON object in a reply, whether bare, fenced or buried in prose."""
+    text = (text or "").strip()
+    try:
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
+    except ValueError:
+        pass
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            value, _ = decoder.raw_decode(text, match.start())
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def idle_state():
+    """The persisted record of spare-time work: the cycles run and the one still open.
+
+    Persisted because a restart mid-shift must resume this rather than start it again —
+    the daemon restarts into edited source routinely, and an in-memory cycle counter would
+    let one improvement be proposed, queued and forgotten several times over."""
+    try:
+        state = json.loads((STATE / "idle-improvements.json").read_text())
+    except (OSError, ValueError):
+        state = {}
+    state.setdefault("cycles", [])
+    state.setdefault("active", None)
+    return state
+
+
+def write_idle(state):
+    state["cycles"] = state.get("cycles", [])[-40:]
+    tmp = STATE / "idle-improvements.tmp"
+    try:
+        tmp.write_text(json.dumps(state, indent=2) + "\n")
+        tmp.replace(STATE / "idle-improvements.json")
+    except OSError:
+        pass                              # spare-time bookkeeping never fails a run
+
+
+def settle_idle(state, q):
+    """Close out the open improvement once its task has finished, and say how it went."""
+    active = state.get("active")
+    if not active:
+        return None
+    if any(r["id"] == active for r in q.pending()):
+        return None                        # still queued or in flight
+    row = next((r for r in reversed(_read(q.done)) if r["id"] == active), None)
+    state["active"] = None
+    for cycle in reversed(state.get("cycles", [])):
+        if cycle.get("queue_id") == active:
+            cycle["status"] = (row or {}).get("status") or "vanished"
+            cycle["outcome"] = ((row or {}).get("note") or "")[:300]
+            log(f"idle improvement '{cycle.get('title', active)}' ended: {cycle['status']}")
+            return cycle
+    return None
+
+
+def idle_ready(c, q, hours=None):
+    """(ok, why not) — whether spare-time work may start at this moment.
+
+    The order matters. Work somebody assigned always outranks work nobody asked for, and a
+    roadmap blocker that needs a person is not made better by burying it under new tasks."""
+    if q.ready():
+        return False, "assigned work is ready to claim"
+    pending = q.pending()
+    if any(r.get("claimed") for r in pending):
+        return False, "a task is in flight"
+    if pending:
+        return False, "queued work is waiting on its dependencies"
+    roadmap = read_roadmap()
+    if roadmap and roadmap.get("roots"):
+        held = ", ".join(sorted(roadmap["roots"])[:4])
+        return False, f"the roadmap is held on {held}, and that needs a person, not more tasks"
+    if os.environ.get("FLINT_RUN_DEADLINE"):
+        left = hours_left(hours)
+        if left is None or left * 3600 < IDLE_MIN_SECONDS:
+            return False, "too little of the shift is left for another task to finish"
+    return True, ""
+
+
+def idle_improvement(c, q, budget, ledger=None, hours=None):
+    """One self-directed improvement at a time, while there is genuinely nothing else to do.
+
+    Returns the task queued, or None. Everything here is deliberately conservative: one
+    improvement open at a time, a cooldown between cycles, the same allowance and the same
+    shift deadline as any other turn, the lowest priority in the queue so a real task claimed
+    a second later still goes first, and the proposal put through `scope_gap` before it is
+    queued — spare-time work is exactly the kind that arrives vague."""
+    ledger = ledger or Ledger(STATE / "learn.json")
+    state = idle_state()
+    settle_idle(state, q)
+    if state.get("active"):
+        write_idle(state)
+        return None                        # one at a time, always
+    ok, why = idle_ready(c, q, hours)
+    if not ok:
+        if state.get("standing_down") != why:
+            state["standing_down"] = why
+            log(f"idle improvement standing down: {why}")
+        write_idle(state)
+        return None
+    state.pop("standing_down", None)
+    cooldown = max(300, int(c.get("idle_improvement_cooldown", 1800)))
+    if time.time() - state.get("last_cycle", 0) < cooldown or not can_take_a_turn(c, budget):
+        write_idle(state)
+        return None
+    model = ledger.pick("planner", pool(c, "planner"))
+    if model is None:
+        write_idle(state)
+        return None
+    base, t = c.get("base_branch", "main"), trunk_name(c)
+    _, landed = git(["log", "--format=- %s", "-n", "15", f"{base}..{t}"], cwd=c["repo"])
+    landed = landed.replace("- swarm: ", "- ") or "- (nothing yet)"
+    seen = [*q.recent_titles(60), *(cy.get("title") for cy in state["cycles"] if cy.get("title"))]
+    cycle = {"id": f"i{uuid.uuid4().hex[:8]}", "at": time.time(), "model": model}
+    log(f"nothing queued; looking for one improvement with {model}")
+    state["last_cycle"] = time.time()
+    with _view_lock:
+        view = refresh_view(c)
+        try:
+            out = flint(IDLE_IMPROVEMENT.format(
+                goal=read_goal(c), landed=landed,
+                seen="\n".join(f"- {x}" for x in seen if x) or "- (nothing yet)",
+                test_cmd=c["test_cmd"]),
+                view, c, "planner", "swarm", budget,
+                max(3, min(8, int(c.get("steps", {}).get("planner", 6)))), model)
+        except (StepLimit, ModelError) as exc:
+            cycle.update(status="no_answer", why=f"{type(exc).__name__}: {str(exc)[:200]}")
+            state["cycles"].append(cycle)
+            write_idle(state)
+            log(f"idle improvement: {model} produced no usable answer ({type(exc).__name__})")
+            return None
+        except (CapReached, ProviderDown, NoCredits) as exc:
+            # Not a failed cycle: nothing was asked. Try again after the usual cooldown.
+            log(f"idle improvement deferred: {type(exc).__name__}")
+            write_idle(state)
+            return None
+    proposal = json_object(out) or {}
+    title = proposal.get("title")
+    if not isinstance(title, str) or not title.strip():
+        cycle.update(status="nothing_found",
+                     why=str(proposal.get("why_not") or "no proposal in the reply")[:300])
+        state["cycles"].append(cycle)
+        write_idle(state)
+        log(f"idle improvement: nothing worth doing — {cycle['why']}")
+        journal("idle_improvement", status="nothing_found", model=model, why=cycle["why"])
+        return None
+    kind = proposal.get("kind") if proposal.get("kind") in KINDS else "feature"
+    acceptance = [a.strip() for a in (proposal.get("acceptance") or [])
+                  if isinstance(a, str) and a.strip()][:8]
+    detail = str(proposal.get("detail") or "").strip()
+    if proposal.get("why_now"):
+        detail += f"\n\nProposed as spare-time work because: {str(proposal['why_now'])[:300]}"
+    candidate = {"title": title.strip(), "detail": detail, "acceptance": acceptance or [detail]}
+    cycle["title"] = candidate["title"]
+    gap = scope_gap(candidate, c)
+    if gap:
+        # Work nobody asked for is held to the same standard as work somebody did.
+        cycle.update(status="rejected", why=gap)
+        state["cycles"].append(cycle)
+        write_idle(state)
+        log(f"idle improvement: dropped '{candidate['title']}' before queueing — {gap}")
+        journal("idle_improvement", status="rejected", model=model, title=candidate["title"],
+                why=gap)
+        return None
+    task = q.add(candidate["title"], candidate["detail"], kind, origin="idle",
+                 planner_model=model, acceptance=candidate["acceptance"], priority=-1)
+    if not task:
+        cycle.update(status="duplicate", why="already queued or the queue is full")
+        state["cycles"].append(cycle)
+        write_idle(state)
+        return None
+    cycle.update(status="queued", queue_id=task["id"], kind=kind)
+    state["cycles"].append(cycle)
+    state["active"] = task["id"]
+    write_idle(state)
+    log(f"idle improvement queued {task['id']}: {task['title']}")
+    journal("idle_improvement", status="queued", model=model, id=task["id"],
+            title=task["title"], kind=kind)
+    return task
+
+
 # ------------------------------------------------------------------ account
 
 def account():
@@ -3984,11 +4218,13 @@ def dispatch_roadmap(c, q):
         for dep in p.get("depends_on", []):
             if dep in downstream:
                 downstream[dep].append(p["id"])
+    moving = {r["packet"] for r in flight} | {t.get("packet") for t in added}
     for pid, row in blocked.items():
         row["blocks"] = sorted(downstream.get(pid, []))
-        # A root blocker waits on nothing that is itself blocked. Clearing one of those is
-        # what actually moves the roadmap; the rest resolve on their own once it does.
-        row["root"] = not any(dep in blocked for dep in row["waiting_on"])
+        # A root blocker waits on nothing that is already blocked or already being worked on.
+        # Those are the ones a person has to act on; everything else resolves on its own once
+        # they do, and listing it alongside them only buries the one that matters.
+        row["root"] = not any(dep in blocked or dep in moving for dep in row["waiting_on"])
     roots = {pid: row for pid, row in blocked.items() if row["root"]}
     mark = json.dumps(sorted((pid, row["reason"]) for pid, row in roots.items()))
     if roots and mark != _roadmap_said.get("blockers"):
@@ -4213,6 +4449,19 @@ def run_daemon(c, max_tasks=None, hours=None):
                 except Exception as e:
                     log(f"planner error: {e}")
                     dry_runs += 1
+            # Last, and only into genuinely empty time: `idle_ready` stands this down for any
+            # assigned work, anything in flight, any held roadmap packet, and the last half
+            # hour of the shift. It spends the same allowance as every other turn.
+            if c.get("idle_improvement", True) and not max_tasks:
+                try:
+                    idle_improvement(c, q, budget, ledger, hours=hours)
+                except (CapReached, ProviderDown):
+                    pass                    # the allowance or the provider; not our business
+                except NoCredits as e:
+                    log(f"out of credits: {e}")
+                    shutdown()
+                except Exception as e:      # work nobody asked for must never stop a run
+                    log(f"idle improvement error: {type(e).__name__}: {e}")
             stop.wait(c.get("tick", 90) if not max_tasks else 5)
     except KeyboardInterrupt:
         log("shutting down")

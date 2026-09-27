@@ -2,6 +2,7 @@
 import json
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -77,3 +78,63 @@ class RoadmapDispatchTests(unittest.TestCase):
         self.save(); self.git('branch', '-f', 'swarm/trunk', 'HEAD')
         with self.assertRaisesRegex(ValueError, 'not been activated'):
             swarmd.dispatch_roadmap(self.c, self.q)
+
+    def test_a_held_packet_says_why_and_what_would_release_it(self):
+        report = self._report()
+        held = report['blocked']['reserved']
+        self.assertEqual(held['reason'], 'coordinator_gate')
+        self.assertEqual(held['waiting_on'], ['Owner handoff'])
+        self.assertIn('EXECUTION.json', held['next_action'])
+        self.assertTrue(held['root'])
+        # F02 waits on F01, which is itself held, so it is not the thing to go and fix.
+        self.assertEqual(report['blocked']['F02']['reason'], 'dependency')
+        self.assertFalse(report['blocked']['F02']['root'])
+        self.assertEqual(report['blocked']['F02']['waiting_on'], ['F01'])
+        self.assertIn('reserved', report['roots'])
+
+    def test_a_packet_in_flight_is_reported_as_in_flight_not_as_blocked(self):
+        swarmd.dispatch_roadmap(self.c, self.q)
+        report = self._report()
+        self.assertNotIn('F01', report['blocked'])
+        self.assertEqual([r['packet'] for r in report['in_flight']], ['F01'])
+
+    def _exhaust(self, tid, note):
+        """Fail a task until it leaves the queue, as a real run's retries would."""
+        while any(r['id'] == tid for r in self.q.pending()):
+            self.q.release(tid, False, note)
+
+    def test_a_failed_packet_stays_visible_instead_of_vanishing(self):
+        first = swarmd.dispatch_roadmap(self.c, self.q)[0]
+        self._exhaust(first['id'], 'still red')
+        self.assertEqual(swarmd.dispatch_roadmap(self.c, self.q), [])
+        held = self._report()['blocked']['F01']
+        self.assertEqual(held['reason'], 'attempt_failed')
+        self.assertIn('EXECUTION.json', held['next_action'])
+        self.assertIn('still red', held['attempt_note'])
+        # It is the root cause of F02 being stuck, and it says so.
+        self.assertTrue(held['root'])
+        self.assertEqual(held['blocks'], ['F02'])
+
+    def test_a_failed_packet_runs_again_only_once_a_decision_is_recorded(self):
+        first = swarmd.dispatch_roadmap(self.c, self.q)[0]
+        self._exhaust(first['id'], 'the suite never went green')
+        self.assertEqual(swarmd.dispatch_roadmap(self.c, self.q), [])
+        # An undated note, or one predating the failure, authorises nothing.
+        self.ledger['packets']['F01'] = {'retry': {'reason': 'flaky fixture, fixed on trunk'}}
+        self.save(); self.git('branch', '-f', 'swarm/trunk', 'HEAD')
+        self.assertEqual(swarmd.dispatch_roadmap(self.c, self.q), [])
+        self.ledger['packets']['F01']['retry']['at'] = time.time() + 5
+        self.save(); self.git('branch', '-f', 'swarm/trunk', 'HEAD')
+        again = swarmd.dispatch_roadmap(self.c, self.q)
+        self.assertEqual([t['packet'] for t in again], ['F01'])
+        self.assertEqual(again[0]['title'], 'F01 (retry 2)')
+
+    def test_a_queue_that_says_done_without_a_commit_is_held_not_forgotten(self):
+        first = swarmd.dispatch_roadmap(self.c, self.q)[0]
+        self.q.release(first['id'], True, 'model said complete')
+        self.assertEqual(swarmd.dispatch_roadmap(self.c, self.q), [])
+        self.assertEqual(self._report()['blocked']['F01']['reason'], 'unverified_completion')
+
+    def _report(self):
+        swarmd.dispatch_roadmap(self.c, self.q)
+        return json.loads((self.state / 'roadmap-execution.json').read_text())
