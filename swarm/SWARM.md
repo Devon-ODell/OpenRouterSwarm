@@ -56,6 +56,10 @@ edits the current directory directly. The swarm never edits your checkout.
    transcript. `inject_corpus: false` keeps excerpts out of a repository's
    prompts altogether; either way every role can still call the `study` tool.
 4. **Gate**: the test command must pass, and no existing assertion may be lost.
+   Trunk's own baseline run is cached per commit and per command set (24 hours
+   by default, `baseline_ttl`), so an unchanged trunk is not re-proved before
+   every attempt; the implementer is asked to run the narrowest covering module
+   while it works, and the supervisor runs the whole command afterwards.
    Lost, not touched: an assertion removed and the same assertion function added
    back in the same hunk is an edit, assertions removed alongside the code they
    tested go with it, and a test file deleted with its subject is one removal.

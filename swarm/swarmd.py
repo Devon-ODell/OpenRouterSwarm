@@ -1295,6 +1295,22 @@ def all_resting(ledger, c):
     return f"every model is resting; {model} is back at {dt.datetime.fromtimestamp(until):%H:%M:%S} (`swarm wake` ends the rest now)"
 
 
+def route_to_paid(c, role, worker, model, why):
+    """Swap in a paid stand-in for this turn, or None when none is reachable or affordable."""
+    alt = paid_stand_in(c, model)
+    if not alt:
+        return None
+    left = spend_left(c)
+    log(f"{role}: {why} — routing this turn to paid {alt}; its cost is booked from "
+        "OpenRouter's reported charge"
+        + (f" ({spend_phrase(c)})" if left is not None else ""), worker)
+    journal("paid_fallback", role=role, worker=worker, model=model, to=alt,
+            recorded_spend_usd=round(spend_used(c), 6), spend_window=spend_window(c),
+            charge_confirmed=False, reason=why)
+    _ran_on[worker] = alt
+    return alt
+
+
 def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     """One headless flint turn, paced against the daily allowance.
 
@@ -1304,11 +1320,21 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     """
     model = model or (pool(c) or [DEFAULT_MODEL])[0]
     _ran_on.pop(worker, None)
+    whole_turn = max(1, int(max_steps or 1))
     while True:
         if _stop.is_set():
             raise Stopped("swarm is stopping")
         ok, wait, why = budget.check()
         if ok:
+            # Starting is not finishing. 21 turns paused part-way on the budget (exit 6) and
+            # everything they had done to that point was thrown away, so a turn whose rounds do
+            # not all fit goes to a paid model now rather than halfway through. If no paid model
+            # is reachable it still runs: a short turn may finish, and idling until midnight is
+            # certainly worse.
+            if not budget.check(need=whole_turn)[0]:
+                route_to_paid(c, role, worker, model,
+                              f"only part of a {whole_turn}-round turn fits the free allowance")
+                model = _ran_on.get(worker, model)
             break
         # The local count only climbs until midnight. Before paying for this turn or waiting
         # on it, ask OpenRouter whether the free requests are really gone.
@@ -1318,15 +1344,9 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         # paid model rather than idling until midnight; `paid_stand_in` returns None once the
         # budget is spent, and during the owner's window no paid model is reached for at all.
         if budget.paid_would_help():
-            alt = paid_stand_in(c, model)
+            alt = route_to_paid(c, role, worker, model, why)
             if alt:
-                left = spend_left(c)
-                log(f"{role}: {why} — routing this turn to paid {alt}; its cost is booked from OpenRouter's reported charge"
-                    + (f" ({spend_phrase(c)})" if left is not None else ""), worker)
-                journal("paid_fallback", role=role, worker=worker, model=model, to=alt,
-                        recorded_spend_usd=round(spend_used(c), 6), spend_window=spend_window(c),
-                        charge_confirmed=False, reason=why)
-                model = _ran_on[worker] = alt
+                model = alt
                 break
         # The allowance can be hours from resetting; saying so once a quarter hour is enough,
         # and the worker records that it is waiting rather than working.
@@ -1340,6 +1360,9 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
 
     env = dict(os.environ)
     env["FLINT_MAX_STEPS"] = str(max_steps)
+    # The suite the model is told to leave passing takes 105s in the studio, and flint's bash
+    # tool cut off at 120s — 15 seconds from killing the run it was asked to make.
+    env["FLINT_BASH_TIMEOUT"] = str(int(c.get("test_timeout", 900)))
     if role not in READ_ONLY_ROLES:
         # This role's product is a diff, so flint offers it one edit-only round before the
         # tool-free one and applies edits it writes as reply text. Without that, a turn spent
@@ -1506,8 +1529,10 @@ do it and test it. Creativity that serves the goal is rewarded; scope creep
 and churn are not.
 
 Rules that are not negotiable:
-- The command `{test_cmd}` must exit zero when you are finished. Run it
-  yourself and keep working until it does.
+- Your change must leave `{test_cmd}` passing. While you work, run the narrowest
+  test that covers what you changed — the context pack above names the module,
+  e.g. `python3 -m unittest tests.test_table_games -q`. The supervisor runs the
+  whole command afterwards, so you do not have to.
 - Do not delete, skip, relax or weaken any existing test to get a green run.
   If an existing test is genuinely wrong, leave it failing and say so.
 - Add tests that prove the new behavior, including at least one edge case.
@@ -1646,6 +1671,34 @@ Output ONLY a JSON array, no prose around it:
 
 
 # ------------------------------------------------------------------ gate
+
+def baseline_key(c, commit):
+    """What a cached baseline pass is a pass *of*: this commit and these exact commands."""
+    parts = [str(commit), c.get("test_cmd", ""), *(c.get("validation_commands") or [])]
+    return hashlib.sha1("\n".join(parts).encode()).hexdigest()
+
+
+def baseline_cache(key, passed=None, ttl=86_400):
+    """Read or record that trunk at this commit passed its own gate.
+
+    Every attempt ran the full suite before the model started, and the studio's suite takes 105
+    seconds. Nothing about trunk changed between one attempt and the next, so most of those runs
+    proved the same thing over again."""
+    path = STATE / "baseline.json"
+    if passed is None:
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if row.get("key") != key or not row.get("passed"):
+            return None
+        return row if time.time() - row.get("at", 0) < ttl else None
+    row = {"key": key, "passed": bool(passed), "at": time.time()}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(row))
+    tmp.replace(path)
+    return row
+
 
 def run_gate(cwd, c):
     cmd = sandboxed(c["test_cmd"], cwd, c)
@@ -2129,7 +2182,17 @@ class Worker(threading.Thread):
         self.evidence.write("contract.json", self.contract)
         self.evidence.record("baseline", strategy=strategy, base_commit=self.review_base)
         info["strategy"] = strategy
-        ok, output = self.gate("baseline")
+        # Trunk at this commit either passed its own gate recently or it did not; running the
+        # suite again proves the same thing and costs the studio 105 seconds per attempt.
+        key = baseline_key(c, self.review_base)
+        cached = baseline_cache(key, ttl=c.get("baseline_ttl", 86_400))
+        if cached:
+            ok, output = True, f"baseline: cached pass for {self.review_base[:12]}"
+            self.evidence.record("baseline_cached", base_commit=self.review_base,
+                                 at=cached["at"], key=key)
+        else:
+            ok, output = self.gate("baseline")
+            baseline_cache(key, passed=ok)
         _, dirty = git(["status", "--porcelain"], cwd=wd, check=True)
         if not ok or dirty:
             return "baseline", "baseline tests failed or changed tracked/unignored files; no model calls spent:\n" + output, info

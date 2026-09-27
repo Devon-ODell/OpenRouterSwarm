@@ -206,7 +206,13 @@ def search(pattern, path=".", glob=None):
     return "\n".join(lines[:200]) + extra
 
 
-def bash(command, timeout=120):
+BASH_TIMEOUT = int(os.environ.get("FLINT_BASH_TIMEOUT", "120"))
+
+
+def bash(command, timeout=None):
+    """Run a shell command. The default timeout is FLINT_BASH_TIMEOUT, which a swarm sets to
+    its own test timeout: the suite it asks the model to run can take longer than 120s."""
+    timeout = BASH_TIMEOUT if timeout is None else timeout
     shell = os.environ.get("SHELL") or "/bin/sh"
     env = None
     if os.environ.get("FLINT_HEADLESS"):
@@ -271,7 +277,8 @@ TOOL_SCHEMAS = [
     _schema("bash", "Run a shell command in the project directory. Each call is a fresh shell, "
                     "so chain with && if you need cd. Use for tests, git, builds, installs.",
             {"command": {"type": "string"},
-             "timeout": {"type": "integer", "description": "seconds (default 120)"}}, ["command"]),
+             "timeout": {"type": "integer",
+                         "description": f"seconds (default {BASH_TIMEOUT})"}}, ["command"]),
     _schema("study", "Search the local study corpus (MIT OCW lecture cards, slides, notes, problem sets "
                      "and transcripts on deep learning and machine learning, probability, matrix calculus, discrete math and combinatorics, algorithms and Python, mathematical finance, fintech, blockchain, risk and decision analysis, venture finance, microeconomics, game theory, public finance, perception and psychology, math for computer science, cryptography (interactive proofs, SNARGs), poker strategy, semiconductor microfabrication, game design; plus past code reviews) for techniques "
                      "and reference material. Hits under flint/cards/ name the course and lecture; follow "
