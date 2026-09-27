@@ -400,3 +400,22 @@ class BridgeSurfaceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NowPhaseTests(NowTests):
+    """`doing` is "<role> with <model>" during a turn and plain prose between turns."""
+
+    def test_a_turn_reports_its_role_and_model(self):
+        row = swarmd.write_now([self.worker(doing="implementer with qwen/qwen3-coder")])["workers"][0]
+        self.assertEqual((row["role"], row["model"]), ("implementer", "qwen/qwen3-coder"))
+
+    def test_the_gate_is_not_reported_as_a_model(self):
+        row = swarmd.write_now([self.worker(doing="running the tests (baseline)")])["workers"][0]
+        self.assertEqual(row["role"], "running the tests (baseline)")
+        self.assertIsNone(row["model"], "the phase was being shown as the model's name")
+
+    def test_a_paid_stand_in_is_the_model_that_actually_ran(self):
+        swarmd._ran_on["w0"] = "qwen/qwen3-coder"
+        self.addCleanup(swarmd._ran_on.clear)
+        row = swarmd.write_now([self.worker(doing="implementer with a:free")])["workers"][0]
+        self.assertEqual(row["model"], "qwen/qwen3-coder")

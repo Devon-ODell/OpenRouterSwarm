@@ -2287,10 +2287,14 @@ def write_now(workers, c=None):
         if not (task and since and w.is_alive()):
             continue
         rounds = turn_round(w.name)
+        # `doing` is "<role> with <model>" during a turn, but plain prose between turns
+        # ("running the tests (baseline)"). Splitting on the separator only when it is there
+        # keeps the gate from being reported as the name of the model.
+        role, _, model = (getattr(w, "doing", "") or "").partition(" with ")
         rows.append({
             "worker": w.name, "task": task.get("id"), "title": str(task.get("title", ""))[:120],
-            "role": (getattr(w, "doing", "") or "").split(" with ")[0] or None,
-            "model": _ran_on.get(w.name) or (getattr(w, "doing", "") or "").split(" with ")[-1],
+            "role": role or None,
+            "model": _ran_on.get(w.name) or model or None,
             "round": rounds and rounds[0], "rounds": rounds and rounds[1],
             "since": since, "seconds": round(time.time() - since),
             "waiting": _waiting.get(w.name), "doing": getattr(w, "doing", None)})
