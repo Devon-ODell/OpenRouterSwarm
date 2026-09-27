@@ -45,7 +45,11 @@ LOGS.mkdir(exist_ok=True)
 
 DEFAULT_MODEL = "inclusionai/ling-3.0-flash-fin:free"
 KINDS = ("feature", "bugfix", "test", "refactor")
-META = ("persona", "planner_model", "priority", "depth", "parent", "origin", "acceptance", "depends_on", "root", "strategy", "execution_class")
+META = ("persona", "planner_model", "priority", "depth", "parent", "origin", "acceptance",
+        "depends_on", "root", "strategy", "execution_class", "allow_test_changes")
+# Only a person may authorise a task to change existing tests. A planner or decomposer that
+# could set this on its own subtasks would have found the way to make any red suite green.
+TEST_CHANGE_ORIGINS = frozenset({"human", "cursor"})
 READ_ONLY_ROLES = {"planner", "architect", "judge", "decomposer", "adversary"}
 MAX_ATTEMPTS = 2
 SECRET_ENV = re.compile(r"API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL", re.I)
@@ -532,6 +536,10 @@ class Queue:
             t.update({k: meta[k] for k in META if meta.get(k) is not None})
             if t.get("execution_class", "standard") not in ("standard", "fast"):
                 raise ValueError("execution_class must be standard or fast")
+            if t.get("allow_test_changes"):
+                if t.get("origin") not in TEST_CHANGE_ORIGINS:
+                    raise ValueError("only a person can allow a task to change existing tests")
+                t["allow_test_changes"] = True
             criteria(t)
             known = {r["id"]: r for r in history}
             dependencies = t.get("depends_on", [])
@@ -737,7 +745,8 @@ class Queue:
             _write(self.path, kept)
             return [r for r in rows if r["id"] not in keep], kept
 
-    def edit(self, tid, title=None, detail=None, kind=None, priority=None, acceptance=None):
+    def edit(self, tid, title=None, detail=None, kind=None, priority=None, acceptance=None,
+             allow_test_changes=None):
         """Rewrite a pending task in place, keeping its id, its dependencies and its history.
         Only the fields given change. A task being worked on right now is refused: the worker
         already has the old wording. Editing clears a retry backoff, since the point of fixing
@@ -772,6 +781,11 @@ class Queue:
                 new["acceptance"] = [a.strip() for a in acceptance if a and a.strip()] or None
                 if new["acceptance"] is None:
                     del new["acceptance"]
+            if allow_test_changes is not None:
+                # Editing the queue is something only a person does, so this is theirs to set.
+                new["allow_test_changes"] = bool(allow_test_changes)
+                if not new["allow_test_changes"]:
+                    del new["allow_test_changes"]
             criteria(new)                      # refuses an unusable acceptance list before it lands
             new.pop("not_before", None)
             _write(self.path, [new if r["id"] == tid else r for r in rows])
@@ -1561,18 +1575,127 @@ def run_gate(cwd, c):
     return rc == 0, out[-4000:]
 
 
-def weakened_tests(diff):
-    """Heuristic: did the diff strip assertions out of existing test files?"""
-    removed, in_test = 0, False
+ASSERT_CALL = re.compile(
+    r"\b(assert\w*(?:\.\w+)*|expect|require|should\w*|t\.(?:Error|Fatal)f?)\b")
+# Directory names too common to identify anything: "games" is not what "games/reversi" means.
+GENERIC_DIR = frozenset({"", ".", "/", "src", "lib", "app", "test", "tests", "spec", "specs",
+                         "games", "site", "docs", "scripts", "static", "public", "assets"})
+
+
+def assert_counts(lines):
+    """How many times each assertion function is called across these lines."""
+    counts = {}
+    for line in lines:
+        for m in ASSERT_CALL.finditer(line):
+            counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+    return counts
+
+
+def identifiers(path):
+    """The names that stand for this path in code: the path, its directory, and their names."""
+    p = Path(path)
+    out = {str(path), p.name, p.stem}
+    parent = p.parent
+    if str(parent) not in GENERIC_DIR:
+        out |= {str(parent), parent.name}
+    return {x for x in out if x and x not in GENERIC_DIR}
+
+
+def deleted_paths(diff):
+    """Every name that identifies something this diff deletes."""
+    out, pending = set(), None
     for line in diff.splitlines():
-        if line.startswith("+++ ") or line.startswith("--- "):
-            low = line.lower()
-            in_test = any(m in low for m in ("test", "spec_", "_spec"))
-        elif in_test and line.startswith("-") and not line.startswith("---"):
-            if any(m in line for m in ("assert", "require", "expect", "t.Error",
-                                       "t.Fatal", "should")):
-                removed += 1
-    return removed
+        if line.startswith("diff --git "):
+            pending = line.split(" b/", 1)[-1].strip()
+        elif line.startswith("deleted file mode") and pending:
+            out |= identifiers(pending)
+            pending = None
+    return out
+
+
+def test_hunks(diff):
+    """[(path, deleted, [hunk lines])] for the test files this diff touches."""
+    files, path, deleted, is_test, hunks = [], None, False, False, None
+
+    def close():
+        if is_test and path:
+            files.append((path, deleted, hunks))
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            close()
+            path = line.split(" b/", 1)[-1].strip()
+            low = path.lower()
+            is_test = any(m in low for m in ("test", "spec_", "_spec"))
+            deleted, hunks = False, []
+        elif line.startswith("deleted file mode"):
+            deleted = True
+        elif line.startswith("@@") and is_test:
+            hunks.append([])
+        elif is_test and hunks and line[:1] in ("+", "-", " "):
+            hunks[-1].append(line)
+    close()
+    return files
+
+
+def names_deleted(line, gone):
+    """True when this line refers to something the diff deletes.
+
+    A test that loads games/star-catcher/game.js writes it as
+    path.join(__dirname, '..', 'games', 'star-catcher', 'game.js'), so the slug is what can be
+    matched, not the joined path."""
+    return any(re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", line) for name in gone)
+
+
+def names_its_source(test_path, gone):
+    """True when a deleted test file is named after something else the diff deletes.
+
+    tests/test_reversi.py deleted alongside games/reversi/ is one removal, not a weakening;
+    tests/test_core.py deleted while the code stays is the clearest weakening there is."""
+    stem = Path(test_path).stem.lower()
+    return any(len(name) >= 3 and name.lower() in stem for name in gone)
+
+
+def weakened_tests(diff, allow_test_changes=False):
+    """Assertions this diff took out of test files that are still meant to exist.
+
+    The old check counted every removed line containing "assert" under any path containing
+    "test". All four hits across 189 studio attempts were legitimate, and this check carries the
+    heaviest penalty in the ledger (weight 6) and hangs the model on the rafters, so a false
+    positive punishes a model for doing what the owner asked:
+
+      - two attempts deleted games/reversi/ and games/star-catcher/ and the assertions that
+        loaded them, which is what "remove star catcher and reversi" means;
+      - one was the owner's own removal request, again;
+      - one changed `assert.equal(b[112], 3)` to `assert.equal(b[80], 3)` — an assertion edited
+        to match an 8x15 board, not an assertion removed.
+
+    So: count per assertion function, treat a removal paired with an addition of the same
+    function in the same hunk as an edit, skip hunks that remove code for files the diff deletes,
+    and skip a test file deleted alongside the source it tested.
+    """
+    if allow_test_changes:
+        return 0                       # the owner authorised this; the adversary is told so
+    total, all_gone = 0, deleted_paths(diff)
+    for path, deleted, hunks in test_hunks(diff):
+        # A file cannot be its own deleted source, or every deleted test file would excuse itself.
+        gone = all_gone - identifiers(path)
+        if deleted:
+            if names_its_source(path, gone):
+                continue               # the test went with the code it tested
+            # A test file deleted while the code it tests stays is the plainest weakening there
+            # is, so every assertion it took with it counts.
+            for lines in hunks:
+                total += sum(assert_counts([l[1:] for l in lines if l.startswith("-")]).values())
+            continue
+        for lines in hunks:
+            minus = [l[1:] for l in lines if l.startswith("-")]
+            plus = [l[1:] for l in lines if l.startswith("+")]
+            if gone and any(names_deleted(l, gone) for l in minus):
+                continue               # this hunk removes the use of something that is gone
+            back = assert_counts(plus)
+            for name, n in assert_counts(minus).items():
+                total += max(0, n - back.get(name, 0))
+    return total
 
 
 def last_error(output):
@@ -1888,10 +2011,13 @@ class Worker(threading.Thread):
         _, diff = git(["diff", "--cached", "--unified=3", self.review_base], cwd=self.wt, check=True)
         return tree, diff
 
-    def review(self, tree, diff, tests, model, avoid=()):
+    def review(self, tree, diff, tests, model, avoid=(), allow_test_changes=False):
         self.evidence.record("reviewing", reviewed_tree=tree, reviewer=model)
+        note = ("\nThe owner authorised test changes for this task; check that the changes to "
+                "existing tests match what was asked, and reject them if they do not.\n"
+                if allow_test_changes else "")
         prompt = REVIEW.format(contract=json.dumps(self.contract, indent=2), tree=tree,
-                               tests=tests, diff=diff[:self.c.get("max_diff", 24000)])
+                               tests=tests, diff=diff[:self.c.get("max_diff", 24000)]) + note
         try:
             raw = self.call("adversary", prompt, self.wt, self.c["steps"]["adversary"], model, avoid)
             review = parse_review(raw, tree, self.contract["acceptance"])
@@ -1991,8 +2117,12 @@ class Worker(threading.Thread):
                 how = (f"{tried} edit call(s) changed nothing" if tried
                        else "the turn never reached an edit")
                 return stage, f"no implementation changes: {how}; evidence: {self.evidence.path}", info
-            if weakened_tests(diff):
-                return "weakened_tests", "existing assertions removed; manual review required", info
+            allowed = bool(task.get("allow_test_changes"))
+            lost = weakened_tests(diff, allow_test_changes=allowed)
+            if lost:
+                return ("weakened_tests",
+                        f"{lost} existing assertion(s) removed with nothing in their place; "
+                        "manual review required", info)
             ok, tests = self.gate(f"candidate-{cycle}")
             after, _ = self.snapshot()
             if after != tree:
@@ -2000,7 +2130,7 @@ class Worker(threading.Thread):
             review = None
             if ok:
                 try:
-                    review = self.review(tree, diff, tests, adv, avoid={impl})
+                    review = self.review(tree, diff, tests, adv, avoid={impl}, allow_test_changes=allowed)
                 except (ModelError, StepLimit) as exc:
                     info["reviewer"] = self.last_model or adv   # the model that failed to deliver
                     return "review_error", str(exc), info
@@ -2068,7 +2198,8 @@ class Worker(threading.Thread):
                 tree, diff = self.snapshot()
                 ok, output = self.gate("rebased")
                 after, _ = self.snapshot()
-                if not ok or after != tree or weakened_tests(diff):
+                if not ok or after != tree or weakened_tests(
+                        diff, allow_test_changes=bool(self.task.get("allow_test_changes"))):
                     return False, "rebased candidate failed verification or changed during tests"
                 review = self.review(tree, diff, output, self._review_model, avoid={self._author})
                 if review["verdict"] != "approve":
@@ -3039,7 +3170,8 @@ def cmd_add(a):
         depends = q.resolve(a.depends_on) if a.depends_on else None
         t = q.add(a.title, a.detail or "", a.kind, priority=a.priority, origin="human",
                   acceptance=a.acceptance or None, depends_on=depends,
-                  execution_class=getattr(a, "execution_class", "standard"))
+                  execution_class=getattr(a, "execution_class", "standard"),
+                  allow_test_changes=getattr(a, "allow_test_changes", False) or None)
     except ValueError as e:
         sys.exit(f"not queued: {e}")
     if not t:
@@ -3116,6 +3248,9 @@ def main():
                    help="one thing the reviewer must verify; repeat for each (default: the detail)")
     p.add_argument("--depends-on", action="append", metavar="TITLE_OR_ID", dest="depends_on",
                    help="a task that must finish first, by exact title or id; repeat for each")
+    p.add_argument("--allow-test-changes", action="store_true", dest="allow_test_changes",
+                   help="this task may change or delete existing tests (e.g. removing a game "
+                        "and its tests). Only you can set this; the adversary is told.")
     p.set_defaults(fn=cmd_add)
     p2 = sub.add_parser("plan")
     p2.add_argument("-n", type=int, default=5)

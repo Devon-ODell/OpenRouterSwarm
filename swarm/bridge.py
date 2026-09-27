@@ -12,6 +12,7 @@ Every command prints JSON. `ask` streams one JSON object per line as models fini
     bridge.py queue-get    --repo PATH --id ID
     bridge.py queue-edit   --repo PATH --id ID [--title T] [--detail D] [--kind K]
                            [--priority N] [--acceptance TEXT ...]
+                           [--allow-test-changes | --no-allow-test-changes]
     bridge.py queue-remove --repo PATH --id ID [--cascade]
     bridge.py queue-clear  --repo PATH [--include-claimed]
     bridge.py study    --query Q [-k 6]
@@ -461,6 +462,8 @@ def queue_row(t, rows, full=False):
            "created": t.get("created", 0), "depth": t.get("depth", 0),
            "acceptance": [x for x in (t.get("acceptance") or []) if isinstance(x, str)],
            "depends_on": t.get("depends_on", []),
+           "allow_test_changes": bool(t.get("allow_test_changes")),
+           "harness_failures": t.get("harness_failures", 0),
            "blocks": [{"id": r["id"], "title": r["title"]} for r in swarmd.Queue.blocked_by(t["id"], rows)],
            "note": (t.get("notes") or [t.get("note")] or [None])[-1]}
     row["detail"] = detail if full else detail[:400]
@@ -490,7 +493,7 @@ def cmd_queue_edit(a):
     c, q = _queue(a.repo)
     try:
         t = q.edit(a.id, title=a.title, detail=a.detail, kind=a.kind, priority=a.priority,
-                   acceptance=a.acceptance)
+                   acceptance=a.acceptance, allow_test_changes=a.allow_test_changes)
     except KeyError:
         emit({"ok": False, "error": f"no queued task with id {a.id}"})
         return 2
@@ -817,6 +820,12 @@ def main(argv=None):
             s.add_argument("--priority", type=int, choices=(0, 1, 2))
             s.add_argument("--acceptance", action="append",
                            help="one acceptance criterion; repeat for several")
+            # Editing the queue is a person's doing, so this is theirs to grant or take back.
+            s.add_argument("--allow-test-changes", dest="allow_test_changes",
+                           action="store_true", default=None,
+                           help="let this task change or delete existing tests")
+            s.add_argument("--no-allow-test-changes", dest="allow_test_changes",
+                           action="store_false", help="take that permission back")
         if name == "queue-remove":
             s.add_argument("--cascade", action="store_true",
                            help="also remove the queued tasks that depend on this one")

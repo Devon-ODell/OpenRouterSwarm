@@ -1,0 +1,12 @@
+diff --git a/tests/test_core.py b/tests/test_core.py
+deleted file mode 100644
+index 1111111..0000000
+--- a/tests/test_core.py
++++ /dev/null
+@@ -1,6 +0,0 @@
+-import unittest
+-
+-
+-class CoreTests(unittest.TestCase):
+-    def test_pagination(self):
+-        self.assertEqual(len(paginate(items, 10)), 10)

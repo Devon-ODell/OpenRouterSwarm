@@ -55,7 +55,13 @@ edits the current directory directly. The swarm never edits your checkout.
    words of the task, and then only that lecture's own pages, never a
    transcript. `inject_corpus: false` keeps excerpts out of a repository's
    prompts altogether; either way every role can still call the `study` tool.
-4. **Gate**: the test command must pass and no existing assertion may be removed.
+4. **Gate**: the test command must pass, and no existing assertion may be lost.
+   Lost, not touched: an assertion removed and the same assertion function added
+   back in the same hunk is an edit, assertions removed alongside the code they
+   tested go with it, and a test file deleted with its subject is one removal.
+   A task may be allowed to change tests outright — `swarm add
+   --allow-test-changes`, or the panel's edit form — which only a person can
+   set, and which the adversary is told about.
 5. **Adversary**: a different model tries to break the change and must end
    with exactly `APPROVE: …`. A rejection leaves its failing test on the branch.
 6. **Land** on trunk by fast-forward, rebasing and re-testing first if trunk
