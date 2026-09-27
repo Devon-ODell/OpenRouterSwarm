@@ -247,16 +247,34 @@ class SourceChangeTests(unittest.TestCase):
                 self.assertFalse(swarmd.restart_into_new_code(["half.py"]))
             execve.assert_not_called()
 
-    def test_a_restart_replaces_this_process_with_the_same_command(self):
+    def restart(self):
         with patch.object(swarmd, "source_compiles", return_value=(True, "")), \
              patch.object(swarmd, "shutdown"), patch.object(swarmd, "log"), \
              patch.object(swarmd, "journal"), patch.object(swarmd, "STATE", Path(tempfile.mkdtemp())), \
              patch.object(swarmd.os, "execve") as execve:
-            swarmd.restart_into_new_code(["swarmd.py"], hours=8)
-        argv = execve.call_args.args[1]
+            swarmd.restart_into_new_code(["swarmd.py"])
+        return execve.call_args.args
+
+    def test_a_restart_replaces_this_process_with_the_same_command(self):
+        _, argv, _ = self.restart()
         self.assertEqual(argv[0], sys.executable)
         self.assertEqual(argv[1:], sys.argv)
-        self.assertIn("FLINT_RUN_DEADLINE", execve.call_args.args[2])
+
+    def test_the_end_of_the_shift_is_inherited_exactly_not_recomputed(self):
+        """A restart used to set the deadline to `hours` from *itself*, so each one pushed the
+        end of the shift forward by however long the run had already lasted. Seen live: an
+        8-hour shift started at 09:03 restarted at 09:14 and moved its end from 17:03 to 17:14.
+        """
+        ends_at = str(time.time() + 3600)
+        with patch.dict(os.environ, {"FLINT_RUN_DEADLINE": ends_at}):
+            _, _, env = self.restart()
+        self.assertEqual(env["FLINT_RUN_DEADLINE"], ends_at)
+
+    def test_a_shift_with_no_deadline_gains_none_from_restarting(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLINT_RUN_DEADLINE", None)
+            _, _, env = self.restart()
+        self.assertNotIn("FLINT_RUN_DEADLINE", env)
 
 
 class ShiftDeadlineTests(unittest.TestCase):
@@ -279,6 +297,18 @@ class ShiftDeadlineTests(unittest.TestCase):
     def test_a_shift_that_is_already_over_says_so(self):
         with patch.dict(os.environ, {"FLINT_RUN_DEADLINE": str(time.time() - 60)}):
             self.assertIsNone(swarmd.hours_left(8))
+
+    def test_the_first_start_fixes_when_the_shift_ends(self):
+        with patch.dict(os.environ, {}, clear=False), \
+             patch.object(swarmd, "run_daemon"), patch.object(swarmd, "preflight"), \
+             patch.object(swarmd, "read_goal", return_value="g"), patch.object(swarmd, "log"), \
+             tempfile.TemporaryDirectory() as d, patch.object(swarmd, "STATE", Path(d)):
+            os.environ.pop("FLINT_RUN_DEADLINE", None)
+            self.addCleanup(swarmd._stop.clear)
+            self.addCleanup(os.environ.pop, "FLINT_RUN_DEADLINE", None)
+            swarmd.start({"repo": ".", "workers": 1}, hours=8)
+            self.assertAlmostEqual(float(os.environ["FLINT_RUN_DEADLINE"]),
+                                   time.time() + 8 * 3600, delta=30)
 
     def test_a_restarted_daemon_past_its_deadline_does_not_start(self):
         with patch.dict(os.environ, {"FLINT_RUN_DEADLINE": str(time.time() - 60)}), \

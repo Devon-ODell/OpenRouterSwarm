@@ -597,7 +597,7 @@ def source_compiles():
     return True, ""
 
 
-def restart_into_new_code(changed, hours=None):
+def restart_into_new_code(changed):
     """Replace this process with the same command on the new code. Never returns if it works.
 
     execv keeps the pid, so the daemon.pid note and anything watching it stay correct, and
@@ -615,12 +615,11 @@ def restart_into_new_code(changed, hours=None):
     shutdown()                                  # kill anything still running before we go
     for path in (STATE / "now.json",):
         path.unlink(missing_ok=True)
-    env = dict(os.environ)
-    if hours:
-        # The shift ends when it was always going to end, not `hours` from this restart.
-        env["FLINT_RUN_DEADLINE"] = str(time.time() + hours * 3600)
+    # FLINT_RUN_DEADLINE is already in this process's environment, fixed when the shift began,
+    # and is inherited unchanged. Recomputing it here from the hours remaining is what made a
+    # restart walk the end of the shift forward by however long the run had lasted.
     try:
-        os.execve(sys.executable, [sys.executable, *sys.argv], env)
+        os.execve(sys.executable, [sys.executable, *sys.argv], dict(os.environ))
     except OSError as e:                        # nothing was lost; carry on as we are
         log(f"could not restart into the new code: {e}")
         journal("self_restart_failed", changed=changed, error=str(e)[:200])
@@ -3685,6 +3684,10 @@ def start(c, hours=None, max_tasks=None, awake=False):
         log("the shift this daemon was restarted into is already over; not starting")
         return
     hours = hours_left(hours)
+    if hours and not os.environ.get("FLINT_RUN_DEADLINE"):
+        # Fix the end of the shift now, once. Every later restart inherits this exact time, so
+        # a run that restarts ten times still ends when the first start said it would.
+        os.environ["FLINT_RUN_DEADLINE"] = str(time.time() + hours * 3600)
     with open(STATE / "daemon.lock", "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -3761,7 +3764,7 @@ def run_daemon(c, max_tasks=None, hours=None):
                     w.join()
                 if restart_for:
                     # Everything is finished and nothing is running: the only safe moment.
-                    restart_into_new_code(restart_for, hours=hours)
+                    restart_into_new_code(restart_for)
                     restart_for = []          # it refused; carry on with the code we have
                     tally.drain.clear()
                     workers = [Worker(i, c, q, budget, stop, ledger, tally)
