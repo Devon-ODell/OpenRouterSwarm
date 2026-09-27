@@ -71,7 +71,14 @@ edits the current directory directly. The swarm never edits your checkout.
 6. **Land** on trunk by fast-forward, rebasing and re-testing first if trunk
    moved. Trunk is never moved while it is checked out anywhere.
 7. **Judge**: a third model scores impact, creativity and quality (0–10),
-   names one lesson and up to two follow-ups.
+   names one lesson and up to two follow-ups. If the goal ranks its work under a
+   heading saying `Work on now` or `Priorities`, the judge is shown that list and
+   says which item the change served; what the change earned above the landing
+   floor is then scaled by its place in it (1.0, 0.85, 0.6, 0.5, and 0.35 for
+   serving nothing on the list). The planner is held to the same list: a task
+   must say which priority it `serves`, tasks serving none are dropped, and at
+   least half of each batch must serve the first. A goal that ranks nothing
+   leaves all of this switched off.
 8. **Reinforce**: the reward updates the implementer model, the planner model
    and the planner persona that proposed the task.
 

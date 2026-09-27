@@ -47,7 +47,7 @@ LOGS.mkdir(exist_ok=True)
 DEFAULT_MODEL = "inclusionai/ling-3.0-flash-fin:free"
 KINDS = ("feature", "bugfix", "test", "refactor")
 META = ("persona", "planner_model", "priority", "depth", "parent", "origin", "acceptance",
-        "depends_on", "root", "strategy", "execution_class", "allow_test_changes")
+        "depends_on", "root", "strategy", "execution_class", "allow_test_changes", "serves")
 # Only a person may authorise a task to change existing tests. A planner or decomposer that
 # could set this on its own subtasks would have found the way to make any red suite green.
 TEST_CHANGE_ORIGINS = frozenset({"human", "cursor"})
@@ -425,6 +425,53 @@ def can_take_a_turn(c, budget):
 
 def trunk_name(c):
     return c.get("trunk", "swarm/trunk")
+
+
+# A goal file's ordered priorities, when it has any. The heading has to say so: a "Legacy
+# backlog (reference, not the next dispatch order)" is exactly what this must not read as a
+# priority list.
+PRIORITY_HEADING = re.compile(r"^#{1,6}\s*.*(?:work on now|priorities).*$", re.I | re.M)
+NUMBERED = re.compile(r"^\s{0,3}(\d+)[.)]\s+(.*)$")
+# How much of a landed change's reward its place in that list is worth. The judge gave 0.94 to
+# a thumbnail validator and 0.97 to a configurable word list while the four deep games GOAL.md
+# puts first landed nothing, and those rewards are what trained the planner toward tooling.
+GOAL_ITEM_WEIGHT = {1: 1.0, 2: 0.85, 3: 0.6, 4: 0.5, 0: 0.35}
+
+
+def goal_items(goal_text):
+    """The numbered priorities under the goal's own "work on now" heading, in order.
+
+    Empty when the goal does not rank anything, and then nothing downstream changes: no task is
+    dropped for serving no item and no reward is scaled. A goal that does not say what comes
+    first cannot be used to say a change came second."""
+    m = PRIORITY_HEADING.search(goal_text or "")
+    if not m:
+        return []
+    items, seen = [], set()
+    for line in (goal_text[m.end():]).splitlines():
+        if line.startswith("#"):
+            break                       # the next heading ends the list
+        row = NUMBERED.match(line)
+        if row:
+            n = int(row.group(1))
+            if n in seen:
+                break                   # a second list under the same heading
+            seen.add(n)
+            items.append(re.sub(r"\*\*|`", "", row.group(2)).strip()[:200])
+    return items
+
+
+def goal_item_weight(n, items):
+    """What a landed change's place in the priority list multiplies its reward by."""
+    if not items:
+        return 1.0
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 0
+    if not 1 <= n <= len(items):
+        n = 0
+    return GOAL_ITEM_WEIGHT.get(n, 0.5 if n else GOAL_ITEM_WEIGHT[0])
 
 
 def read_goal(c):
@@ -1582,7 +1629,7 @@ it so the swarm learns which agents and ideas to reinforce.
 
 PROJECT GOAL
 {goal}
-
+{priorities}
 TASK
 {title}
 {detail}
@@ -1608,13 +1655,21 @@ working in this repository (advice, not a summary of this change). Suggest up to
 two follow-up tasks this change makes possible, with acceptance criteria.
 
 You may read files to check your judgement. Output ONLY this JSON:
-{{"impact": 0, "creativity": 0, "quality": 0, "breakthrough": false, "why": "one sentence", "lesson": "one sentence", "follow_ups": [{{"title": "...", "detail": "..."}}]}}"""
+{{"impact": 0, "creativity": 0, "quality": 0, "goal_item": 0, "breakthrough": false, "why": "one sentence", "lesson": "one sentence", "follow_ups": [{{"title": "...", "detail": "..."}}]}}"""
+
+PRIORITIES = """
+THE GOAL'S ORDERED PRIORITIES — 1 is what matters most:
+{items}
+Set "goal_item" to the number of the priority this change serves, or 0 if it
+serves none of them. Judge honestly: useful work that serves nothing on this
+list is still 0.
+"""
 
 PLANNER = """You are the PLANNER for an autonomous engineering swarm that works around the clock.
 
 PROJECT GOAL
 {goal}
-
+{priorities}
 YOUR STANCE THIS ROUND: {persona_name}
 {persona}
 
@@ -1642,9 +1697,15 @@ Rules:
 - Tasks run one after another on top of accepted work, but each must be
   valuable and testable on its own.
 - Nothing that needs credentials, live trading, or network access to real services.
-
+{serves_rule}
 Output ONLY a JSON array, no prose around it:
-[{{"title": "...", "detail": "...", "kind": "feature|bugfix|test|refactor"}}]"""
+[{{"title": "...", "detail": "...", "kind": "feature|bugfix|test|refactor"{serves_field}}}]"""
+
+PLANNER_SERVES = """- Every task must serve one of the goal's numbered priorities, and say which in
+  "serves". A task that serves none of them will be dropped. At least half of
+  this batch must serve priority 1: that is what the goal says matters most, and
+  it is where nothing has landed.
+"""
 
 DECOMPOSER = """You are the DECOMPOSER in an engineering swarm. This task timed out or failed repeatedly.
 Split it into 2 or 3 smaller tasks that together achieve it, each small enough
@@ -2103,6 +2164,7 @@ class Worker(threading.Thread):
                 log(f"learning update failed; task outcome retained: {exc}", self.name)
             # One row per attempt that spent model calls: the MIT experiment's raw data.
             journal("attempt", id=task["id"], title=task["title"], stage=self.stage,
+                    goal_item=info.get("goal_item"),
                     failure_class=None if self.stage == "accepted" else self.failure_class,
                     edit_calls=info.get("edit_calls"),
                     mit=info.get("mit"), injected=info.get("mit_injected", False),
@@ -2364,9 +2426,13 @@ class Worker(threading.Thread):
         return False, "trunk kept moving; retained candidate for a later attempt"
 
     def judge(self, task, goal, diff, verdict, model, avoid=()):
+        items = goal_items(goal)
+        priorities = PRIORITIES.format(
+            items="\n".join(f"{i}. {t}" for i, t in enumerate(items, 1))) if items else ""
         try:
             out = self.call("judge", JUDGE.format(
-                goal=goal, title=task["title"], detail=task["detail"], verdict=verdict,
+                goal=goal, priorities=priorities, title=task["title"],
+                detail=task["detail"], verdict=verdict,
                 diff=diff[:self.c.get("max_diff", 24000)]),
                 self.wt, self.c["steps"].get("judge", 4), model, avoid)
         except Exception as e:  # the change already landed; never lose it to a judge failure
@@ -2394,7 +2460,10 @@ class Worker(threading.Thread):
             # A reviewer that cannot deliver a verdict wastes the implementer's work.
             L.update("implementer", info["reviewer"], 0.0, weight=PENALTY_WEIGHT["model_error"])
             log(f"reviewer {info['reviewer']} failed to deliver a verdict; penalised", self.name)
-        r = reward(stage, scores, nov, repairs=info.get("repairs", 0))
+        items = goal_items(read_goal(self.c))
+        info["goal_item"] = int((scores or {}).get("goal_item") or 0) if items else None
+        r = reward(stage, scores, nov, repairs=info.get("repairs", 0),
+                   goal_weight=goal_item_weight(info["goal_item"], items))
         if r is None:
             return
         # Only the author of faulty code pays the penalty weight; the planner whose
@@ -2430,6 +2499,7 @@ class Worker(threading.Thread):
         info["reward"] = r
         journal("reward", id=task["id"], title=task["title"], stage=stage, reward=r, weight=w,
                 novelty=nov, implementer=impl, persona=task.get("persona"),
+                goal_item=info.get("goal_item"),
                 scores={k: v for k, v in (scores or {}).items() if k != "follow_ups"},
                 breakthrough=breakthrough)
         log(f"{task['id']}: {stage}, reward {r:.2f}{' ★ BREAKTHROUGH' if breakthrough else ''}", self.name)
@@ -2639,6 +2709,32 @@ class Worker(threading.Thread):
 
 # ------------------------------------------------------------------ planning
 
+def serving_the_goal(tasks, items):
+    """(tasks to queue, how many were dropped) for one planner batch.
+
+    The judge rewarded a thumbnail validator 0.94 and a configurable word list 0.97 while the
+    four deep games the goal puts first landed nothing, and those rewards are what taught the
+    planner to keep proposing tooling. With no ranked priorities nothing is dropped: a goal that
+    does not say what comes first cannot say a task serves nothing."""
+    if not items:
+        return tasks, 0
+
+    def serves(t):
+        try:
+            n = int(t.get("serves"))
+        except (TypeError, ValueError):
+            return 0
+        return n if 1 <= n <= len(items) else 0
+    on_goal = [t for t in tasks if serves(t)]
+    first = [t for t in on_goal if serves(t) == 1]
+    # Half the batch has to be the first priority, so the rest is capped by how much of it
+    # there is. No first-priority task means no batch: the planner is asked again, on another
+    # model, rather than filling the queue with fifth things.
+    rest = [t for t in on_goal if serves(t) != 1][:len(first)]
+    kept = [t for t in tasks if t in first or t in rest]
+    return kept, len(tasks) - len(kept)
+
+
 def plan(c, q, budget, n=6, ledger=None):
     ledger = ledger or Ledger(STATE / "learn.json")
     ensure_trunk(c)
@@ -2648,6 +2744,10 @@ def plan(c, q, budget, n=6, ledger=None):
     if model is None:
         log(f"planner: {all_resting(ledger, c)}; will retry")
         return 0
+    items = goal_items(goal)
+    priorities = PRIORITIES.format(
+        items="\n".join(f"{i}. {t}" for i, t in enumerate(items, 1))) if items else ""
+    serves_rule = PLANNER_SERVES if items else ""
     base, t = c.get("base_branch", "main"), trunk_name(c)
     _, landed = git(["log", "--format=- %s", "-n", "25", f"{base}..{t}"], cwd=c["repo"])
     landed = landed.replace("- swarm: ", "- ") or "- (nothing yet)"
@@ -2659,7 +2759,9 @@ def plan(c, q, budget, n=6, ledger=None):
         view = refresh_view(c)
         try:
             out = flint(PLANNER.format(
-                goal=goal, persona_name=persona, persona=persona_text(persona, c), landed=landed,
+                goal=goal, priorities=priorities, serves_rule=serves_rule,
+                serves_field=', "serves": 1' if items else "",
+                persona_name=persona, persona=persona_text(persona, c), landed=landed,
                 breakthroughs=brk, playbook=format_playbook(*ledger.playbook()),
                 corpus=study(f"{goal[:600]} {persona}", c, k=3), seen=seen, n=n,
                 test_cmd=c["test_cmd"], steps=max(2, c["steps"]["planner"] - 3)),
@@ -2671,16 +2773,20 @@ def plan(c, q, budget, n=6, ledger=None):
     if tasks is None:
         ledger.update("planner", model, 0.0)
         raise ModelError(f"planner {model} returned no JSON task list")
+    tasks = [t for t in tasks[:n] if isinstance(t, dict) and isinstance(t.get("title"), str)
+             and isinstance(t.get("detail", ""), str) and t.get("kind", "feature") in KINDS]
+    kept, dropped = serving_the_goal(tasks, items)
     added = 0
-    for task in tasks[:n]:
-        if (isinstance(task, dict) and isinstance(task.get("title"), str)
-                and isinstance(task.get("detail", ""), str)
-                and task.get("kind", "feature") in KINDS
-                and q.add(task["title"], task.get("detail", ""), task.get("kind", "feature"),
-                          persona=persona, planner_model=model, origin="plan")):
+    for task in kept:
+        if q.add(task["title"], task.get("detail", ""), task.get("kind", "feature"),
+                 persona=persona, planner_model=model, origin="plan",
+                 serves=task.get("serves") if items else None):
             added += 1
+    if dropped:
+        log(f"planner: dropped {dropped} task(s) that did not serve the goal's priorities")
     log(f"planner queued {added} task(s)")
-    journal("plan", added=added, persona=persona, model=model)
+    journal("plan", added=added, dropped=dropped, persona=persona, model=model,
+            priorities=len(items))
     return added
 
 

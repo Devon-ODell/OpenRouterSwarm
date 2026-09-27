@@ -94,18 +94,22 @@ def novelty(text, prior_texts):
     return round(1.0 - max((similarity(text, p) for p in prior_texts), default=0.0), 3)
 
 
-def reward(stage, scores=None, nov=0.0, repairs=0):
+def reward(stage, scores=None, nov=0.0, repairs=0, goal_weight=1.0):
     """Reward in [0, 1], or None when the outcome says nothing about the implementer.
 
     Any accepted change earns at least 0.4, above every failure. The judge's
     scores spread accepted work over 0.4–1.0; each repair round the change
-    needed first costs 0.1 (never below 0.4); novelty adds up to 0.1."""
+    needed first costs 0.1 (never below 0.4); novelty adds up to 0.1.
+
+    `goal_weight` scales what the change *earned* above that floor, by where the goal ranks
+    what it served. Landing something is always worth 0.4 — the floor is the invariant above,
+    and a landed change must never be worth less than a failure — but landing the fourth
+    priority is worth much less than landing the first."""
     if stage != "accepted":
         return STAGE_REWARD.get(stage)
-    if scores:
-        base = 0.4 + 0.6 * sum(w * clamp(scores.get(k, 5), 0, 10) for k, w in WEIGHTS.items()) / 10
-    else:
-        base = 0.6
+    earned = (0.6 * sum(w * clamp(scores.get(k, 5), 0, 10) for k, w in WEIGHTS.items()) / 10
+              if scores else 0.2)
+    base = 0.4 + earned * clamp(goal_weight, 0.0, 1.0)
     base = max(0.4, base - REPAIR_COST * max(0, repairs or 0))
     return round(min(1.0, base + 0.1 * clamp(nov, 0.0, 1.0)), 4)
 
@@ -209,6 +213,10 @@ def parse_scores(text):
         except (TypeError, ValueError):
             return None
     out["breakthrough"] = d.get("breakthrough") is True
+    try:                                   # which of the goal's priorities this served, or 0
+        out["goal_item"] = max(0, int(d.get("goal_item", 0)))
+    except (TypeError, ValueError):
+        out["goal_item"] = 0
     out["why"] = str(d.get("why", ""))[:300]
     out["lesson"] = str(d.get("lesson", ""))[:300]
     out["follow_ups"] = [
