@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -622,3 +623,160 @@ class StandInAttributionTests(unittest.TestCase):
                 swarmd.flint("p", self.dir.name, self.c, "implementer", "w0", None, 5,
                              "qwen/qwen3.8-27b:free")
         self.assertNotIn("w0", swarmd._ran_on)
+
+
+class AllowanceRecheckTests(unittest.TestCase):
+    """`allowance_recheck`: while the free allowance looks spent, ask OpenRouter whether it is.
+
+    The local count only climbs until UTC midnight and counts requests OpenRouter never
+    charged, so on 2026-09-26 it read 1025/1000 while OpenRouter reported 964, and every turn
+    for hours went to a paid model. OpenRouter's count is the one that decides."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        root = Path(self.dir.name)
+        for name in ("flint", "state", "logs"):
+            (root / name).mkdir()
+        self.requests = root / "flint" / "requests.json"
+        budget_module = sys.modules[swarmd.Budget.__module__]
+        for target, name, value in ((flint, "STATE_DIR", root / "flint"),
+                                    (budget_module, "REQUESTS_JSON", self.requests),
+                                    (swarmd, "STATE", root / "state"), (swarmd, "LOGS", root / "logs")):
+            pt = patch.object(target, name, value)
+            pt.start()
+            self.addCleanup(pt.stop)
+        self.logged = []
+        for name, value in (("log", lambda msg, *a, **k: self.logged.append(msg)),
+                            ("_rechecked", {"at": 0.0, "said": False})):
+            pt = patch.object(swarmd, name, value)
+            pt.start()
+            self.addCleanup(pt.stop)
+        swarmd._stop.clear()
+        self.asked = 0
+        self.reply = None
+        pt = patch.object(swarmd, "account", self.fake_account)
+        pt.start()
+        self.addCleanup(pt.stop)
+        self.c = {"allowance_recheck": 300, "allow_paid": True, "daily_usd": 1.0,
+                  "python": sys.executable, "models": ["dots-studio/dots-3-note-preview:free"],
+                  "paid_models": ["poolside/laguna-s-2.1"], "test_cmd": "true"}
+        self.budget = swarmd.Budget(cap=1000, reserve=0, owner_window=["00:00", "00:00"])
+
+    def fake_account(self):
+        self.asked += 1
+        return self.reply
+
+    def counted(self, count, **extra):
+        self.requests.write_text(json.dumps({"day": UTC_TODAY, "count": count, **extra}))
+
+    def openrouter(self, used, limit=1000):
+        self.reply = {"free_model_daily_requests": {"used": used, "limit": limit,
+                                                    "remaining": max(0, limit - used)}}
+
+    def state(self):
+        return json.loads(self.requests.read_text())
+
+    def test_a_lower_count_from_openrouter_brings_free_turns_back(self):
+        self.counted(1025)
+        self.openrouter(964)
+        self.assertFalse(self.budget.check()[0])
+        self.assertTrue(swarmd.recheck_allowance(self.c, self.budget))
+        self.assertEqual(self.state()["count"], 964)
+        self.assertTrue(self.budget.check()[0])
+        rows = [json.loads(l) for l in (swarmd.STATE / "journal.jsonl").read_text().splitlines()]
+        self.assertEqual([(r["used"], r["counted"]) for r in rows if r["event"] == "allowance_restored"],
+                         [(964, 1025)])
+
+    def test_a_daily_cap_block_openrouter_no_longer_backs_is_lifted(self):
+        self.counted(40, blocked_until=time.time() + 6 * 3600)
+        self.openrouter(40)
+        self.assertTrue(swarmd.recheck_allowance(self.c, self.budget))
+        self.assertNotIn("blocked_until", self.state())
+        self.assertTrue(self.budget.check()[0])
+
+    def test_a_spent_allowance_stays_spent_and_says_so_once(self):
+        until = time.time() + 6 * 3600
+        self.counted(1000, blocked_until=until)
+        self.openrouter(1000)
+        self.assertFalse(swarmd.recheck_allowance(self.c, self.budget))
+        self.assertEqual(self.state()["blocked_until"], until)
+        self.assertFalse(self.budget.check()[0])
+        swarmd._rechecked["at"] = 0.0            # the next check is due
+        self.assertFalse(swarmd.recheck_allowance(self.c, self.budget))
+        self.assertEqual(self.asked, 2)
+        self.assertEqual(sum("allowance spent" in m for m in self.logged), 1)
+
+    def test_openrouter_is_asked_no_more_often_than_the_setting(self):
+        self.counted(1000)
+        self.openrouter(1000)
+        for _ in range(5):
+            swarmd.recheck_allowance(self.c, self.budget)
+        self.assertEqual(self.asked, 1)
+        swarmd._rechecked["at"] = time.time() - 301
+        self.openrouter(990)
+        self.assertTrue(swarmd.recheck_allowance(self.c, self.budget))
+        self.assertEqual(self.asked, 2)
+
+    def test_unset_or_zero_never_asks(self):
+        self.counted(1025)
+        self.openrouter(0)
+        for c in ({}, {"allowance_recheck": 0}, {"allowance_recheck": "soon"}):
+            self.assertEqual(swarmd.allowance_recheck(c), 0)
+            self.assertFalse(swarmd.recheck_allowance(c, self.budget))
+        self.assertEqual(self.asked, 0)
+        self.assertEqual(self.state()["count"], 1025)
+
+    def test_nothing_is_asked_while_free_requests_remain(self):
+        self.counted(10)
+        self.openrouter(10)
+        self.assertFalse(swarmd.recheck_allowance(self.c, self.budget))
+        self.assertEqual(self.asked, 0)
+
+    def test_the_owner_window_is_not_a_shortage_to_recheck(self):
+        budget = swarmd.Budget(cap=1000, reserve=0, owner_window=["00:00", "23:59"])
+        self.counted(1025)
+        self.openrouter(0)
+        self.assertFalse(swarmd.recheck_allowance(self.c, budget))
+        self.assertEqual(self.asked, 0)
+
+    def test_an_unreachable_openrouter_changes_nothing(self):
+        self.counted(1025)
+        self.reply = None
+        self.assertFalse(swarmd.recheck_allowance(self.c, self.budget))
+        self.assertEqual(self.state()["count"], 1025)
+
+    def test_the_reserve_still_holds_after_a_recheck(self):
+        budget = swarmd.Budget(cap=1000, reserve=100, owner_window=["00:00", "00:00"])
+        self.counted(1000)
+        self.openrouter(950)
+        self.assertFalse(swarmd.recheck_allowance(self.c, budget))
+        self.assertEqual(self.state()["count"], 950)
+        self.assertFalse(budget.check()[0], "950 of 900 usable is still spent")
+
+    def test_a_turn_runs_free_instead_of_paid_once_the_recheck_restores_the_allowance(self):
+        self.counted(1025)
+        self.openrouter(964)
+        cmds = []
+
+        class FakeProc:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "done", ""
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def fake_process(cmd, **kw):
+            cmds.append(cmd)
+            yield FakeProc()
+
+        with patch.object(swarmd, "process", fake_process), \
+                patch.object(swarmd, "sandboxed", lambda cmd, cwd, c: cmd):
+            swarmd.flint("prompt", self.dir.name, self.c, "implementer", "w0",
+                         self.budget, 5, "dots-studio/dots-3-note-preview:free")
+        self.assertIn("dots-studio/dots-3-note-preview:free", cmds[0])
+        self.assertNotIn("poolside/laguna-s-2.1", cmds[0])
+        rows = [json.loads(l) for l in (swarmd.STATE / "journal.jsonl").read_text().splitlines()]
+        self.assertEqual([r for r in rows if r["event"] == "paid_fallback"], [])

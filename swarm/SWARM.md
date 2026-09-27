@@ -211,6 +211,15 @@ dollars and only reachable from the extension.
 pool. One worker usually spends the day's allowance, so more workers finish
 sooner, not more; they also land in parallel and conflict more.
 
+`allowance_recheck` (seconds; 300 in the template, off when unset or 0) asks
+OpenRouter again while the allowance looks spent. The local count only climbs
+until midnight and includes requests OpenRouter never charged, so it can read
+1025/1000 while OpenRouter reports 964; with a paid fallback, every turn in
+between is paid for. When OpenRouter reports requests left, the swarm takes
+its count, lifts a daily-cap block it no longer backs, logs `free allowance is
+back`, journals `allowance_restored` and runs the next turn free. It checks at
+startup too, so a counter left over from before a restart is settled first.
+
 `owner_window` (disabled by default) pauses the swarm during set local hours.
 
 ## Safety

@@ -57,6 +57,7 @@
     "share_on": 0.5
   },
   "tick": 90,
+  "allowance_recheck": 300,
   "plan_batch": 5,
   "plan_cooldown": 600,
   "turn_timeout": 1800,

@@ -66,6 +66,8 @@ _held = {}            # worker -> when it last said it was waiting for the allow
 _waiting = {}         # worker -> why it is not working, or absent while it is
 _ran_on = {}          # worker -> the model its last turn actually ran on, once a stand-in took it
 _active_turns = {}   # worker -> live role and actual routed model
+_recheck_lock = threading.Lock()
+_rechecked = {"at": 0.0, "said": False}   # last OpenRouter allowance check, and whether "still spent" was logged
 NO_CORPUS = os.path.join(os.devnull, "no-corpus.db")   # cannot exist: flint then hides `study`
 
 
@@ -851,6 +853,10 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         ok, wait, why = budget.check()
         if ok:
             break
+        # The local count only climbs until midnight. Before paying for this turn or waiting
+        # on it, ask OpenRouter whether the free requests are really gone.
+        if recheck_allowance(c, budget):
+            continue
         # Free capacity is gone. If this swarm has a dollar budget left, the turn runs on a
         # paid model rather than idling until midnight; `paid_stand_in` returns None once the
         # budget is spent, and during the owner's window no paid model is reached for at all.
@@ -1997,6 +2003,56 @@ def sync_usage(info):
         F.Throttle()._txn(lambda d: d.update(count=max(d.get("count", 0), used)))
 
 
+def allowance_recheck(c):
+    """Seconds between asking OpenRouter whether a spent free allowance is back; 0 or unset is off."""
+    try:
+        return max(0, int(c.get("allowance_recheck") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def recheck_allowance(c, budget):
+    """While the free allowance looks spent, ask OpenRouter whether it really is.
+
+    The local count only climbs between UTC midnights: flint counts every request it starts,
+    including failed ones OpenRouter never charged, and `sync_usage` keeps the larger of the
+    two counts. Once it passes the cap the swarm pays for, or idles through, every turn until
+    midnight, even while OpenRouter still has free requests for this key. At most every
+    `allowance_recheck` seconds this adopts OpenRouter's count instead and lifts a daily-cap
+    block OpenRouter no longer backs. True when free turns can run again."""
+    every = allowance_recheck(c)
+    if not every or not budget.paid_would_help():
+        return False            # off, within the allowance, or paused for the owner's window
+    with _recheck_lock:
+        if time.time() - _rechecked["at"] < every:
+            return False
+        _rechecked["at"] = time.time()
+        q = (account() or {}).get("free_model_daily_requests") or {}
+        used, limit = q.get("used"), q.get("limit")
+        if not isinstance(used, int) or not isinstance(limit, int):
+            return False
+        import flint as F
+
+        def adopt(d):
+            counted = d.get("count", 0)
+            d["count"] = used
+            if used < limit:
+                d.pop("blocked_until", None)
+            return counted
+        counted = F.Throttle()._txn(adopt)
+        if budget.check()[0]:
+            _rechecked["said"] = False
+            log(f"free allowance is back: OpenRouter reports {used}/{limit} used "
+                f"(counted {counted} here); free models again")
+            journal("allowance_restored", used=used, limit=limit, counted=counted)
+            return True
+        if not _rechecked["said"]:
+            _rechecked["said"] = True
+            log(f"free allowance spent: OpenRouter reports {used}/{limit} used; "
+                f"rechecking every {every / 60:g}m")
+        return False
+
+
 def free_tool_models():
     key = os.environ.get("OPENROUTER_API_KEY", "")
     sys.path.insert(0, str(ROOT))
@@ -2342,6 +2398,9 @@ def run_daemon(c, max_tasks=None):
     for model, until, why in ledger.resting():
         if model in live:
             log(f"{model} is resting until {dt.datetime.fromtimestamp(until):%H:%M:%S} ({why[:120]})")
+    # A count left over from before the restart can say the allowance is spent when
+    # OpenRouter says otherwise; settle that before the first turn is routed.
+    recheck_allowance(c, budget)
 
     workers = [Worker(i, c, q, budget, stop, ledger, tally) for i in range(c["workers"])]
     for w in workers:
@@ -2524,7 +2583,8 @@ def cmd_status(a):
                   "shared": monthly(c), "ledger": str(spend_file(c)),
                   "remaining_usd": (round(spend_left(c), 6) if spend_left(c) is not None else None),
                   "paid_fallback": paid_pool(c)},
-        "pacing": {"allowed_now": ok, "wait_s": round(wait), "reason": why},
+        "pacing": {"allowed_now": ok, "wait_s": round(wait), "reason": why,
+                   "allowance_recheck_s": allowance_recheck(c)},
         "queue": {"pending": len(pend),
                   "claimed": sum(1 for t in pend if t.get("claimed"))},
         "landed": sum(1 for t in done if t.get("status") == "done"),
