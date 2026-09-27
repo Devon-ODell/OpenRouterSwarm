@@ -92,10 +92,80 @@ def journal(event, **kw):
 EXAMPLE = HERE / "config.example.json"
 
 
-def load_cfg():
+def repo_slug(repo):
+    """The short, stable name a repository's state, logs, worktrees and config are filed under."""
+    repo = str(Path(repo).expanduser().resolve())
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", Path(repo).name) + "-" + \
+        hashlib.sha1(repo.encode()).hexdigest()[:6]
+
+
+def per_repo_config(repo):
+    """Where a repository's tuned config belongs, whether or not anyone has written one."""
+    return HERE / "configs" / f"{repo_slug(repo)}.json"
+
+
+def config_path_for(repo=None):
+    """Which config file governs `repo`: the environment's choice, then the repository's own
+    tuned file, then the default.
+
+    Tuned files in swarm/configs/ are the whole point of that folder, but only
+    start-studio-swarm.command used to find one, through FLINT_SWARM_CONFIG. Every other way in
+    — `swarm grind <repo>`, the bridge, the Cursor panel's Start button — read config.json and
+    ground a carefully tuned repository on default settings without saying so."""
+    env = os.environ.get("FLINT_SWARM_CONFIG")
+    if env:
+        return Path(env).expanduser()
+    if repo:
+        tuned = per_repo_config(repo)
+        if tuned.is_file():
+            return tuned
+    return HERE / "config.json"
+
+
+def config_kind(path=None):
+    """How to name the loaded config in a log line or the panel's badge."""
+    path = Path(path or CONFIG)
+    if path.parent == HERE / "configs":
+        return "per-repo"
+    return "environment" if os.environ.get("FLINT_SWARM_CONFIG") else "default"
+
+
+def use_config(repo):
+    """Point this process at the config that governs `repo`.
+
+    The path is a module global and never a key inside the file: the file holds values, and a
+    config copied from another checkout must not drag the old path along with it."""
+    global CONFIG
+    CONFIG = config_path_for(repo)
+    return CONFIG
+
+
+def warn_config_mismatch(repo, record=False):
+    """The tuned file that exists for `repo` but is not the one loaded, or None.
+
+    Silence here is what let the 11:32 run on 2026-09-26 grind the studio for 25 paid attempts
+    on the default pytest gate and the default paid fallback."""
+    if not repo:
+        return None
+    tuned = per_repo_config(repo)
+    if not tuned.is_file() or tuned.resolve() == Path(CONFIG).resolve():
+        return None
+    log(f"WARNING using {CONFIG} while {tuned.name} exists for this repo — its tuned settings "
+        f"are not in effect (FLINT_SWARM_CONFIG={tuned})")
+    if record:
+        journal("config_mismatch", loaded=str(CONFIG), tuned=str(tuned), repo=str(repo))
+    return tuned
+
+
+def load_cfg(repo=None):
     """The live config, seeded from the committed template the first time. config.json is not
     tracked: the swarm rewrites it on every run, and a tracked file it rewrites cannot be
-    updated with `git pull`."""
+    updated with `git pull`.
+
+    With `repo`, the path is resolved for that repository first, so a caller that knows which
+    repository it means gets that repository's tuned settings rather than the default ones."""
+    if repo:
+        use_config(repo)
     if not CONFIG.exists() and EXAMPLE.is_file() and CONFIG.parent == EXAMPLE.parent:
         CONFIG.write_text(EXAMPLE.read_text())
         log(f"created {CONFIG} from {EXAMPLE.name}")
@@ -103,6 +173,7 @@ def load_cfg():
 
 
 def save_cfg(c):
+    """Write back to whichever file this process loaded, per-repo file included."""
     tmp = CONFIG.with_suffix(".tmp")
     tmp.write_text(json.dumps(c, indent=2) + "\n")
     tmp.replace(CONFIG)
@@ -134,9 +205,7 @@ def python_for(c):
 def use_repo(c):
     """Queue, lessons, logs and worktrees are kept per target repository."""
     global STATE, LOGS, SLUG
-    repo = str(Path(c["repo"]).expanduser().resolve())
-    SLUG = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(repo).name) + "-" + \
-        hashlib.sha1(repo.encode()).hexdigest()[:6]
+    SLUG = repo_slug(c["repo"])
     STATE = HERE / "state" / SLUG
     LOGS = HERE / "logs" / SLUG
     STATE.mkdir(parents=True, exist_ok=True)
@@ -2392,6 +2461,7 @@ def run_daemon(c, max_tasks=None):
     ledger = Ledger(STATE / "learn.json")
     q.recover()
     log(f"swarm up — repo={repo.name} trunk={trunk_name(c)} workers={c['workers']}")
+    log(f"config: {CONFIG} ({config_kind()})")
     log(json.dumps(budget.snapshot()))
     # Rests persist in learn.json across runs; say so, or a fresh start looks stuck.
     live = set(pool(c))
@@ -2528,16 +2598,21 @@ def build_report(c, hours=24):
 def _setup(a=None):
     c = cfg()
     use_repo(c)
+    warn_config_mismatch(c["repo"], record=True)
     if a is not None and getattr(a, "workers", None):
         c["workers"] = a.workers
     return c
 
 
 def cmd_grind(a):
+    if a.repo:
+        # Before configure() reads or rewrites anything: this repository may have a tuned file.
+        use_config(a.repo)
     if a.new:
         if not a.goal:
             sys.exit("--new needs --goal describing the problem")
         repo = scaffold(a.new, a.goal)
+        use_config(repo)
         configure(repo, a.test_cmd or "python3 -m unittest discover -s tests -t . -q")
     elif a.repo:
         configure(a.repo, a.test_cmd)
@@ -2573,6 +2648,8 @@ def cmd_status(a):
     note = daemon_note()
     print(json.dumps({
         "repo": c["repo"], "trunk": trunk_name(c), "trunk_ahead": ahead,
+        "config_path": str(CONFIG), "config_kind": config_kind(),
+        "config_tuned_available": str(per_repo_config(c["repo"])) if per_repo_config(c["repo"]).is_file() else None,
         "daemon": {"running": bool(note),
                    "pid": note and note.get("pid"),
                    "since": note and dt.datetime.fromtimestamp(note["started"]).isoformat(timespec="seconds"),

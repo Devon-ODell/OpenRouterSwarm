@@ -16,6 +16,16 @@ Cursor extension pointed at this folder):
 on first use, rewritten on every run, and not tracked by Git, so pulling never
 fights with it. Delete it to start again from the template.
 
+A repository with settings worth keeping gets its own file:
+`swarm/configs/<slug>.json`, where the slug is the one its state and logs use
+(`swarm/state/<slug>/`) — `swarm status` prints it as `config_path`. Whenever a
+repository is named, that file is loaded in place of `config.json`, so `swarm
+grind <repo>`, the bridge, the Cursor panel's Start button and its status view
+all agree about which test command, model pool and cooldowns are in effect.
+`FLINT_SWARM_CONFIG` overrides both. When a tuned file exists but something
+else was loaded, the daemon logs a warning and journals `config_mismatch`
+rather than grinding quietly on the wrong settings.
+
 ```sh
 swarm grind ~/code/project --goal "what it should become"   # start nonstop
 swarm grind                                                 # resume the configured target

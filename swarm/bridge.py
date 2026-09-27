@@ -87,9 +87,12 @@ def _kill_children(*_):
 
 
 def config_for(repo=None):
-    """The swarm config, pointed at `repo` when given. Only the configured repo is ground by
-    a running daemon; other repos still get their own queue and state."""
-    c = swarmd.load_cfg()
+    """The swarm config for `repo` when given, else the default one. Only the configured repo is
+    ground by a running daemon; other repos still get their own queue and state.
+
+    A repository with a tuned file in swarm/configs/ gets that file's settings — its test
+    command, its pool, its cooldowns — so the panel and the daemon agree about what is running."""
+    c = swarmd.load_cfg(repo)
     c["python"] = swarmd.python_for(c)
     if repo:
         repo = str(Path(repo).expanduser().resolve())
@@ -420,6 +423,7 @@ def cmd_info(a):
         import corpus_index
         corpus = corpus_index.stats(db)
     out = {"root": str(ROOT), "python": sys.executable, "config": str(swarmd.CONFIG),
+           "config_kind": swarmd.config_kind(),
            "configured_repo": None if str(c.get("repo", "__")).startswith("__") else c.get("repo"),
            "models": swarmd.pool(c), "allow_paid": bool(c.get("allow_paid")), "corpus": corpus,
            "sandbox": sandbox.available(), "api_key": bool(os.environ.get("OPENROUTER_API_KEY")),
@@ -583,7 +587,10 @@ def cmd_status(a):
     exp = experiment.summary(swarmd.STATE / "journal.jsonl")
     budget = swarmd.Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                            owner_window=c.get("owner_window", ["00:00", "00:00"])).snapshot()
+    tuned = swarmd.per_repo_config(c["repo"])
     emit({"repo": c["repo"], "is_target": is_target(c["repo"]), "daemon_running": daemon_running(),
+          "config_path": str(swarmd.CONFIG), "config_kind": swarmd.config_kind(),
+          "config_tuned_available": str(tuned) if tuned.is_file() else None,
           "trunk": swarmd.trunk_name(c), "trunk_ahead": int(ahead) if str(ahead or "").isdigit() else None,
           "queue": [queue_row(t, pending) for t in pending],
           "max_queue": c.get("max_queue", 20),
@@ -647,14 +654,22 @@ def cmd_vote(a):
 
 
 def cmd_grind_cmd(a):
-    parts = [sys.executable, str(HERE / "swarmd.py"), "grind", str(Path(a.repo).expanduser().resolve())]
+    repo = str(Path(a.repo).expanduser().resolve())
+    parts = [sys.executable, str(HERE / "swarmd.py"), "grind", repo]
     if a.goal:
         parts += ["--goal", a.goal]
     if a.test_cmd:
         parts += ["--test-cmd", a.test_cmd]
     if a.hours:
         parts += ["--hours", str(a.hours)]
-    emit({"command": " ".join(shlex.quote(p) for p in parts)})
+    command = " ".join(shlex.quote(p) for p in parts)
+    # swarmd resolves this itself from the repo argument; naming it here makes the line the
+    # panel drops into a terminal say out loud which settings it is starting on.
+    tuned = swarmd.per_repo_config(repo)
+    config = str(swarmd.config_path_for(repo))
+    if tuned.is_file():
+        command = f"FLINT_SWARM_CONFIG={shlex.quote(str(tuned))} " + command
+    emit({"command": command, "config": config, "config_kind": swarmd.config_kind(config)})
     return 0
 
 
