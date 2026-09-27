@@ -31,7 +31,11 @@ def contract(task, goal, base, strategy):
     return {"task": task["id"], "title": task["title"], "goal": goal,
             "base_commit": base, "acceptance": criteria(task), "strategy": strategy,
             "parent": task.get("parent"), "root": task.get("root", task["id"]),
-            "depth": task.get("depth", 0), "depends_on": task.get("depends_on", [])}
+            "depth": task.get("depth", 0), "depends_on": task.get("depends_on", []),
+            "packet_id": task.get("packet_id"), "allowed_paths": task.get("allowed_paths", []),
+            "verification_commands": task.get("verification_commands", []),
+            "origin": task.get("origin"), "cycle_id": task.get("cycle_id"),
+            "evidence": task.get("evidence"), "benefit": task.get("benefit")}
 
 
 def review_object(text):

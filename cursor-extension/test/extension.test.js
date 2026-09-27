@@ -372,6 +372,29 @@ test('the HUD command is contributed with an icon and reaches the title bar', ()
   assert.ok(typeof registered['flintSwarm.showPanel'] === 'function');
 });
 
+test('scrum board and completed buttons dispatch distinct requests', () => {
+  const { handlers, sent } = panelHarness;
+  for (const id of ['board', 'completed']) {
+    sent.length = 0;
+    handlers['doc:click']({ target: { closest: (selector) => selector === '#' + id ? {} : null } });
+    assert.deepStrictEqual(sent, [{ type: id }]);
+  }
+});
+
+test('completed view excludes blocked tasks and escapes all evidence', () => {
+  const { html } = require(path.join(EXT, 'board-view.js'));
+  const data = { repo: '/r', as_of: 1, notice: '<unsafe>', stale_workers: [],
+    columns: ['Done', 'Blocked'], cards: [
+      { id: 't1', title: '<script>bad</script>', status: 'Done', reason: 'Passed',
+        commands: ['test'], files: ['x'], criteria: [{ text: '<criterion>' }] },
+      { id: 't2', title: 'unfinished', status: 'Blocked' }] };
+  const completed = html(data, true);
+  assert.ok(completed.includes('&lt;script&gt;') && completed.includes('&lt;criterion&gt;'));
+  assert.ok(!completed.includes('unfinished'));
+  assert.ok(completed.includes('Done (1)'));
+  assert.ok(html(data).includes('Blocked (1)'));
+});
+
 test('a real bridge call returns MIT hits with absolute paths', async () => {
   const db = (process.env.FLINT_CORPUS_DB || path.join(require('os').homedir(), '.flint', 'corpus.db'));
   if (!fs.existsSync(db)) { console.log('skip  (no study corpus at ' + db + ')'); return; }

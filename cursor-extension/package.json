@@ -2,7 +2,7 @@
   "name": "flint-swarm",
   "displayName": "Flint Swarm",
   "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers with a merged verdict, a queue you can edit, and MIT OpenCourseWare lookups.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "devon-odell",
   "license": "UNLICENSED",
   "private": true,
@@ -121,6 +121,18 @@
         "title": "Refresh Swarm Status",
         "category": "Flint Swarm",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "flintSwarm.showBoard",
+        "title": "Open Swarm Scrum Board",
+        "category": "Flint Swarm",
+        "icon": "$(project)"
+      },
+      {
+        "command": "flintSwarm.showCompleted",
+        "title": "Show Verified Completed Tasks",
+        "category": "Flint Swarm",
+        "icon": "$(checklist)"
       }
     ],
     "menus": {
@@ -153,6 +165,11 @@
           "command": "flintSwarm.refresh",
           "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
           "group": "navigation@2"
+        },
+        {
+          "command": "flintSwarm.showCompleted",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
+          "group": "navigation@3"
         }
       ]
     },

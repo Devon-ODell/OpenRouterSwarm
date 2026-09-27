@@ -39,6 +39,15 @@
         : '<span class="dim">○ No swarm is set up for this repository.</span>';
     }
     if (!now) return '<span class="ok">● Running</span> <span class="dim">· waiting for its first status line…</span>';
+    if (now.run && ['Blocked', 'Draining', 'Waiting'].includes(now.run.state)) {
+      const run = now.run;
+      const blocker = (run.blockers || [])[0];
+      return `<span class="warn">${R.esc(run.state)}</span> · ${R.esc(run.reason || '')}`
+        + (run.state === 'Blocked' && blocker ? `<br>Owner: ${R.esc(blocker.owner || 'repository owner')} · Next: ${R.esc(blocker.recovery_action || '')}` : '');
+    }
+    if (now.run && now.run.improvement && now.run.improvement.phase === 'discovering') {
+      return '<span class="ok">● Finding an improvement</span>';
+    }
     const w = (now.workers || [])[0];
     if (!w) {
       if (now.idle && now.back) return `<span class="warn">◐ ${R.esc(now.idle)}</span> · first back ${R.esc(atTime(now.back))}`;
@@ -56,22 +65,22 @@
       + ` · ${forHuman(w.seconds)}`;
   }
 
-  /** How the last 24 hours went. Red when almost nothing is landing. */
+  /** How the last 24 hours went. Red when few attempts accepted. */
   function healthLine() {
     const h = status && status.health;
     if (!h || !h.attempts) return '<span class="dim">No attempts in the last 24h.</span>';
     const rate = h.landed_rate == null ? '–' : `${Math.round(h.landed_rate * 100)}%`;
-    const bits = [`${h.attempts} attempts · <b>${h.landed} landed</b> (${rate})`];
+    const bits = [`${h.attempts} attempts · <b>${h.landed} accepted attempts</b> (${rate})`];
     if (h.failures && h.failures.length) {
       bits.push(h.failures.map(([k, n]) => `${R.esc(k)} ${n}`).join(' · '));
     }
     if (h.usd) {
       bits.push(`${money(h.usd)} spent`
-        + (h.usd_per_landed ? ` · ${money(h.usd_per_landed)} per landed commit` : ''));
+        + (h.usd_per_landed ? ` · ${money(h.usd_per_landed)} per accepted attempt` : ''));
     }
     const cls = h.unhealthy ? 'err' : 'dim';
     return `<span class="${cls}">24h: ${bits.join(' — ')}</span>`
-      + (h.unhealthy ? ' <span class="err">— almost nothing is landing</span>' : '');
+      + (h.unhealthy ? ' <span class="err">— few attempts accepted</span>' : '');
   }
 
   /** Which settings are in force. Red when the tuned file exists and was not loaded. */
@@ -90,8 +99,23 @@
     if (status) {
       const name = status.repo.split('/').pop();
       bits.push(nowLine());
+      const run = (status.now && status.now.run) || status.run;
+      if (run && run.id) {
+        const left = run.deadline ? Math.max(0, run.deadline - Date.now() / 1000) : null;
+        bits.push(`<span class="dim">Run ${R.esc(run.id.slice(0, 8))}`
+          + (left == null ? ' · no shift deadline' : ` · ${forHuman(left)} remaining`)
+          + (run.stop_reason ? ` · ${R.esc(run.stop_reason)}` : '') + '</span>');
+        bits.push(`<span class="dim">Last tool/check progress: ${run.last_progress_at ? forHuman(Date.now() / 1000 - run.last_progress_at) + ' ago' : 'not recorded'}`
+          + ` · Last accepted commit: ${run.last_accepted_commit ? R.esc(run.last_accepted_commit.slice(0, 8)) : 'none this run'}`
+          + ` · Blocked: ${forHuman(run.blocked_duration || run.blocked_seconds || 0)}</span>`);
+        const imp = run.improvement;
+        if (imp && imp.enabled) {
+          if (imp.selected) bits.push(`Improvement: ${R.esc(imp.selected.title)} · ${R.esc(imp.selected.benefit)}`);
+          if (imp.next_scan) bits.push(`Next discovery: ${R.esc(atTime(imp.next_scan))}`);
+        }
+      }
       bits.push(healthLine());
-      bits.push(`<b>${R.esc(name)}</b> · ${status.queue.length} queued · ${status.landed} landed`
+      bits.push(`<b>${R.esc(name)}</b> · ${status.queue.length} queued · ${status.landed} closed as done (unverified)`
         + (status.trunk_ahead ? ` · trunk +${status.trunk_ahead}` : ''));
       bits.push(configLine());
       const b = status.budget;
@@ -146,10 +170,12 @@
     $('stop').disabled = !running;
     $('drain').disabled = !running;
     $('restart').disabled = !running;
+    $('improveIdle').checked = !!(status && status.improvement && status.improvement.enabled);
+    $('improveIdle').disabled = !status;
     const recent = (status && status.recent) || [];
     const age = status && status.stale_seconds;
     const quiet = running && age != null
-      ? `<div class="quiet${age >= 600 ? ' warn' : ''}">quiet ${idleFor(age)}`
+      ? `<div class="quiet${age >= 600 ? ' warn' : ''}">last log write ${idleFor(age)} ago`
         + `<button class="icon" id="activity" title="Watch the activity log">log&nbsp;↗</button></div>`
       : '';
     $('recent').innerHTML = (recent.length
@@ -202,15 +228,16 @@
   function renderLanded() {
     const head = $('landedHead'), list = $('landedList');
     if (!landed) {
-      head.innerHTML = '<span class="dim">Loading what landed…</span>';
+      head.innerHTML = '<span class="dim">Loading integrated commits…</span>';
       list.innerHTML = '';
       return;
     }
     head.innerHTML = `<div class="qhead"><span>${landed.length} commit(s) on <b>`
       + `${R.esc(String(status && status.trunk || 'trunk'))}</b></span></div>`;
+    head.innerHTML += '<p class="dim">Integrated into swarm/trunk; this does not prove the full task is Done or deployed. Latest 20 commits.</p>';
     list.innerHTML = '';
     if (!landed.length) {
-      list.innerHTML = '<p class="dim">Nothing has landed yet.</p>';
+      list.innerHTML = '<p class="dim">No integrated commits found.</p>';
       return;
     }
     for (const cmt of landed) list.appendChild(landedRow(cmt));
@@ -432,6 +459,8 @@
   document.addEventListener('click', (e) => {
     const tabBtn = e.target.closest('.tab');
     if (tabBtn) { showTab(tabBtn.dataset.tab); return; }
+    if (e.target.closest('#board')) { vscode.postMessage({ type: 'board' }); return; }
+    if (e.target.closest('#completed')) { vscode.postMessage({ type: 'completed' }); return; }
     if (e.target.closest('#activity')) { vscode.postMessage({ type: 'activity' }); return; }
     if (e.target.closest('#budget')) { vscode.postMessage({ type: 'budget' }); return; }
     if (e.target.closest('#qclear')) {
@@ -525,6 +554,7 @@
   $('queue').addEventListener('click', () => vscode.postMessage({ type: 'queue', title: $('question').value.trim(), withCode: $('withCode').checked }));
   $('lookup').addEventListener('click', () => vscode.postMessage({ type: 'study', query: $('question').value.trim(), withCode: $('withCode').checked }));
   $('start').addEventListener('click', () => vscode.postMessage({ type: 'start' }));
+  $('improveIdle').addEventListener('change', () => vscode.postMessage({ type: 'improvement', repo: status && status.repo, enabled: $('improveIdle').checked }));
   $('drain').addEventListener('click', () => vscode.postMessage({ type: 'stop', repo: status && status.repo, drain: true }));
   $('restart').addEventListener('click', () => vscode.postMessage({ type: 'restart', repo: status && status.repo }));
   // Name the repository the panel is showing: stop means this swarm, not every swarm on the machine.

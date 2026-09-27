@@ -36,6 +36,7 @@ from learn import (Ledger, format_playbook, is_breakthrough, json_array,  # noqa
                    FAULTY, CRIME, BREAKTHROUGH_WEIGHT, PENALTY_WEIGHT)
 from workflow import Attempt, STRATEGIES, REVIEW, REPAIR, contract, criteria, parse_review, failure_signature  # noqa: E501
 import sandbox                          # noqa: E402
+import improvement                      # noqa: E402
 
 CONFIG = Path(os.environ.get("FLINT_SWARM_CONFIG") or HERE / "config.json").expanduser()
 STATE = HERE / "state"                  # per target repo once use_repo() runs
@@ -47,7 +48,9 @@ LOGS.mkdir(exist_ok=True)
 DEFAULT_MODEL = "inclusionai/ling-3.0-flash-fin:free"
 KINDS = ("feature", "bugfix", "test", "refactor")
 META = ("persona", "planner_model", "priority", "depth", "parent", "origin", "acceptance",
-        "depends_on", "root", "strategy", "execution_class", "allow_test_changes", "serves")
+        "depends_on", "root", "strategy", "execution_class", "allow_test_changes", "serves",
+        "packet_id", "allowed_paths", "verification_commands", "cycle_id", "proposal_id",
+        "evidence", "benefit", "baseline_commit", "effort_minutes", "recovery_action")
 # Only a person may authorise a task to change existing tests. A planner or decomposer that
 # could set this on its own subtasks would have found the way to make any red suite green.
 TEST_CHANGE_ORIGINS = frozenset({"human", "cursor"})
@@ -74,6 +77,9 @@ _waiting = {}         # worker -> why it is not working, or absent while it is
 _ran_on = {}          # worker -> the model its last turn actually ran on, once a stand-in took it
 _active_turns = {}   # worker -> live role and actual routed model
 _turn_logs = {}      # worker -> the log the live turn is writing, for its round counter
+_run = {}
+_run_lock = threading.RLock()
+_scheduler_drain = threading.Event()
 _recheck_lock = threading.Lock()
 _rechecked = {"at": 0.0, "said": False}   # last OpenRouter allowance check, and whether "still spent" was logged
 NO_CORPUS = os.path.join(os.devnull, "no-corpus.db")   # cannot exist: flint then hides `study`
@@ -91,7 +97,7 @@ def log(msg, worker="swarm"):
 
 def journal(event, **kw):
     rec = {"t": time.time(), "iso": dt.datetime.now().isoformat(timespec="seconds"),
-           "event": event, **kw}
+           "event": event, "run_id": _run.get("id"), **kw}
     with _journal_lock:
         with open(STATE / "journal.jsonl", "a") as f:
             f.write(json.dumps(rec) + "\n")
@@ -146,7 +152,8 @@ RELOADABLE = frozenset({
     "max_repairs", "reviewer_exclude", "plan_cooldown", "plan_batch", "allowance_recheck",
     "monthly_usd", "daily_usd", "spend_reset_day", "daily_cap", "reserve", "owner_window",
     "max_queue", "max_depth", "inject_corpus", "allow_paid", "study", "tick", "max_diff",
-    "validation_commands", "test_cmd", "keep_worktrees"})
+    "validation_commands", "test_cmd", "keep_worktrees", "improve_when_idle",
+    "improvement_paths", "improvement_timeout", "review_format_retries"})
 # Changing these under a running daemon would strand worktrees, state or threads.
 RESTART_ONLY = frozenset({"repo", "trunk", "workers", "sandbox_write", "base_branch", "python",
                           "goal_file", "roadmap_file"})
@@ -576,7 +583,11 @@ def describe_error(e):
 # the harness while it runs and it becomes half one version and half another: new flint against
 # old supervisor, with no sign of it in any log.
 def source_files():
-    return sorted({ROOT / "flint.py", ROOT / "nonstop.py", *(HERE.glob("*.py"))})
+    # Reporting/bridge additions must not restart a shift. Include the daemon's
+    # transitive local dependencies, including modules loaded by child turns.
+    return sorted({ROOT / "flint.py", ROOT / "nonstop.py", *(
+        HERE / name for name in ("swarmd.py", "budget.py", "learn.py", "workflow.py",
+                                "sandbox.py", "improvement.py", "mit_corpus.py", "wallet.py"))})
 
 
 def source_fingerprint():
@@ -650,6 +661,8 @@ def drain(tally, stop=True):
     model work went with them."""
     if stop:
         _drain_reason["stop_requested"] = True
+        _run["stop_reason"] = "Drain requested"
+    _scheduler_drain.set()
     if not tally.drain.is_set():
         tally.drain.set()
         log("draining: finishing the task(s) in flight, then "
@@ -871,15 +884,23 @@ class Queue:
                         f.write(json.dumps(r) + "\n")
             return [r["title"] for r in parked]
 
-    def claim(self):
+    def claim(self, eligible=None, improvements=True):
         with self.locked():
             rows, now = _read(self.path), time.time()
             complete = {r["id"] for r in _read(self.done) if r.get("status") == "done"}
             ready = [r for r in rows if not r.get("claimed") and r.get("not_before", 0) <= now
-                     and set(r.get("depends_on", [])).issubset(complete)]
+                     and not r.get("blocked_reason")
+                     and set(r.get("depends_on", [])).issubset(complete)
+                     and (improvements or r.get("origin") != "improvement")
+                     and (eligible is None or eligible(r))]
+            if any(r.get("claimed") and r.get("origin") == "improvement" for r in rows):
+                ready = [r for r in ready if r.get("origin") != "improvement"]
+            if any(r.get("origin") != "improvement" for r in rows):
+                ready = [r for r in ready if r.get("origin") != "improvement"]
             if not ready:
                 return None
-            task = max(ready, key=lambda r: (r.get("priority", 0), -r.get("created", 0)))
+            task = max(ready, key=lambda r: (r.get("origin") != "improvement",
+                                           r.get("priority", 0), -r.get("created", 0)))
             task["claimed"] = now
             _write(self.path, rows)
             return task
@@ -889,6 +910,7 @@ class Queue:
         with self.locked():
             complete = {r["id"] for r in _read(self.done) if r.get("status") == "done"}
             return [r for r in _read(self.path) if not r.get("claimed") and r.get("not_before", 0) <= now
+                    and not r.get("blocked_reason")
                     and set(r.get("depends_on", [])).issubset(complete)]
 
     MAX_HARNESS_FAILURES = 3
@@ -910,7 +932,7 @@ class Queue:
                 return None
             rows = [r for r in rows if r["id"] != tid]
             task.pop("claimed", None)
-            harness = not ok and not defer and failure_class == "harness"
+            harness = not ok and not defer and failure_class in ("harness", "review_format")
             task["attempts"] = task.get("attempts", 0) + (0 if defer or harness else 1)
             if not harness:
                 task["note"] = note[-800:]
@@ -1057,7 +1079,7 @@ class Queue:
             _write(self.path, rows)
             return task
 
-    def requeue(self, tid):
+    def requeue(self, tid, recovery_action=None):
         """Put a finished task — parked, split or done — back in the queue, fresh.
 
         A task parked for three harness failures was never shown to be wrong, so it comes back
@@ -1072,8 +1094,15 @@ class Queue:
                 raise ValueError("that task is already in the queue")
             if len(rows) >= self.max_queue:
                 raise ValueError("the queue is full")
-            task = dict(task, attempts=0, harness_failures=0, origin="human")
-            for key in ("status", "finished", "not_before", "claimed", "note", "harness_note"):
+            if not recovery_action or not recovery_action.strip():
+                raise ValueError("Record the scoped repair or decision that makes this retry useful.")
+            task = dict(task)
+            task["previous_outcomes"] = (task.get("previous_outcomes", []) + [
+                {k: task.get(k) for k in ("status", "finished", "note", "attempts", "harness_note")}])[-20:]
+            task["recovery_action"] = recovery_action.strip()
+            task["notes"] = (task.get("notes", []) + ["Recovery decision: " + recovery_action.strip()])[-3:]
+            task = dict(task, attempts=0, harness_failures=0)
+            for key in ("status", "finished", "not_before", "claimed", "note", "harness_note", "blocked_reason"):
                 task.pop(key, None)
             rows.append(task)
             _write(self.path, rows)
@@ -1225,6 +1254,8 @@ def failure_class(stage, note="", edited=None):
     harness  this swarm lost the turn: rounds, wall clock, a restart, a sandbox, a provider.
     """
     note = str(note or "")
+    if stage == "review_format_error":
+        return "review_format"
     if stage in TASK_STAGES:
         return "task"
     if stage in HARNESS_STAGES:
@@ -1535,6 +1566,10 @@ class ModelError(RuntimeError):
     """The model answered badly: malformed, empty or crashed turn."""
 
 
+class ReviewFormatError(ModelError):
+    """A bounded set of reviews failed schema validation on the same tree."""
+
+
 FAST_IMPLEMENTER = """Perform this small, fully specified edit.
 YOUR TASK: {title}
 PROJECT GOAL AND RULES
@@ -1659,6 +1694,10 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     while True:
         if _stop.is_set():
             raise Stopped("swarm is stopping")
+        if c.get("_discovery") and (_scheduler_drain.is_set() or not improve_enabled(c)):
+            raise Stopped("discovery stopped")
+        if c.get("_attempt_deadline") and time.time() >= c["_attempt_deadline"]:
+            raise AgentTimeout(role, model, 0, "attempt deadline")
         ok, wait, why = budget.check()
         if ok:
             # Starting is not finishing. 21 turns paused part-way on the budget (exit 6) and
@@ -1742,7 +1781,18 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
             with process(cmd, stdout=subprocess.PIPE, stderr=err,
                          text=True, env=env) as p:
                 try:
-                    out, _ = p.communicate(timeout=timeout)
+                    while True:
+                        if c.get("_discovery") and (_scheduler_drain.is_set() or not improve_enabled(c)):
+                            raise Stopped("discovery stopped")
+                        remaining = timeout - (time.time() - t0)
+                        if remaining <= 0:
+                            raise subprocess.TimeoutExpired(cmd, timeout)
+                        try:
+                            out, _ = p.communicate(timeout=min(2, remaining))
+                            break
+                        except subprocess.TimeoutExpired:
+                            if time.time() - t0 >= timeout:
+                                raise
                 except subprocess.TimeoutExpired:
                     kill_group(p)
                     out, _ = p.communicate()
@@ -1755,6 +1805,8 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         _active_turns.pop(worker, None)
         _turn_logs.pop(worker, None)
     progress = logfile.read_text(errors="replace")
+    if re.search(r"^tool: ", progress, re.M):
+        mark_progress(f"{role}: tool activity completed")
     studied = len(re.findall(r"^tool: study$", progress, re.M))
     count_study(worker, studied)
     count_edits(worker, len(re.findall(r"^tool: (?:edit_file|write_file)$", progress, re.M)))
@@ -2295,6 +2347,218 @@ def turn_round(worker):
     return (int(hits[-1][0]), int(hits[-1][1])) if hits else None
 
 
+def improve_settings(c):
+    saved = improvement.read(STATE / "improvement-settings.json")
+    return {"enabled": saved.get("enabled", c.get("improve_when_idle", False)) is True,
+            "paths": saved.get("paths", c.get("improvement_paths", []))}
+
+
+def improve_enabled(c):
+    return improve_settings(c)["enabled"]
+
+
+def mark_progress(reason):
+    with _run_lock:
+        _run["last_progress_at"] = time.time()
+        _run["last_progress"] = reason
+
+
+def begin_run(c):
+    run_id = os.environ.get("FLINT_RUN_ID") or uuid.uuid4().hex
+    os.environ["FLINT_RUN_ID"] = run_id
+    saved = improvement.read(STATE / "run.json")
+    with _run_lock:
+        _run.clear()
+        _run.update(saved if saved.get("id") == run_id else
+                    {"id": run_id, "started": time.time(), "blocked_seconds": 0})
+        _run.update(state="Running", stop_reason=None,
+                    deadline=float(os.environ["FLINT_RUN_DEADLINE"]) if os.environ.get("FLINT_RUN_DEADLINE") else None)
+        improvement.write(STATE / "run.json", _run)
+
+
+def assigned_blockers(c, q):
+    if c.get("roadmap_file"):
+        report = improvement.read(STATE / "roadmap-execution.json")
+        blockers = report.get("blockers", {})
+        if blockers:
+            return [dict(blockers[pid], id=pid) for pid in report.get("root_blockers", []) or blockers]
+    with q.locked():
+        pending, done = _read(q.path), _read(q.done)
+    pending_ids = {t["id"] for t in pending}
+    return [{"id": t["id"], "reason": t.get("blocked_reason") or t.get("note") or "Assigned task unfinished",
+             "owner": "repository owner", "recovery_action": "Resolve or explicitly cancel this task before discovery."}
+            for t in pending + done if t.get("origin") != "improvement"
+            and (t in pending or (t["id"] not in pending_ids and t.get("status") in ("parked", "split")
+                 and not (c.get("roadmap_file") and (t.get("packet_id") or t.get("title") in {
+                     p.get("title") for p in report.get("blockers", {}).values()}))))]
+
+
+_tool_observed = {}
+
+
+def run_snapshot(workers, c):
+    """Activity clocks are independent: a heartbeat is never evidence of progress."""
+    now = time.time()
+    for name, logfile in list(_turn_logs.items()):
+        try:
+            count = len(re.findall(r"^tool: ", Path(logfile).read_text(errors="replace"), re.M))
+        except OSError:
+            continue
+        key = str(logfile)
+        if count > _tool_observed.get(key, 0):
+            _tool_observed[key] = count
+            mark_progress(f"{name}: tool activity")
+    q = Queue()
+    pending = q.pending()
+    blocked = assigned_blockers(c, q)
+    cycles = improvement.read(STATE / "improvements.json")
+    if _stop.is_set():
+        state, reason = "Stopped", _run.get("stop_reason") or "Stop requested"
+    elif _scheduler_drain.is_set():
+        state, reason = "Draining", "Finishing current work before stopping or restarting"
+    elif workers:
+        state = "Waiting" if all(w.get("waiting") for w in workers) else "Running"
+        reason = workers[0].get("waiting") or workers[0].get("doing") or "Working"
+    elif cycles.get("phase") == "discovering":
+        state, reason = "Running", "Finding an improvement"
+    elif any(t.get("claimed") for t in pending):
+        state, reason = "Waiting", "Reconciling active attempts"
+    elif blocked and (not pending or not q.ready() or all(t.get("blocked_reason") for t in pending)):
+        state, reason = "Blocked", blocked[0]["reason"]
+    else:
+        state, reason = "Waiting", cycles.get("reason") or "Waiting for ready work"
+    with _run_lock:
+        was_blocked = _run.get("blocked_since")
+        if state == "Blocked":
+            _run.setdefault("blocked_since", now)
+        elif was_blocked:
+            _run["blocked_seconds"] = _run.get("blocked_seconds", 0) + now - was_blocked
+            _run.pop("blocked_since", None)
+        _run.update(state=state, reason=reason, heartbeat_at=now)
+        improvement.write(STATE / "run.json", _run)
+        result = dict(_run)
+    result.update(heartbeat_age=0, progress_age=now - result["last_progress_at"] if result.get("last_progress_at") else None,
+                  blocked_duration=result.get("blocked_seconds", 0) + (now - result["blocked_since"] if result.get("blocked_since") else 0),
+                  remaining_seconds=max(0, result["deadline"] - now) if result.get("deadline") else None,
+                  blockers=blocked, improvement={**improve_settings(c), "phase": cycles.get("phase"),
+                      "selected": cycles.get("selected"), "next_scan": cycles.get("next_scan"),
+                      "reason": cycles.get("reason"), "cycle_id": cycles.get("active_cycle")})
+    return result
+
+
+def discovery_allowed(c, q, budget):
+    if _stop.is_set() or _scheduler_drain.is_set() or not improve_enabled(c):
+        return False
+    if os.environ.get("FLINT_RUN_DEADLINE") and hours_left(None) is None:
+        return False
+    return not q.pending() and not assigned_blockers(c, q) and can_take_a_turn(c, budget)
+
+
+def discover_improvement(c, q, budget, ledger):
+    """One bounded cycle; called by one scheduler thread under a cross-process lock."""
+    with open(STATE / "improvement.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        data = improvement.read(STATE / "improvements.json")
+        # Reconcile the preceding cycle from durable queue results after a restart.
+        current = data.get("selected") or {}
+        if current.get("task_id"):
+            tid = current["task_id"]
+            if q.get(tid):
+                return
+            outcome = next((t for t in reversed(_read(q.done)) if t["id"] == tid), {})
+            accepted = outcome.get("status") == "done"
+            data["no_progress"] = 0 if accepted else data.get("no_progress", 0) + 1
+            disposition = "accepted" if accepted else "rejected"
+            data.setdefault("seen", {})[current["id"]] = {
+                "disposition": disposition, "evidence_key": current["evidence_key"],
+                "baseline_commit": current["baseline_commit"]}
+            data.setdefault("cycles", []).append({"id": data.get("active_cycle"), "task_id": tid,
+                "proposal_id": current["id"], "outcome": disposition, "finished": time.time()})
+            data["cycles"] = data["cycles"][-100:]
+            data["selected"] = None
+            data["phase"] = "waiting"
+            if data["no_progress"] >= 3:
+                data["next_scan"] = time.time() + 1800
+                data["reason"] = "Three cycles produced no accepted change; discovery cooldown"
+                data["no_progress"] = 0
+            improvement.write(STATE / "improvements.json", data)
+        if not discovery_allowed(c, q, budget):
+            return
+        _, baseline = git(["rev-parse", trunk_name(c)], cwd=c["repo"], check=True)
+        if data.get("next_scan", 0) > time.time() and data.get("baseline") == baseline:
+            return
+        try:
+            scope = improvement.paths(improve_settings(c)["paths"])
+        except ValueError as exc:
+            data.update(phase="waiting", reason=str(exc), next_scan=None)
+            improvement.write(STATE / "improvements.json", data)
+            return
+        model = ledger.pick("planner", pool(c, "planner"))
+        if model is None:
+            return
+        cycle = uuid.uuid4().hex
+        data.update(phase="discovering", active_cycle=cycle, baseline=baseline,
+                    reason="Finding an improvement", run_id=_run.get("id"), next_scan=None)
+        improvement.write(STATE / "improvements.json", data)
+        journal("improvement_discovery", cycle_id=cycle, baseline=baseline)
+        try:
+            with _view_lock:
+                view = refresh_view(c)
+                history = {"tasks": q.recent_titles(40), "proposals": data.get("backlog", []),
+                           "decisions": data.get("seen", {})}
+                prompt = improvement.PROMPT.format(goal=read_goal(dict(c, repo=str(view))),
+                    scope=json.dumps(scope), history=json.dumps(history)[-24000:])
+                config = dict(c, _discovery=True, allow_paid=False, study=False)
+                config["role_timeouts"] = dict(c.get("role_timeouts", {}), planner=300)
+                raw = flint(prompt, view, config, "planner", "discovery", budget,
+                            min(8, c["steps"].get("planner", 8)), model)
+            proposals = improvement.candidates(json_array(raw), scope, baseline)
+            seen = data.get("seen", {})
+            proposals = [p for p in proposals if p["id"] not in seen or (
+                seen[p["id"]].get("disposition") == "rejected"
+                and seen[p["id"]].get("evidence_key") != p["evidence_key"]
+                and seen[p["id"]].get("baseline_commit") != baseline)]
+            data["backlog"] = (proposals + data.get("backlog", []))[:20]
+            _, current_base = git(["rev-parse", trunk_name(c)], cwd=c["repo"], check=True)
+            if not discovery_allowed(c, q, budget) or current_base != baseline:
+                data.update(phase="waiting", reason="Assigned work, stop, or a changed baseline postponed discovery")
+                return
+            if proposals:
+                selected = proposals[0]
+                detail = (selected["problem"] + "\nEVIDENCE: " + selected["evidence"]
+                          + "\nBENEFIT: " + selected["benefit"] + "\nVERIFY: " + selected["verification"])
+                task = q.add(selected["title"], detail, "feature", origin="improvement", priority=-1,
+                    acceptance=selected["acceptance"], allowed_paths=selected["allowed_paths"],
+                    cycle_id=cycle, proposal_id=selected["id"], evidence=selected["evidence"],
+                    benefit=selected["benefit"], baseline_commit=baseline, effort_minutes=selected["effort_minutes"])
+                if task:
+                    data.update(selected=dict(selected, task_id=task["id"]), phase="queued",
+                                reason=selected["benefit"])
+                    journal("improvement_selected", cycle_id=cycle, id=task["id"], proposal_id=selected["id"])
+                    return
+            data["no_progress"] = data.get("no_progress", 0) + 1
+            data.update(phase="waiting", reason="Waiting — no supported improvement found")
+        except (Stopped, CapReached):
+            data.update(phase="waiting", reason="Discovery paused by stop, drain, or request allowance")
+        except Exception as exc:
+            data["no_progress"] = data.get("no_progress", 0) + 1
+            data.update(phase="waiting", reason=f"Discovery failed: {str(exc)[:200]}")
+            journal("improvement_discovery_error", cycle_id=cycle, error=str(exc)[:400])
+        finally:
+            if data.get("phase") != "queued":
+                cooldown = 1800 if data.get("no_progress", 0) >= 3 else 300
+                data["next_scan"] = time.time() + cooldown
+                if cooldown == 1800:
+                    data["no_progress"] = 0
+                data.setdefault("cycles", []).append({"id": cycle, "baseline": baseline,
+                    "outcome": data.get("reason"), "finished": time.time()})
+                data["cycles"] = data["cycles"][-100:]
+            improvement.write(STATE / "improvements.json", data)
+
+
 def write_now(workers, c=None):
     """What the swarm is doing, for the panel's first line.
 
@@ -2318,6 +2582,8 @@ def write_now(workers, c=None):
             "since": since, "seconds": round(time.time() - since),
             "waiting": _waiting.get(w.name), "doing": getattr(w, "doing", None)})
     note = {"at": time.time(), "workers": rows}
+    if c is not None:
+        note["run"] = run_snapshot(rows, c)
     if not rows and c is not None:
         ledger = Ledger(STATE / "learn.json")
         resting = ledger.resting()
@@ -2417,6 +2683,7 @@ def report_progress(workers, said, every=180):
     for w in workers:
         task, since = getattr(w, "task", None), getattr(w, "started", 0)
         if not (task and since and w.is_alive()):
+            said.pop(w.name, None)
             continue
         if now - said.get(w.name, since) > every:
             said[w.name] = now
@@ -2491,6 +2758,14 @@ class Worker(threading.Thread):
             self.evidence.record(role, role_calls=self.role_calls, active_model=model)
             self.evidence.write(f"prompt-{self.role_calls:02d}-{role}.txt", prompt)
         c = dict(self.c, study=False) if getattr(self, "mit", None) == "off" else self.c
+        deadline = getattr(self, "attempt_deadline", None)
+        if deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise AgentTimeout(role, model, 0, "attempt deadline")
+            c = dict(c, _attempt_deadline=deadline)
+            c["role_timeouts"] = dict(c.get("role_timeouts", {}),
+                                       **{role: min(turn_timeout(c, role), max(1, int(remaining)))})
         if getattr(self, "execution_class", "standard") == "fast":
             c = dict(c, study=False)
             if role in ("implementer", "repair"):
@@ -2591,6 +2866,8 @@ class Worker(threading.Thread):
     def do_task(self, task, goal):
         self.task, self.stage, self.wt = task, "error", None
         self.doing, self.started = "starting", time.time()
+        self.attempt_deadline = (self.started + min(1200, self.c.get("improvement_timeout", 1200))
+                                 if task.get("origin") == "improvement" else None)
         self.evidence, self.role_calls, self.gate_count = None, 0, 0
         self.mit = None
         self.agent_timed_out = False
@@ -2641,11 +2918,17 @@ class Worker(threading.Thread):
         """Run configured commands and retain supervisor-owned evidence."""
         self.gate_count += 1
         self.doing = f"running the tests ({label})"
-        commands = [self.c["test_cmd"], *self.c.get("validation_commands", [])]
+        commands = list(dict.fromkeys([self.c["test_cmd"], *self.c.get("validation_commands", []),
+                                       *self.task.get("verification_commands", [])]))
         evidence, passed = [], True
         for i, command in enumerate(commands):
             name = f"gate-{self.gate_count:02d}-{label}-{i}.log"
             config = dict(self.c, test_cmd=command, _gate_log=str(self.evidence.path / name))
+            if self.attempt_deadline:
+                remaining = self.attempt_deadline - time.time()
+                if remaining <= 0:
+                    raise AgentTimeout("verification", None, 0, "attempt deadline")
+                config["test_timeout"] = min(config.get("test_timeout", 900), max(1, remaining))
             started = time.monotonic()
             try:
                 ok, output = run_gate(self.wt, config)
@@ -2655,6 +2938,7 @@ class Worker(threading.Thread):
             row = {"command": command, "passed": ok, "log": name,
                    "seconds": round(time.monotonic() - started, 3), "tail": output}
             evidence.append(row)
+            mark_progress("verification completed")
             passed = passed and ok
         self.evidence.write(f"gate-{self.gate_count:02d}.json", evidence)
         self.evidence.record("verifying", gate=label, gates=evidence)
@@ -2675,26 +2959,45 @@ class Worker(threading.Thread):
                 if allow_test_changes else "")
         prompt = REVIEW.format(contract=json.dumps(self.contract, indent=2), tree=tree,
                                tests=tests, diff=diff[:self.c.get("max_diff", 24000)]) + note
-        try:
-            raw = self.call("adversary", prompt, self.wt, self.c["steps"]["adversary"], model, avoid)
-            review = parse_review(raw, tree, self.contract["acceptance"])
-        except ValueError as exc:
-            self.evidence.write(f"review-{self.role_calls:02d}-invalid.txt", raw)
-            raise ModelError(f"invalid review: {exc}") from exc
-        self.evidence.write(f"review-{self.role_calls:02d}.json", review)
-        after, _ = self.snapshot()
-        if after != tree:
-            raise ModelError("reviewer modified the candidate it was asked to inspect")
-        return review
+        tried, correction = set(), ""
+        retries = max(0, min(2, int(self.c.get("review_format_retries", 2))))
+        for retry in range(retries + 1):
+            raw = self.call("adversary", prompt + correction, self.wt,
+                            self.c["steps"]["adversary"], model, avoid)
+            after, _ = self.snapshot()
+            if after != tree:
+                raise ModelError("reviewer modified the candidate it was asked to inspect")
+            try:
+                review = parse_review(raw, tree, self.contract["acceptance"])
+            except ValueError as exc:
+                self.evidence.write(f"review-{self.role_calls:02d}-invalid.txt", raw)
+                self.evidence.record("review_format_error", error=str(exc), format_retry=retry,
+                                     reviewed_tree=tree, reviewer=self.last_model or model)
+                journal("review_format_error", id=self.task["id"], tree=tree,
+                        reviewer=self.last_model or model, retry=retry, error=str(exc))
+                if retry == retries or self.role_calls >= self.c.get("max_role_calls", 10):
+                    raise ReviewFormatError(f"invalid review after {retry + 1} calls: {exc}") from exc
+                tried.add(self.last_model or model)
+                model = self.pick(set(avoid) | self.no_review() | tried, role="adversary") or model
+                correction = (f"\nThe previous response failed validation: {exc}. Reinspect the SAME "
+                              "tree; return a complete JSON review. Include each criterion exactly "
+                              "once, with evidence, and verification for every finding.\n")
+                continue
+            self.evidence.write(f"review-{self.role_calls:02d}.json", review)
+            return review
 
     def _attempt(self, task, goal, info):
         c, w = self.c, self.name
         if task.get("kind") == "harness":
             return "refused", "target a separate harness checkout; live harness editing is disabled", info
+        reason = task_blocker(c, task)
+        if reason:
+            return "refused", reason, info
         log(f"claim {task['id']} — {task['title']}", w)
         self.ensure_worktree(task)
         wd = self.wt
         self.evidence = Attempt(STATE, self.branch.split("/")[-1], task, wd, self.branch)
+        self.evidence.record("claimed", run_id=_run.get("id"))
         info["artifact"] = str(self.evidence.path)
         info["attempt_id"] = self.evidence.data["id"]
         _, self.review_base = git(["rev-parse", "HEAD"], cwd=wd, check=True)
@@ -2788,6 +3091,9 @@ class Worker(threading.Thread):
             if head != self.review_base:
                 return "rejected", "agent changed commit history outside supervisor control", info
             tree, diff = self.snapshot()
+            outside = self.outside_scope()
+            if outside:
+                return "rejected", "candidate changed paths outside its contract: " + ", ".join(outside), info
             if not diff.strip():
                 info["edit_calls"] = tried = count_edits(w)
                 stage = "agent_timeout" if self.agent_timed_out else "no_change"
@@ -2808,6 +3114,9 @@ class Worker(threading.Thread):
             if ok:
                 try:
                     review = self.review(tree, diff, tests, adv, avoid={impl}, allow_test_changes=allowed)
+                except ReviewFormatError as exc:
+                    info["reviewer"] = self.last_model or adv
+                    return "review_format_error", str(exc), info
                 except (ModelError, StepLimit) as exc:
                     info["reviewer"] = self.last_model or adv   # the model that failed to deliver
                     return "review_error", str(exc), info
@@ -2848,6 +3157,9 @@ class Worker(threading.Thread):
         info["role_calls"] = self.role_calls
         # Record integration before optional learning/reporting. Recovery consults Git too.
         self.evidence.record("integrated", commit=info["commit"])
+        with _run_lock:
+            _run.update(last_accepted_at=time.time(), last_accepted_commit=info["commit"])
+        mark_progress("accepted commit")
         log(f"{task['id']}: landed on {trunk_name(c)}; evidence: {self.evidence.path}", w)
         # A third model scores the landed change; its lesson and follow-ups feed the playbook.
         info["judge"] = self.pick({impl, adv}, role="judge") or adv
@@ -2864,6 +3176,9 @@ class Worker(threading.Thread):
         """Review/test a rebased candidate before compare-and-swap of swarm trunk."""
         c, t = self.c, trunk_name(self.c)
         for _ in range(2):
+            reason = task_blocker(c, self.task)
+            if reason or not self.q.get(self.task["id"]):
+                return False, reason or "task was cancelled before integration"
             _, old = git(["rev-parse", t], cwd=c["repo"], check=True)
             rc, _ = git(["merge-base", "--is-ancestor", old, "HEAD"], cwd=self.wt)
             if rc != 0:
@@ -2873,6 +3188,8 @@ class Worker(threading.Thread):
                     return False, f"conflicts with newer trunk; work retained on {self.branch}"
                 self.review_base = old
                 tree, diff = self.snapshot()
+                if self.outside_scope():
+                    return False, "rebased candidate changed paths outside its contract"
                 ok, output = self.gate("rebased")
                 after, _ = self.snapshot()
                 if not ok or after != tree or weakened_tests(
@@ -2977,7 +3294,7 @@ class Worker(threading.Thread):
 
     def follow_up(self, task, scores, r, breakthrough):
         """Recursion on success: strong work spawns the next step it made possible."""
-        if self.c.get("roadmap_file"):
+        if self.c.get("roadmap_file") or task.get("origin") == "improvement":
             return  # Future packets are dispatched only by their recorded roadmap gates.
         if not scores or not (breakthrough or r >= 0.75):
             return
@@ -3112,12 +3429,39 @@ class Worker(threading.Thread):
 
     # -- loop --------------------------------------------------------------
 
+    def outside_scope(self):
+        scope = self.task.get("allowed_paths")
+        if not scope:
+            return []
+        _, names = git(["diff", "--cached", "--name-only", "--no-renames", "-z", self.review_base],
+                       cwd=self.wt, check=True)
+        return [p for p in names.split("\0") if p and not improvement.contains(p, scope)]
+
+    def clear_active(self):
+        self.task, self.started, self.doing = None, 0, None
+        for table in (_active_turns, _turn_logs, _waiting, _held, _ran_on):
+            table.pop(self.name, None)
+
+    def release_task(self, *args, **kwargs):
+        try:
+            return self.q.release(*args, **kwargs)
+        finally:
+            self.clear_active()
+
     def run(self):
         while not self.stop.is_set() and not self.tally.drain.is_set():
             # Between tasks, never inside one: an edited config reaches this run without a
             # restart, and a restart is what killed 54 attempts in this window.
             watch_config(self.c, self.budget)
-            task = self.q.claim()
+            try:
+                if self.c.get("roadmap_file"):
+                    dispatch_roadmap(self.c, self.q)
+                task = self.q.claim(eligible=lambda t: not t.get("blocked_reason"),
+                                    improvements=improve_enabled(self.c))
+            except Exception as exc:
+                log(f"dispatch blocked: {exc}", self.name)
+                self.stop.wait(20)
+                continue
             if not task:
                 self.stop.wait(20)
                 continue
@@ -3126,7 +3470,7 @@ class Worker(threading.Thread):
                 ok, note = self.do_task(task, goal)
                 # A timeout only forces a split when there was work to be too big for. With no
                 # diff there is nothing to divide, and the timeout is ours, not the task's.
-                final = self.q.release(task["id"], ok, note, failure_class=self.failure_class,
+                final = self.release_task(task["id"], ok, note, failure_class=self.failure_class,
                                        split_now=self.agent_timed_out and self.stage != "agent_timeout")
                 journal("task", id=task["id"], title=task["title"], ok=ok, stage=self.stage,
                         failure_class=None if ok else self.failure_class,
@@ -3139,7 +3483,7 @@ class Worker(threading.Thread):
                 self.tally.finished()
             except CapReached:
                 log("quota/window pause — deferring task", self.name)
-                self.q.release(task["id"], False, "quota/window pause", defer=60,
+                self.release_task(task["id"], False, "quota/window pause", defer=60,
                                failure_class="harness")
                 # 22 of these in one day, ten minutes each, while the local count read
                 # 1025/1000 and OpenRouter reported fewer requests used. Ask before sleeping,
@@ -3148,7 +3492,7 @@ class Worker(threading.Thread):
                     continue
                 self.stop.wait(min(600, allowance_recheck(self.c) or 600))
             except ProviderDown as e:
-                self.q.release(task["id"], False, f"provider unavailable: {str(e)[:200]}", defer=30,
+                self.release_task(task["id"], False, f"provider unavailable: {str(e)[:200]}", defer=30,
                                failure_class="harness")
                 if self.pick() is None:
                     # No model can take a turn. Sleep until the first one is back, not blindly.
@@ -3161,11 +3505,11 @@ class Worker(threading.Thread):
                 self.stop.wait(wait)
             except NoCredits as e:
                 log(f"out of credits: {e}", self.name)
-                self.q.release(task["id"], False, "no credits")
+                self.release_task(task["id"], False, "no credits")
                 self.stop.set()
             except Exception as e:
                 if self.stop.is_set():
-                    self.q.release(task["id"], False, "run stopped; changes retained", defer=1,
+                    self.release_task(task["id"], False, "run stopped; changes retained", defer=1,
                                    failure_class="harness")
                     return
                 described = describe_error(e)
@@ -3174,13 +3518,15 @@ class Worker(threading.Thread):
                 # A turn that timed out is still a failed attempt: let it split like any other,
                 # or the task is shelved with no smaller pieces to try.
                 # An unexpected exception in the supervisor is ours, not the task's.
-                final = self.q.release(task["id"], False, str(e)[:400], failure_class="harness")
+                final = self.release_task(task["id"], False, str(e)[:400], failure_class="harness")
                 if final and final.get("status") == "split":
                     try:
                         self.decompose(final, read_goal(self.c))
                     except Exception as exc:
                         log(f"could not split '{final['title']}': {exc}", self.name)
                 self.stop.wait(30)
+            finally:
+                self.clear_active()
 
 
 # ------------------------------------------------------------------ planning
@@ -3701,67 +4047,181 @@ def holder():
             f"  Stop it:   kill -INT {d['pid']}   (or Ctrl-C in its terminal)")
 
 
-def dispatch_roadmap(c, q):
-    """Dispatch only committed packets whose dependencies and owner gates are evidenced.
-
-    The coordinator ledger stays authoritative for human gates. Live queue/commit
-    evidence is reported separately so workers cannot accept their own gates.
-    """
-    repo, trunk = Path(c["repo"]), trunk_name(c)
+def roadmap_context(c):
+    """Read a single committed snapshot. Queue labels alone never unlock a packet."""
+    repo, trunk = c["repo"], trunk_name(c)
+    _, revision = git(["rev-parse", trunk], cwd=repo, check=True)
     def committed(path):
-        _, raw = git(["show", f"{trunk}:{path}"], cwd=repo, check=True)
+        _, raw = git(["show", f"{revision}:{path}"], cwd=repo, check=True)
         return json.loads(raw)
-    rows = committed(c["roadmap_file"])["tasks"]
+    packets = committed(c["roadmap_file"])["tasks"]
     ledger = committed("docs/roadmap/EXECUTION.json")
     if ledger.get("implementation_started") is not True:
         raise ValueError("roadmap implementation has not been activated")
-    with q.locked():
-        pending, done = _read(q.path), _read(q.done)
-    history = {r["title"]: r for r in done + pending}
     accepted = {}
-    for packet in rows:
-        pid = packet["id"]
-        evidence = ledger.get("packets", {}).get(pid, {})
+    by_id = {p["id"]: p for p in packets}
+    for pid, evidence in ledger.get("packets", {}).items():
+        p = by_id.get(pid, {})
+        if not p:
+            continue
         commit = evidence.get("accepted_commit")
         if evidence.get("status") == "accepted" and evidence.get("evidence"):
-            if packet["dispatch"] == "coordinator":
+            if p.get("dispatch") == "coordinator" or (commit and git(
+                    ["merge-base", "--is-ancestor", commit, revision], cwd=repo)[0] == 0):
                 accepted[pid] = evidence
-            elif commit and git(["merge-base", "--is-ancestor", commit, trunk], cwd=repo)[0] == 0:
-                accepted[pid] = evidence
-        queued = history.get(packet["title"], {})
-        match = re.search(r"integrated ([0-9a-f]{40}) on", queued.get("note", ""))
-        if queued.get("status") == "done" and match:
-            commit = match.group(1)
-            if git(["merge-base", "--is-ancestor", commit, trunk], cwd=repo)[0] == 0:
-                accepted[pid] = {"status": "accepted", "queue_id": queued["id"],
-                                 "accepted_commit": commit, "evidence": queued["note"]}
-    added, blocked = [], {}
-    for packet in rows:
+    # A packet can also be accepted by a complete, supervisor-owned artifact bundle.
+    for path in (STATE / "attempts").glob("*/attempt.json"):
+        a = improvement.read(path)
+        task = a.get("task", {})
+        pid = task.get("packet_id")
+        p = by_id.get(pid)
+        if not p or pid in accepted or a.get("phase") != "accepted":
+            continue
+        sha = a.get("commit", "")
+        if not re.fullmatch(r"[0-9a-f]{40}", sha) or git(
+                ["merge-base", "--is-ancestor", sha, revision], cwd=repo)[0]:
+            continue
+        saved = improvement.read(path.parent / "contract.json")
+        expected = criteria({"title": p["title"], "acceptance": p["acceptance"]})
+        if saved.get("packet_id") != pid or saved.get("acceptance") != expected:
+            continue
+        _, tree = git(["rev-parse", sha + "^{tree}"], cwd=repo)
+        gates = a.get("gates", [])
+        if (a.get("reviewed_tree") != tree or not gates
+                or not all(g.get("passed") is True and g.get("command")
+                           and (path.parent / g.get("log", "")).is_file() for g in gates)):
+            continue
+        if not set(p.get("commands", [])).issubset({g["command"] for g in gates}):
+            continue
+        for review_path in path.parent.glob("review-*.json"):
+            try:
+                review = parse_review(review_path.read_text(), tree, expected)
+            except (OSError, ValueError):
+                continue
+            if review["verdict"] == "approve":
+                accepted[pid] = {"status": "accepted", "accepted_commit": sha,
+                                 "queue_id": task["id"], "evidence": str(path.parent)}
+                break
+    # Remove chains with unmet prerequisites, even if a ledger says the child is accepted.
+    while True:
+        invalid = [pid for pid in accepted if any(d not in accepted for d in by_id[pid].get("depends_on", []))
+                   or any(not ledger.get("gates", {}).get(g, {}).get("evidence")
+                          for g in by_id[pid].get("coordinator_gates", []))]
+        if not invalid:
+            break
+        for pid in invalid:
+            accepted.pop(pid)
+    return packets, ledger, accepted
+
+
+def packet_fields(packet):
+    scope = improvement.paths(packet.get("write_paths", []))
+    return {"packet_id": packet["id"], "acceptance": packet["acceptance"],
+            "allowed_paths": scope, "verification_commands": packet.get("commands", []),
+            "detail": packet["detail"], "execution_class": packet.get("execution_class", "standard")}
+
+
+def task_blocker(c, task):
+    """Fail closed for broad roadmap requests, for every task origin."""
+    if task.get("blocked_reason"):
+        return task["blocked_reason"]
+    if task.get("allowed_paths"):
+        improvement.paths(task["allowed_paths"])
+    if not c.get("roadmap_file"):
+        return None
+    packets, ledger, accepted = roadmap_context(c)
+    if task.get("origin") == "improvement":
+        if any(p["id"] not in accepted for p in packets):
+            return "Assigned roadmap work remains; resolve its root blocker before improvements."
+        return None
+    packet = next((p for p in packets if p["id"] == task.get("packet_id")), None)
+    if not packet or packet.get("dispatch") != "swarm":
+        return "Resolve this request into a committed swarm packet; epics and standing rules cannot be implemented as one task."
+    for key, value in packet_fields(packet).items():
+        if key != "detail" and task.get(key) != value:
+            return f"Packet {packet['id']} contract changed ({key}); refresh dispatch before claiming."
+    missing = [d for d in packet.get("depends_on", []) if d not in accepted]
+    missing += [g for g in packet.get("coordinator_gates", [])
+                if not ledger.get("gates", {}).get(g, {}).get("evidence")]
+    return "Waiting on " + ", ".join(missing) if missing else None
+
+
+_roadmap_lock = threading.RLock()
+
+
+def dispatch_roadmap(c, q):
+    with _roadmap_lock:
+        return _dispatch_roadmap(c, q)
+
+
+def _dispatch_roadmap(c, q):
+    packets, ledger, accepted = roadmap_context(c)
+    by_id = {p["id"]: p for p in packets}
+    by_title = {p["title"].strip().lower(): p for p in packets}
+    # Canonicalize legacy exact-title tasks, but keep broad requests visible and unclaimable.
+    with q.locked():
+        pending, done = _read(q.path), _read(q.done)
+        for task in pending:
+            if task.get("claimed"):
+                continue
+            if task.get("origin") == "improvement":
+                task.pop("blocked_reason", None)
+                if len(accepted) < len(packets):
+                    task["blocked_reason"] = "Resolve assigned roadmap work before improvements."
+                continue
+            packet = by_id.get(task.get("packet_id")) or by_title.get(task["title"].strip().lower())
+            if packet and packet.get("dispatch") == "swarm":
+                task.update(packet_fields(packet))
+                task.pop("blocked_reason", None)
+                missing = [d for d in packet.get("depends_on", []) if d not in accepted]
+                missing += [g for g in packet.get("coordinator_gates", [])
+                            if not ledger.get("gates", {}).get(g, {}).get("evidence")]
+                if missing:
+                    task["blocked_reason"] = "Waiting on " + ", ".join(missing)
+                elif packet["id"] in accepted:
+                    task["blocked_reason"] = "Packet already accepted; close the duplicate request."
+            else:
+                task["blocked_reason"] = "Resolve this broad request into committed roadmap packet IDs."
+        _write(q.path, pending)
+    history = {r.get("packet_id") or by_title.get(r["title"].strip().lower(), {}).get("id"): r
+               for r in done + pending}
+    added, blocked, blockers = [], {}, {}
+    for packet in packets:
         pid = packet["id"]
-        if packet["dispatch"] != "swarm" or pid in accepted or packet["title"] in history:
+        if pid in accepted:
             continue
-        missing = [dep for dep in packet["depends_on"] if dep not in accepted]
-        missing += [gate for gate in packet.get("coordinator_gates", [])
-                    if not ledger.get("gates", {}).get(gate, {}).get("evidence")]
-        if missing:
-            blocked[pid] = missing
+        missing = [d for d in packet.get("depends_on", []) if d not in accepted]
+        missing += [g for g in packet.get("coordinator_gates", [])
+                    if not ledger.get("gates", {}).get(g, {}).get("evidence")]
+        previous = history.get(pid, {})
+        parked = previous.get("status") in ("parked", "split", "done", "cancelled")
+        if missing or parked or packet.get("dispatch") != "swarm":
+            reason = previous.get("note") if parked else "Waiting on " + ", ".join(missing)
+            if packet.get("dispatch") != "swarm" and not missing:
+                reason = "Coordinator evidence required"
+            blocked[pid] = missing or [previous.get("status", "coordinator")]
+            blockers[pid] = {"packet_id": pid, "title": packet["title"], "status": "Blocked",
+                             "depends_on": missing, "reason": reason or "No verified acceptance",
+                             "owner": packet.get("owner") or "repository coordinator",
+                             "queue_id": previous.get("id"),
+                             "recovery_action": "Record a scoped repair or decision, then requeue this packet; preserve its dependencies."
+                             if parked else "Supply acceptance evidence for: " + ", ".join(missing or [pid])}
             continue
-        if len(pending) + len(added) >= 5:
+        if previous or len(pending) + len(added) >= min(5, q.max_queue):
             continue
-        detail = (packet["detail"] + "\n\nREAD: docs/roadmap/README.md and this packet in "
-                  + c["roadmap_file"] + "\nVERIFICATION:\n" + "\n".join(packet.get("commands", [])))
+        fields = packet_fields(packet)
+        detail = fields.pop("detail") + "\nREAD: docs/roadmap/README.md and " + c["roadmap_file"]
         task = q.add(packet["title"], detail, "feature", origin="roadmap",
-                     priority=packet["priority"], execution_class=packet["execution_class"],
-                     acceptance=packet["acceptance"], serves=1)
+                     priority=packet.get("priority", 1), serves=1, **fields)
         if task:
             added.append(task)
             log(f"roadmap {pid}: queued {task['id']}")
+    roots = [pid for pid, b in blockers.items() if not any(d in blockers for d in b["depends_on"])]
     report = {"updated": dt.datetime.now().isoformat(), "accepted": accepted,
-              "blocked": blocked, "pending": [{"id": t["id"], "title": t["title"]}
-                                               for t in pending + added]}
-    tmp = STATE / "roadmap-execution.tmp"
-    tmp.write_text(json.dumps(report, indent=2) + "\n")
-    tmp.replace(STATE / "roadmap-execution.json")
+              "blocked": blocked, "blockers": blockers, "root_blockers": roots,
+              "pending": [{"id": t["id"], "title": t["title"], "packet_id": t.get("packet_id"),
+                           "blocked_reason": t.get("blocked_reason")} for t in pending + added]}
+    improvement.write(STATE / "roadmap-execution.json", report)
     return added
 
 
@@ -3801,6 +4261,7 @@ def start(c, hours=None, max_tasks=None, awake=False):
             {"pid": os.getpid(), "started": time.time(), "goal": read_goal(c)[:200],
              "repo": str(Path(c["repo"]).expanduser().resolve()), "config": str(CONFIG)}))
         _stop.clear()
+        begin_run(c)
         preflight(c)
         if awake:
             keep_awake()
@@ -3857,6 +4318,7 @@ def run_daemon(c, max_tasks=None, hours=None):
     source = source_fingerprint()
     restart_for, last_restart = [], time.time()
     _drain_reason["stop_requested"] = False
+    _scheduler_drain.clear()
     try:
         signal.signal(signal.SIGUSR1, lambda *_: drain(tally))
         log("edit the config to change settings without a restart; "
@@ -3871,11 +4333,15 @@ def run_daemon(c, max_tasks=None, hours=None):
     last_plan, last_sync, last_beat, dry_runs, plan_fails = 0.0, time.time(), time.time(), 0, 0
     last_bugs = 0.0
     said = {}
+    discovery = None
     try:
         while not stop.is_set():
             if tally.drain.is_set():
-                for w in workers:
-                    w.join()
+                _scheduler_drain.set()
+                while any(w.is_alive() for w in workers) or (discovery and discovery.is_alive()):
+                    write_now(workers, c)
+                    if stop.wait(1):
+                        break
                 if restart_for and _drain_reason["stop_requested"]:
                     log(f"not restarting into {', '.join(restart_for)}: this run was asked to "
                         "stop, and a stop means stop")
@@ -3886,6 +4352,7 @@ def run_daemon(c, max_tasks=None, hours=None):
                     restart_into_new_code(restart_for)
                     restart_for = []          # it refused; carry on with the code we have
                     tally.drain.clear()
+                    _scheduler_drain.clear()
                     workers = [Worker(i, c, q, budget, stop, ledger, tally)
                                for i in range(c["workers"])]
                     for w in workers:
@@ -3920,55 +4387,34 @@ def run_daemon(c, max_tasks=None, hours=None):
             if time.time() - last_beat > 3600:
                 last_beat = time.time()
                 log(f"heartbeat {json.dumps(budget.snapshot())}")
-            # Planning costs requests like anything else, so it is rate-limited
-            # and backs off when it stops producing new work.
-            cooldown = c.get("plan_cooldown", 600) * (2 ** min(dry_runs, 4))
             if c.get("roadmap_file"):
                 try:
                     dispatch_roadmap(c, q)
                 except Exception as exc:
                     log(f"roadmap dispatch blocked: {exc}")
-            if (not c.get("roadmap_file") and len(q.ready()) < c["workers"] and time.time() - last_plan > cooldown
-                    and can_take_a_turn(c, budget)):
-                last_plan = time.time()
-                try:
-                    sync_trunk(c)
-                    added = plan(c, q, budget, c.get("plan_batch", 5), ledger)
-                    plan_fails = 0
-                    dry_runs = 0 if added else dry_runs + 1
-                    if not added:
-                        log(f"planner added nothing — next attempt in "
-                            f"{c.get('plan_cooldown', 600) * 2 ** min(dry_runs, 4) / 60:.0f}m")
-                except (StepLimit, ModelError) as e:
-                    # A botched plan says nothing about whether work remains: redraw a
-                    # (now less likely) model soon, and back off only on a losing streak.
-                    plan_fails += 1
-                    if plan_fails < 4:
-                        last_plan = time.time() - cooldown + 60
-                        log(f"planner failed ({type(e).__name__}: {str(e).splitlines()[0][:120]}); "
-                            "redrawing in 1m")
-                    else:
-                        plan_fails, dry_runs = 0, dry_runs + 1
-                        log("planner failed 4 times in a row; backing off")
-                except CapReached:
-                    log("cap reached while planning — sleeping")
-                    stop.wait(60)
-                except ProviderDown as e:
-                    log(f"planner: {rest(ledger, e)}; redrawing another model")
-                    last_plan = 0.0
-                except NoCredits as e:
-                    log(f"out of credits: {e}")
-                    shutdown()
-                except Exception as e:
-                    log(f"planner error: {e}")
-                    dry_runs += 1
-            stop.wait(c.get("tick", 90) if not max_tasks else 5)
+                    _run["dispatch_error"] = str(exc)
+                    stop.wait(10)
+                    continue
+                _run.pop("dispatch_error", None)
+            if (not tally.drain.is_set() and improve_enabled(c)
+                    and not (discovery and discovery.is_alive())):
+                discovery = threading.Thread(target=discover_improvement,
+                    args=(c, q, budget, ledger), name="discovery", daemon=True)
+                discovery.start()
+            stop.wait(min(10, c.get("tick", 90)) if not max_tasks else 5)
     except KeyboardInterrupt:
         log("shutting down")
     finally:
         shutdown()
         for w in workers:
             w.join(timeout=10)
+        if discovery:
+            discovery.join(timeout=10)
+        _run["stop_reason"] = _run.get("stop_reason") or (
+            "Shift deadline reached" if _run.get("deadline") and time.time() >= _run["deadline"]
+            else "Task limit reached" if tally.limit and tally.n >= tally.limit else "Stop requested")
+        write_now([], c)
+        journal("run_stopped", reason=_run["stop_reason"])
 
 
 # ------------------------------------------------------------------ report

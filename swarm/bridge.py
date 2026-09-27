@@ -525,7 +525,7 @@ def cmd_queue_requeue(a):
     """Put a parked or split task back in the queue, with its attempts cleared."""
     c, q = _queue(a.repo)
     try:
-        t = q.requeue(a.id)
+        t = q.requeue(a.id, recovery_action=a.reason)
     except KeyError:
         emit({"ok": False, "error": f"no finished task with id {a.id}"})
         return 2
@@ -681,6 +681,9 @@ def cmd_status(a):
     tuned = swarmd.per_repo_config(c["repo"])
     emit({"repo": c["repo"], "is_target": is_target(c["repo"]), "daemon_running": daemon_running(),
           "now": swarmd.read_now(), "health": swarmd.health(24),
+          "run": swarmd.improvement.read(swarmd.STATE / "run.json"),
+          "improvement": swarmd.improve_settings(c),
+          "roadmap": swarmd.improvement.read(swarmd.STATE / "roadmap-execution.json"),
           "config_path": str(swarmd.CONFIG), "config_kind": swarmd.config_kind(),
           "config_warnings": swarmd.config_warnings(c),
           "config_tuned_available": str(tuned) if tuned.is_file() else None,
@@ -710,13 +713,79 @@ def cmd_task(a):
     if where:
         detail += f"\n\nThe developer pointed at {where}:\n```\n{code[:4000]}\n```"
     try:
+        preview = task_preview(c, a)
+        if preview["type"] == "roadmap":
+            added = swarmd.dispatch_roadmap(c, swarmd.Queue())
+            emit({"ok": True, "type": "roadmap", "added": [t["id"] for t in added],
+                  "message": "Request resolved to roadmap packets; blocked packets remain blocked.",
+                  "daemon_running": daemon_running(), "is_target": is_target(c["repo"])})
+            return 0
+        fields = preview["task"]
         t = swarmd.Queue(c.get("max_depth", 1), c.get("max_queue", 20)).add(
-            a.title, detail, a.kind, priority=a.priority, origin="cursor", acceptance=[want])
+            a.title, detail, a.kind, priority=a.priority, origin="cursor",
+            acceptance=fields["acceptance"], allowed_paths=fields["allowed_paths"])
     except ValueError as e:
         emit({"ok": False, "error": str(e)})
         return 2
     emit({"ok": bool(t), "id": t and t["id"], "duplicate_or_full": not t, "is_target": is_target(c["repo"]),
           "daemon_running": daemon_running()})
+    return 0
+
+
+def task_preview(c, a):
+    """Resolve broad roadmap intent before a task can be claimed. No model call."""
+    if c.get("roadmap_file"):
+        packets, ledger, accepted = swarmd.roadmap_context(c)
+        return {"type": "roadmap", "packets": [
+            {"id": p["id"], "title": p["title"], "acceptance": p["acceptance"],
+             "allowed_paths": p.get("write_paths", []),
+             "waiting_on": [d for d in p.get("depends_on", []) if d not in accepted]
+                + [g for g in p.get("coordinator_gates", [])
+                   if not ledger.get("gates", {}).get(g, {}).get("evidence")]}
+            for p in packets if p["id"] not in accepted and p.get("dispatch") == "swarm"],
+            "message": "This request starts the committed roadmap. Only bounded packets with satisfied gates can run."}
+    if re.search(r"\b(all|every)\s+(tasks?|goals?|features?)\b|\b(?:execute|work through|complete)\b.*\bgoal\.md\b",
+                 a.title + " " + (a.detail or ""), re.I):
+        raise ValueError("This is a broad request. Select one outcome with allowed paths and explicit acceptance criteria.")
+    allowed = getattr(a, "allowed_path", None) or []
+    if not allowed and a.file:
+        file = Path(a.file).resolve() if Path(a.file).is_absolute() else (Path(c["repo"]) / a.file).resolve()
+        allowed = [str(file.relative_to(Path(c["repo"]).resolve()))]
+    allowed = swarmd.improvement.paths(allowed)
+    acceptance = getattr(a, "acceptance", None) or [a.detail or a.title]
+    swarmd.criteria({"title": a.title, "acceptance": acceptance})
+    return {"type": "task", "task": {"title": a.title, "allowed_paths": allowed,
+                                      "acceptance": acceptance, "detail": a.detail}}
+
+
+def cmd_task_preview(a):
+    c = config_for(a.repo)
+    swarmd.use_repo(c)
+    try:
+        emit({"ok": True, **task_preview(c, a)})
+    except (ValueError, OSError, RuntimeError) as exc:
+        emit({"ok": False, "error": str(exc)})
+        return 2
+    return 0
+
+
+def cmd_improvement(a):
+    c = config_for(a.repo)
+    swarmd.use_repo(c)
+    current = swarmd.improve_settings(c)
+    try:
+        if a.enabled is not None:
+            current["enabled"] = a.enabled == "1"
+            if a.allowed_path:
+                current["paths"] = swarmd.improvement.paths(a.allowed_path)
+            if current["enabled"]:
+                swarmd.improvement.paths(current["paths"])
+            with swarmd.Queue().locked():
+                swarmd.improvement.write(swarmd.STATE / "improvement-settings.json", current)
+        emit({"ok": True, **current})
+    except ValueError as exc:
+        emit({"ok": False, "error": str(exc)})
+        return 2
     return 0
 
 
@@ -874,7 +943,7 @@ def main(argv=None):
     s = sub.add_parser("status")
     s.add_argument("--repo", required=True)
     s.set_defaults(fn=cmd_status)
-    for name, fn in (("ask", cmd_ask), ("task", cmd_task)):
+    for name, fn in (("ask", cmd_ask), ("task", cmd_task), ("task-preview", cmd_task_preview)):
         s = sub.add_parser(name)
         s.add_argument("--repo", required=True)
         s.add_argument("--file")
@@ -897,6 +966,8 @@ def main(argv=None):
                            help=f"paid models to try when no free one answered (max {MAX_PAID_PER_ASK})")
         else:
             s.add_argument("--title", required=True)
+            s.add_argument("--allowed-path", action="append")
+            s.add_argument("--acceptance", action="append")
             s.add_argument("--detail", default="")
             s.add_argument("--kind", default="feature", choices=swarmd.KINDS)
             s.add_argument("--priority", type=int, default=1)
@@ -930,6 +1001,8 @@ def main(argv=None):
                            help="let this task change or delete existing tests")
             s.add_argument("--no-allow-test-changes", dest="allow_test_changes",
                            action="store_false", help="take that permission back")
+        if name == "queue-requeue":
+            s.add_argument("--reason", required=True, help="scoped repair or decision authorizing another attempt")
         if name == "queue-remove":
             s.add_argument("--cascade", action="store_true",
                            help="also remove the queued tasks that depend on this one")
@@ -945,6 +1018,11 @@ def main(argv=None):
     s.add_argument("--disable", action="store_true")
     s.add_argument("--account", action="store_true", help="also ask OpenRouter about the account's credits")
     s.set_defaults(fn=cmd_wallet)
+    s = sub.add_parser("improvement")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--enabled", choices=("0", "1"))
+    s.add_argument("--allowed-path", action="append")
+    s.set_defaults(fn=cmd_improvement)
     s = sub.add_parser("study")
     s.add_argument("--query", required=True)
     s.add_argument("-k", type=int, default=6)
