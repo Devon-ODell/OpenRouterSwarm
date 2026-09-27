@@ -3703,6 +3703,11 @@ def start(c, hours=None, max_tasks=None, awake=False):
             timer.daemon = True
             timer.start()
         signal.signal(signal.SIGTERM, lambda *_: shutdown())
+        # A shell starting a job in the background hands it SIGINT set to SIG_IGN, and CPython
+        # keeps an inherited SIG_IGN rather than installing its own handler. So a daemon
+        # launched with `&` or nohup — which is how every shift is started — silently ignored
+        # `swarm stop` and the panel's Stop button. Taking the signal back makes them work.
+        signal.signal(signal.SIGINT, lambda *_: shutdown())
         try:
             run_daemon(c, max_tasks, hours=hours)
         finally:

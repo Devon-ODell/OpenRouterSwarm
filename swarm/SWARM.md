@@ -324,6 +324,11 @@ end of the shift across, so a restart at hour 7 of 8 does not start another 8.
 `restart_on_change: false` turns it off; `restart_min_interval` (300s) stops an
 autosaving editor thrashing it.
 
+A shift is always launched in the background, and a shell hands a background job
+SIGINT set to SIG_IGN, which CPython keeps rather than replacing. The daemon
+takes the signal back explicitly at startup, or `swarm stop` and the panel's
+Stop button would do nothing at all and say nothing about it.
+
 Stopping is per repository. `swarm stop` and `bridge.py stop --repo P` signal
 the pid in that repository's `state/<slug>/daemon.pid`, and only after `ps`
 confirms it is still that repository's daemon; swarms on other repositories keep

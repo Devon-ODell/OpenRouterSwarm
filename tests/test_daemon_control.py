@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -492,3 +493,59 @@ class ServiceTests(unittest.TestCase):
         with patch.object(swarmd.sys, "platform", "linux"), self.assertRaises(SystemExit) as e:
             swarmd.cmd_service(args)
         self.assertIn("macOS", str(e.exception))
+
+
+class StopSignalReachesABackgroundedDaemonTests(unittest.TestCase):
+    """A shift is always started with `&` or nohup, and that changes what stops it.
+
+    A shell starting a background job sets the child's SIGINT to SIG_IGN, and CPython keeps an
+    inherited SIG_IGN instead of installing its own handler. The daemon therefore ignored both
+    `swarm stop` and the panel's Stop button, silently — found when a stray `stop --all` from
+    the test suite failed to stop a live shift.
+    """
+
+    def script(self, body):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        f = d / "s.py"
+        f.write_text(body)
+        return f
+
+    def run_backgrounded(self, body):
+        """Run a script the way a shift is launched, and return what it printed."""
+        f = self.script(body)
+        out = f.with_suffix(".out")
+        subprocess.run(f"nohup {sys.executable} {f} > {out} 2>&1 &", shell=True, check=True)
+        for _ in range(100):
+            if out.is_file() and out.read_text().strip():
+                break
+            time.sleep(0.05)
+        return out.read_text().strip()
+
+    def test_a_backgrounded_process_really_does_inherit_sig_ign(self):
+        """The premise. If this ever stops being true, the fix below is unnecessary."""
+        said = self.run_backgrounded(
+            "import signal\n"
+            "print('ignored' if signal.getsignal(signal.SIGINT) == signal.SIG_IGN else 'handled')\n")
+        self.assertEqual(said, "ignored")
+
+    def test_installing_a_handler_takes_the_signal_back(self):
+        said = self.run_backgrounded(
+            "import signal\n"
+            "signal.signal(signal.SIGINT, lambda *_: None)\n"
+            "print('ignored' if signal.getsignal(signal.SIGINT) == signal.SIG_IGN else 'handled')\n")
+        self.assertEqual(said, "handled")
+
+    def test_the_daemon_installs_one(self):
+        # start() ends in shutdown(), which sets the module-wide stop event; leaving it set
+        # makes every later test in this process raise "swarm is stopping".
+        self.addCleanup(swarmd._stop.clear)
+        installed = {}
+        with patch.object(swarmd.signal, "signal", side_effect=lambda s, h: installed.setdefault(s, h)), \
+             patch.object(swarmd, "run_daemon"), patch.object(swarmd, "preflight"), \
+             patch.object(swarmd, "read_goal", return_value="g"), \
+             patch.object(swarmd, "log"), tempfile.TemporaryDirectory() as d:
+            with patch.object(swarmd, "STATE", Path(d)):
+                swarmd.start({"repo": ".", "workers": 1})
+        self.assertIn(swarmd.signal.SIGINT, installed)
+        self.assertIn(swarmd.signal.SIGTERM, installed)
