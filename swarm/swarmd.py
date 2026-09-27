@@ -772,6 +772,160 @@ class Queue:
 
 # ------------------------------------------------------------------ corpus
 
+# ------------------------------------------------------------------ context pack
+
+# Paths a task names in its own words. Anything outside this set is a guess about what matters,
+# and a guess is what filled these prompts with a lecture on parking-garage real options.
+CODE_PATH = re.compile(r"[\w][\w./-]*\.(?:py|js|json|md|html|css)\b")
+GAME_DIR = re.compile(r"\b(games/([\w.-]+))/")
+# Definitions worth an outline when a file is too long to show: Python and JavaScript
+# functions, classes, and the consts a game's module keeps its tables in.
+DEFINITION = re.compile(
+    r"^\s*(?:export\s+)?(?:async\s+)?(?:def|class|function)\s+\w+"
+    r"|^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*="
+    r"|^\s*\w+\s*[:=]\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>)")
+
+
+def numbered(text, first=1):
+    """Lines in read_file's exact format, so an edit_file old_str can be copied out of them."""
+    return "\n".join(f"{i:>5}\t{line}" for i, line in enumerate(text.splitlines(), first))
+
+
+def outline(text):
+    """Definitions with their line numbers, for a file too long to show whole.
+
+    A signature is what locates the code; the rest of a 200-character line is body, and an
+    outline that repeats it is as big as the file it stands in for."""
+    return "\n".join(f"{i:>5}\t{line.rstrip()[:120]}"
+                     for i, line in enumerate(text.splitlines(), 1) if DEFINITION.match(line))
+
+
+def task_text(task):
+    rows = task.get("acceptance") or []
+    return " ".join([str(task.get("title") or ""), str(task.get("detail") or "")]
+                    + [r if isinstance(r, str) else str(r.get("text", "")) for r in rows])
+
+
+def named_paths(task, also=""):
+    """The file paths the task names, in the order it names them, deduplicated."""
+    text = task_text(task) + " " + (also or "")
+    return list(dict.fromkeys(m.group(0).rstrip(".") for m in CODE_PATH.finditer(text)))
+
+
+def kin_text(task, q):
+    """The words a task inherits from the task it was split out of.
+
+    44 of 121 finished tasks were splits, and a decomposer writes subtasks in terms of behaviour:
+    "Add parked vehicle data structure and rendering" names no file, while the task it came out
+    of names games/crosstown/game.js. Without this the splits — the ones already failing — are
+    exactly the ones that get no code."""
+    out = []
+    for tid in dict.fromkeys(x for x in (task.get("parent"), task.get("root")) if x and x != task["id"]):
+        row = q.get(tid) or next((r for r in _read(q.done) if r.get("id") == tid), None)
+        if row:
+            out.append(task_text(row))
+    return " ".join(out)
+
+
+def covering_tests(wd, terms, limit=2):
+    """Test files that mention what the task is about, first `limit` of them."""
+    found = []
+    for term in terms:
+        if len(found) >= limit or not term:
+            break
+        rc, out = git(["grep", "-l", "-F", "-i", "--", term, "tests"], cwd=wd)
+        if rc == 0:
+            for path in out.splitlines():
+                if path not in found:
+                    found.append(path)
+    return found[:limit]
+
+
+def context_pack(task, wd, limit=20_000, also=""):
+    """The code this task is about, in the prompt, in read_file's own format.
+
+    The implementer prompt carried no code at all: 16.6 KB of goal, rules and unrelated
+    excerpts, and not one line of the files the task names. A model with 12 tool rounds spent 6
+    to 11 of them reading before it could edit anything, and 60 of 189 attempts ran out of
+    rounds before the first edit. Everything here comes from paths the task itself names, or
+    the task it was split out of, so there is nothing to guess and nothing to pad.
+    """
+    wd, parts, used = Path(wd), [], 0
+    text = task_text(task) + " " + (also or "")
+    # The last two sections are small and carry the most per character — which test module to
+    # run, and what else is in the directory — so a long file cannot crowd them out.
+    reserve = min(2_500, limit // 4)
+
+    def add(header, body, ceiling=None):
+        nonlocal used
+        # Only blank lines come off: a line's leading spaces are its line number's padding, and
+        # read_file's format is the whole point — an old_str is copied out of it byte for byte.
+        body = (body or "").strip("\n")
+        ceiling = limit if ceiling is None else ceiling
+        if not body.strip() or used >= ceiling:
+            return False
+        room = ceiling - used
+        if len(body) > room:
+            body = body[:room] + f"\n… [{len(body) - room} chars not shown; read_file for the rest]"
+        parts.append(f"{header}\n{body}")
+        used += len(body) + len(header) + 2
+        return True
+
+    def show(rel, max_lines=400, head=None):
+        f = wd / rel
+        if not f.is_file():
+            return
+        try:
+            body = f.read_text(errors="replace")
+        except OSError:
+            return
+        lines, ceiling = body.splitlines(), limit - reserve
+        if head:
+            add(f"--- {rel} (first {min(head, len(lines))} of {len(lines)} lines) ---",
+                numbered("\n".join(lines[:head])), ceiling)
+            return
+        whole = numbered(body)
+        # A game's logic runs to 300 lines of 200 characters, so the line count alone is not a
+        # size. A file that will not fit gets its definitions, which is still navigable — a
+        # file cut off halfway is not.
+        if len(lines) <= max_lines and len(whole) <= max(0, ceiling - used):
+            add(f"--- {rel} ({len(lines)} lines) ---", whole, ceiling)
+        else:
+            add(f"--- {rel} ({len(lines)} lines; definitions only, read_file for the rest) ---",
+                outline(body), ceiling)
+
+    paths = named_paths(task, also)
+    seen = set()
+    for rel in paths:
+        if (wd / rel).is_file() and rel not in seen:
+            seen.add(rel)
+            show(rel)
+    # A game directory is a unit: what it declares, what its notes say, and its logic.
+    for whole, slug in dict.fromkeys(GAME_DIR.findall(text)):
+        for rel, kw in ((f"{whole}/manifest.json", {}), (f"{whole}/NOTES.md", {"head": 60}),
+                        (f"{whole}/game.js", {})):
+            if rel not in seen:
+                seen.add(rel)
+                show(rel, **kw)
+    terms = [slug for _, slug in GAME_DIR.findall(text)] + [Path(rel).stem for rel in paths]
+    for rel in covering_tests(wd, list(dict.fromkeys(terms))):
+        if rel in seen:
+            continue
+        seen.add(rel)
+        body = (wd / rel).read_text(errors="replace") if (wd / rel).is_file() else ""
+        tests = "\n".join(f"{i:>5}\t{line.rstrip()}" for i, line in enumerate(body.splitlines(), 1)
+                          if re.match(r"\s*(?:def test_|it\(|test\()", line))
+        add(f"--- {rel} (the tests in it; run this module, not the whole suite) ---", tests)
+    for d in dict.fromkeys(str(Path(rel).parent) for rel in paths if "/" in rel):
+        rc, out = git(["ls-files", "--", d], cwd=wd)
+        if rc == 0 and out:
+            add(f"--- files in {d} ---", "\n".join(out.splitlines()[:60]))
+    if not parts:
+        return ""
+    return ("CODE THIS TASK TOUCHES (already read for you; line numbers match read_file, so an\n"
+            "old_str can be copied straight out of it)\n\n" + "\n\n".join(parts))
+
+
 def study(q, c, k=None):
     """MIT OCW excerpts for a prompt: lecture cards, then source pages, as absolute paths.
     Empty unless a lecture card matches, since tangential pages only distract small models.
@@ -838,6 +992,9 @@ PROJECT GOAL AND RULES
 {goal}
 TASK CONTRACT
 {spec}
+
+{context}
+
 Follow repository instructions and the contract. Change only what the task requires.
 Do not commit, switch branches, merge or reset Git. Do not weaken existing tests.
 No network calls from code or tests, credentials, or live orders.
@@ -1103,6 +1260,8 @@ TASK
 {playbook}
 
 {corpus}
+
+{context}
 
 Implement this task in the current repository. It is a checkout of the swarm's
 trunk, which already contains the swarm's earlier accepted work: build on it.
@@ -1622,6 +1781,11 @@ class Worker(threading.Thread):
         corpus = study(f"{task['title']} {task['detail']}", c) if self.mit == "on" else ""
         info["mit_injected"] = bool(corpus)
         self.evidence.record("study", mit=self.mit, injected=bool(corpus))
+        # The code the task names, read once here rather than over and over by the model.
+        kin = kin_text(task, self.q)
+        context = context_pack(task, wd, also=kin)
+        info["context_chars"] = len(context)
+        self.evidence.record("context", chars=len(context), paths=named_paths(task, kin))
         lessons, pitfalls = ([], []) if fast else self.ledger.playbook()
         # Lessons shown to this implementer share the attempt's reward (see Ledger.credit).
         info["lessons"] = [l["id"] for l in lessons + pitfalls if l.get("kind") in ("lesson", "pitfall")]
@@ -1652,7 +1816,8 @@ class Worker(threading.Thread):
         try:
             handoff = self.call("implementer", (FAST_IMPLEMENTER if fast else IMPLEMENTER).format(
                 goal=goal, spec=spec, previous=previous, corpus=corpus, test_cmd=c["test_cmd"],
-                playbook=format_playbook(lessons, pitfalls)), wd, c["steps"]["implementer"], impl)
+                context=context, playbook=format_playbook(lessons, pitfalls)),
+                wd, c["steps"]["implementer"], impl)
             self.evidence.write("implementation.txt", handoff)
         except AgentTimeout:
             self.evidence.record("timeout_recovery", note="verify partial implementation through normal gates")
@@ -1706,7 +1871,7 @@ class Worker(threading.Thread):
             self.evidence.record("repairing")
             try:
                 handoff = self.call("repair", REPAIR.format(contract=json.dumps(self.contract, indent=2),
-                                    failure=failure, test_cmd=c["test_cmd"]), wd,
+                                    failure=failure, test_cmd=c["test_cmd"], context=context), wd,
                                     c["steps"].get("repair", c["steps"]["implementer"]), impl, avoid={adv})
                 self.evidence.write(f"repair-{cycle + 1}.txt", handoff)
             except AgentTimeout:

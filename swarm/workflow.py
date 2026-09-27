@@ -197,6 +197,8 @@ If this failure repeats, change your approach based on evidence.
 CONTRACT
 {contract}
 
+{context}
+
 FAILURE / REVIEW HANDOFF
 {failure}
 

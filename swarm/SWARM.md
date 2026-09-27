@@ -43,8 +43,12 @@ edits the current directory directly. The swarm never edits your checkout.
 2. **Branch** a fresh worktree from `swarm/trunk`, which already holds every
    change the swarm has accepted, so later work builds on earlier work.
 3. **Implement** with a model drawn by Thompson sampling. The prompt carries
-   the goal, the task, earlier failure notes and the playbook of lessons and
-   pitfalls. On the corpus side of the MIT experiment (below) it also carries
+   the goal, the task, earlier failure notes, the playbook of lessons and
+   pitfalls, and a **context pack**: the files the task names (or the task it
+   was split out of names), already read, numbered exactly as `read_file`
+   prints them so an `edit_file` `old_str` can be copied straight out. A file
+   too long to show becomes an outline of its definitions with line numbers.
+   The turn's rounds are for editing, not for finding the file. On the corpus side of the MIT experiment (below) it also carries
    MIT lecture-card excerpts when a lecture card matches the task, and every
    role in the attempt can call the `study` tool.
 4. **Gate**: the test command must pass and no existing assertion may be removed.
@@ -229,6 +233,13 @@ between is paid for. When OpenRouter reports requests left, the swarm takes
 its count, lifts a daily-cap block it no longer backs, logs `free allowance is
 back`, journals `allowance_restored` and runs the next turn free. It checks at
 startup too, so a counter left over from before a restart is settled first.
+
+An implementer or repair turn also sees how much of its budget is left: each
+round's last tool result ends `[round k of N; M left]`, and with three rounds
+left and nothing edited it is told to stop reading and make the edit. At the
+limit it gets one round offering only `edit_file` and `write_file` before the
+tool-free final answer, and an edit it writes as reply markup is applied rather
+than discarded.
 
 `owner_window` (disabled by default) pauses the swarm during set local hours.
 
