@@ -1,0 +1,40 @@
+Based on my investigation of the codebase and understanding the requirements, I'll implement the parked vehicle data structure and rendering functionality. Here's my implementation:
+
+<tool_call>
+<function=edit_file>
+<parameter=file>
+games/crosstown/game.js
+</parameter>
+<parameter=old_str>
+function init(seed) {
+    const s = { rng: seed >>> 0 || 1, tick: 0, over: false, started: false, score: 0, money: 0, jobsDone: 0, jobsFailed: 0, crashes: 0, pedestrianClips: 0, busts: 0, heat: 0, maxHeat: 0, unseen: 0, caught: 0, distance: 0, speedSum: 0, speedTicks: 0, cooldown: 0, notice: 'WELCOME TO THE NIGHT SHIFT', noticeUntil: 180, route: [], fx: [], botNoise: 0, districtMask: 0, seenDistricts: 0 };
+    const xs = [140], ys = [140];
+    for (let i = 1; i < 6; i++) { xs.push(xs[i-1] + 265 + Math.floor(rand(s) * 42)); ys.push(ys[i-1] + 265 + Math.floor(rand(s) * 42)); }
+    s.city = { xs, ys, size: Math.max(xs[5], ys[5]) + 145, blocks: [] };
+    for (let y = 0; y < 5; y++) for (let x = 0; x < 5; x++) {
+      s.city.blocks.push({ x: xs[x] + 61, y: ys[y] + 61, w: xs[x+1]-xs[x]-122, h: ys[y+1]-ys[y]-122, hue: Math.floor(rand(s)*4), park: rand(s)<.17, sign: Math.floor(rand(s)*6), roof: Math.floor(rand(s)*18) });
+    }
+</parameter>
+<parameter=new_str>
+function init(seed) {
+    const s = { rng: seed >>> 0 || 1, tick: 0, over: false, started: false, score: 0, money: 0, jobsDone: 0, jobsFailed: 0, crashes: 0, pedestrianClips: 0, busts: 0, heat: 0, maxHeat: 0, unseen: 0, caught: 0, distance: 0, speedSum: 0, speedTicks: 0, cooldown: 0, notice: 'WELCOME TO THE NIGHT SHIFT', noticeUntil: 180, route: [], fx: [], botNoise: 0, districtMask: 0, seenDistricts: 0, onFoot: false };
+    const xs = [140], ys = [140];
+    for (let i = 1; i < 6; i++) { xs.push(xs[i-1] + 265 + Math.floor(rand(s) * 42)); ys.push(ys[i-1] + 265 + Math.floor(rand(s) * 42)); }
+    s.city = { xs, ys, size: Math.max(xs[5], ys[5]) + 145, blocks: [] };
+    for (let y = 0; y < 5; y++) for (let x = 0; x < 5; x++) {
+      const block = { x: xs[x] + 61, y: ys[y] + 61, w: xs[x+1]-xs[x]-122, h: ys[y+1]-ys[y]-122, hue: Math.floor(rand(s)*4), park: rand(s)<.17, sign: Math.floor(rand(s)*6), roof: Math.floor(rand(s)*18) };
+      // Add parked vehicles to blocks with parking
+      if (block.park && rand(s) < 0.6) {
+        block.parkedVehicle = {
+          x: block.x + 20 + Math.floor(rand(s) * (block.w - 40)),
+          y: block.y + 20 + Math.floor(rand(s) * (block.h - 40)),
+          a: Math.PI * 2 * rand(s),
+          archetype: Object.keys(ARCHETYPES)[Math.floor(rand(s) * Object.keys(ARCHETYPES).length)]
+        };
+      }
+      s.city.blocks.push(block);
+    }
+</parameter>
+</function>
+</tool_call>
+

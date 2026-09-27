@@ -952,6 +952,11 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
 
     env = dict(os.environ)
     env["FLINT_MAX_STEPS"] = str(max_steps)
+    if role not in READ_ONLY_ROLES:
+        # This role's product is a diff, so flint offers it one edit-only round before the
+        # tool-free one and applies edits it writes as reply text. Without that, a turn spent
+        # reading is thrown away whole and scored against the model as "no change".
+        env["FLINT_FINAL_EDIT"] = "1"
     if not env.get("OPENROUTER_API_KEY"):
         env.pop("OPENROUTER_API_KEY", None)
     if c.get("study") is False:

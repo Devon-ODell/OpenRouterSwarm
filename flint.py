@@ -107,6 +107,24 @@ def read_file(path, offset=1, limit=400):
     return body
 
 
+def read_files(paths, limit=400):
+    """Read several files in one call.
+
+    A weak model makes one tool call per round, so reading four files costs four of the twelve
+    rounds a swarm turn has. One call for the lot leaves the rounds for the edit."""
+    if isinstance(paths, str):          # text markup, or a model that ignored the array type
+        try:
+            parsed = json.loads(paths)
+        except ValueError:
+            parsed = None
+        paths = parsed if isinstance(parsed, list) else re.split(r"[,\n]", paths)
+    paths = [str(x).strip().strip('"\'') for x in (paths or [])]
+    paths = [x for x in paths if x][:20]
+    if not paths:
+        return "Error: read_files needs at least one path."
+    return "\n\n".join(f"=== {x} ===\n{read_file(x, 1, limit)}" for x in paths)
+
+
 def write_file(path, content):
     p = _p(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -215,8 +233,9 @@ def study(query, k=5):
     return text or "No matches in the study corpus. Try different or more specific terms."
 
 
-TOOLS = {"read_file": read_file, "write_file": write_file, "edit_file": edit_file,
-         "list_files": list_files, "search": search, "bash": bash, "study": study}
+TOOLS = {"read_file": read_file, "read_files": read_files, "write_file": write_file,
+         "edit_file": edit_file, "list_files": list_files, "search": search, "bash": bash,
+         "study": study}
 
 
 def _schema(name, desc, props, required):
@@ -230,6 +249,11 @@ TOOL_SCHEMAS = [
             {"path": {"type": "string"},
              "offset": {"type": "integer", "description": "1-based first line (default 1)"},
              "limit": {"type": "integer", "description": "max lines (default 400)"}}, ["path"]),
+    _schema("read_files", "Read several files in one call — use this instead of one read_file per "
+                          "round. Each file appears under a `=== path ===` header with numbered lines.",
+            {"paths": {"type": "array", "items": {"type": "string"},
+                       "description": 'the files to read, e.g. ["src/game.js", "tests/test_game.py"]'},
+             "limit": {"type": "integer", "description": "max lines per file (default 400)"}}, ["paths"]),
     _schema("write_file", "Create a file or fully overwrite one. Prefer edit_file for changes.",
             {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
     _schema("edit_file", "Replace old_str with new_str in a file. old_str must match exactly "
@@ -292,6 +316,7 @@ You help with software tasks by reading, searching, editing files and running co
 
 How to work:
 - Investigate before acting: list_files / search / read_file to understand the code first.
+- Reading several files? Pass them all to read_files at once rather than one read_file per round.
 - Always read_file before edit_file. Keep old_str small but unique, copied exactly.
 - Make the smallest change that solves the task. Don't rewrite files that only need a tweak.
 - After changing code, verify it: run the tests, the build, or the script with bash.
@@ -329,6 +354,14 @@ class StepLimitReached(Exception):
 _TEXT_CALL = re.compile(r"<function=([\w.\-]+)>(.*?)(?:</function>|(?=<function=)|\Z)", re.S)
 _TEXT_PARAM = re.compile(r"<parameter=([\w.\-]+)>(.*?)</parameter>", re.S)
 _TEXT_WRAP = re.compile(r"</?tool_call>")
+# Models writing their own markup also invent their own parameter names. The log for
+# w0-implementer-1790428940089493000 has `<parameter=file>` where the schema says `path`, which
+# on its own turned a finished edit into a "no change" attempt. An alias is only taken when the
+# tool has no parameter by that name and does have the one it stands for.
+_PARAM_ALIASES = {"file": "path", "filename": "path", "filepath": "path", "file_path": "path",
+                  "old": "old_str", "new": "new_str", "old_string": "old_str",
+                  "new_string": "new_str", "old_text": "old_str", "new_text": "new_str",
+                  "text": "content", "contents": "content"}
 
 
 def recover_text_calls(content, schemas):
@@ -359,12 +392,16 @@ def recover_text_calls(content, schemas):
                 val = val[1:]
             if val.endswith("\n"):
                 val = val[:-1]
-            if types.get(key) in ("integer", "number", "boolean"):
+            args[key] = val
+        for alias, real in _PARAM_ALIASES.items():
+            if alias in args and alias not in types and real in types and real not in args:
+                args[real] = args.pop(alias)
+        for key, val in list(args.items()):
+            if types.get(key) in ("integer", "number", "boolean", "array"):
                 try:
-                    val = json.loads(val.strip().lower() if types[key] == "boolean" else val.strip())
+                    args[key] = json.loads(val.strip().lower() if types[key] == "boolean" else val.strip())
                 except ValueError:
                     pass
-            args[key] = val
         if required <= set(args):
             calls.append({"id": "", "name": name, "args": json.dumps(args)})
     if not calls:
@@ -706,6 +743,11 @@ class Agent:
     spend = Spend(path="", cap="")
     last_cost = 0.0
     total_cost = 0.0
+    # An agent assembled without __init__ (tests, checkpoints) edits nothing, offers every tool
+    # and is not a role whose product is a diff.
+    edits = 0
+    only_tools = None
+    final_edit = False
 
     def __init__(self, model, yolo=False, headless=False, read_only=False):
         key = os.environ.get("OPENROUTER_API_KEY")
@@ -722,6 +764,9 @@ class Agent:
         self.yolo = yolo
         self.headless = headless
         self.read_only = read_only or (headless and not yolo)
+        # Roles whose whole product is a diff (a swarm's implementer and repair turns) say so,
+        # and get the edit-only round below rather than losing the turn to the step limit.
+        self.final_edit = bool(os.environ.get("FLINT_FINAL_EDIT")) and not self.read_only
         self.corpus = _corpus_ready()
         if headless:
             os.environ["FLINT_HEADLESS"] = "1"
@@ -736,6 +781,8 @@ class Agent:
         self.reset()
 
     def reset(self):
+        self.edits = 0                  # files created, overwritten or edited this turn
+        self.only_tools = None          # when set, the only tools offered for one request
         self.messages = [{"role": "system", "content": build_system_prompt()}]
         if self.read_only:
             self.messages[0]["content"] += "\nRead-only mode: inspect and advise; you cannot edit files or run shell commands."
@@ -750,6 +797,8 @@ class Agent:
         schemas = [t for t in TOOL_SCHEMAS
                    if (not self.read_only or t["function"]["name"] not in NEEDS_APPROVAL)
                    and (t["function"]["name"] != "study" or getattr(self, "corpus", False))]
+        if getattr(self, "only_tools", None):
+            schemas = [t for t in schemas if t["function"]["name"] in self.only_tools]
         kw = dict(model=self.model, messages=self.messages, tools=schemas,
                   stream=True, stream_options={"include_usage": True})
         if getattr(self, "final_answer", False):
@@ -1014,6 +1063,8 @@ class Agent:
         except Exception as e:  # tools should never crash the agent
             out = f"Error: {type(e).__name__}: {e}"
 
+        if name in ("write_file", "edit_file") and out.startswith(("Created", "Overwrote", "Edited")):
+            self.edits += 1
         if not self.headless:
             lines = out.splitlines() or [""]
             shown = "\n     ".join(l[:160] for l in lines[:4])
@@ -1029,27 +1080,42 @@ class Agent:
             from nonstop import save_checkpoint
             save_checkpoint(path, self.messages)
 
+    NO_EDIT_YET = ("Three rounds left and no file has changed. Stop reading. Make the edit now "
+                   "with edit_file or write_file, then run the single test module that covers it.")
+
+    def _assistant_msg(self, content, calls):
+        """The assistant message for a reply, with stable ids for the calls it made."""
+        msg = {"role": "assistant", "content": content or ""}
+        if calls:
+            msg["tool_calls"] = [{
+                "id": c["id"] or f"call_{len(self.messages)}_{i}", "type": "function",
+                "function": {"name": c["name"], "arguments": c["args"] or "{}"}}
+                for i, c in enumerate(calls)]
+        return msg
+
     def turn(self, user_text):
         self.messages.append({"role": "user", "content": user_text})
-        content = ""
+        self.edits, content = 0, ""
         for step in range(MAX_STEPS):
             if self.headless:
                 print(f"round {step + 1}/{MAX_STEPS}: requesting {self.model}", file=sys.stderr, flush=True)
             content, calls = self.complete()
-            msg = {"role": "assistant", "content": content or ""}
-            if calls:
-                msg["tool_calls"] = [{
-                    "id": c["id"] or f"call_{len(self.messages)}_{i}", "type": "function",
-                    "function": {"name": c["name"], "arguments": c["args"] or "{}"}}
-                    for i, c in enumerate(calls)]
+            msg = self._assistant_msg(content, calls)
             self.messages.append(msg)
             self.save_checkpoint()
             if not calls:
                 break
-            for c in msg["tool_calls"]:
+            left = MAX_STEPS - step - 1
+            for i, c in enumerate(msg["tool_calls"]):
                 result = self.run_tool(c)
+                # Nothing else tells the model how much of the turn is left, so it reads for
+                # eleven rounds of twelve and then loses the edit to the step limit.
+                if self.headless and i == len(msg["tool_calls"]) - 1:
+                    result += f"\n\n[round {step + 1} of {MAX_STEPS}; {left} left]"
                 self.messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
                 self.save_checkpoint()
+            if self.headless and left == 3 and not self.edits:
+                self.messages.append({"role": "user", "content": self.NO_EDIT_YET})
         else:
             content = self._final_answer()
         if self.last_prompt_tokens > CONTEXT_WARN_TOKENS:
@@ -1058,6 +1124,43 @@ class Agent:
 
     FINAL_NUDGE = ("You have used every tool round this turn allows. Do not call any tools. "
                    "Give your final answer now, in exactly the format the task asked for.")
+    FINAL_EDIT_NUDGE = ("You have used every tool round this turn allows and no file has changed, "
+                        "so nothing you did would be kept. This round offers two tools, edit_file "
+                        "and write_file, and nothing else. Make the edit now. Do not read, search "
+                        "or run anything.")
+    EDIT_TOOLS = ("edit_file", "write_file")
+
+    def _run_calls(self, content, calls):
+        """Record a reply and run its calls, the way a normal round does."""
+        msg = self._assistant_msg(content, calls)
+        self.messages.append(msg)
+        for c in msg.get("tool_calls", []):
+            self.messages.append({"role": "tool", "tool_call_id": c["id"],
+                                  "content": self.run_tool(c)})
+        self.save_checkpoint()
+
+    def _final_edit_round(self):
+        """One round offering only the edit tools, for a role whose product is a diff.
+
+        33 of 189 studio attempts ran out of rounds and 27 more read files and never edited: the
+        model spends the turn understanding the code and the harness keeps none of it. This is
+        the last chance to write the change down, and reading is what ran the clock out, so
+        reading is not on offer."""
+        print(f"step limit: offering {self.model} one edit-only round", file=sys.stderr, flush=True)
+        self.messages.append({"role": "user", "content": self.FINAL_EDIT_NUDGE})
+        self.only_tools = set(self.EDIT_TOOLS)
+        try:
+            content, calls = self.complete()
+        except (DailyCapReached, OutOfCredits, BudgetPaused, SpendExhausted,
+                ProviderUnavailable, WalletEmpty, KeyboardInterrupt):
+            raise
+        except Exception as e:
+            print(f"edit-only round failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            self.messages.pop()          # leave history as the step limit found it
+            return
+        finally:
+            self.only_tools = None
+        self._run_calls(content, [c for c in calls if c["name"] in self.EDIT_TOOLS])
 
     def _final_answer(self):
         """After the step limit, a headless turn gets one tool-free round to answer, so the
@@ -1066,6 +1169,8 @@ class Agent:
         limit = StepLimitReached(f"Stopped after {MAX_STEPS} rounds; task is incomplete. Changes may already exist.")
         if not self.headless:
             raise limit
+        if self.final_edit and not self.edits:
+            self._final_edit_round()
         print(f"step limit: asking {self.model} for a final answer without tools", file=sys.stderr, flush=True)
         self.messages.append({"role": "user", "content": self.FINAL_NUDGE})
         self.final_answer = True
@@ -1078,7 +1183,18 @@ class Agent:
             raise limit from e
         finally:
             self.final_answer = False
-        if calls or not content.strip():   # still reaching for tools: no answer, and none run
+        if calls:
+            # Tools were off for that request, so these are calls the model wrote into its reply
+            # text and recover_text_calls picked up. Throwing an edit away here is how a finished
+            # change became a "no change" attempt, a punished model and a split task.
+            edits = [c for c in calls if c["name"] in self.EDIT_TOOLS]
+            if not (edits and self.final_edit):
+                raise limit          # still reaching for tools: no answer, and none run
+            print(f"applying {len(edits)} edit(s) the final answer wrote as text",
+                  file=sys.stderr, flush=True)
+            self._run_calls(content, edits)
+            return content.strip() or f"Applied {len(edits)} edit(s) written as reply text."
+        if not content.strip():
             raise limit
         self.messages.append({"role": "assistant", "content": content})
         self.save_checkpoint()
