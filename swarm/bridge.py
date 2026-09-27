@@ -17,6 +17,7 @@ Every command prints JSON. `ask` streams one JSON object per line as models fini
     bridge.py queue-requeue --repo PATH --id ID
     bridge.py queue-remove --repo PATH --id ID [--cascade]
     bridge.py landed   --repo PATH [--limit 20]
+    bridge.py import-bugs --repo PATH [--limit 5] [--file PATH]
     bridge.py parked   --repo PATH [--limit 20]
     bridge.py queue-clear  --repo PATH [--include-claimed]
     bridge.py study    --query Q [-k 6]
@@ -535,6 +536,22 @@ def cmd_queue_requeue(a):
     return 0
 
 
+def cmd_import_bugs(a):
+    """Turn new player bug reports into queued tasks."""
+    c = config_for(a.repo)
+    swarmd.use_repo(c)
+    q = swarmd.Queue(c.get("max_depth", 1), c.get("max_queue", 20))
+    try:
+        added = swarmd.import_bugs(c, q, path=a.file, limit=a.limit or 5)
+    except OSError as e:
+        emit({"ok": False, "error": f"could not read the reports: {e}"})
+        return 2
+    emit({"ok": True, "repo": c["repo"], "added": len(added),
+          "tasks": [{"id": t["id"], "title": t["title"], "priority": t["priority"]}
+                    for t in added]})
+    return 0
+
+
 def cmd_landed(a):
     """The swarm's own trunk commits, newest first, with model, reward and goal item."""
     c = config_for(a.repo)
@@ -888,6 +905,11 @@ def main(argv=None):
         s.add_argument("--repo", required=True)
         s.add_argument("--limit", type=int, default=20)
         s.set_defaults(fn=fn)
+    s = sub.add_parser("import-bugs")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--limit", type=int, default=5, help="at most this many per run (default 5)")
+    s.add_argument("--file", help="the reports file (default <repo>/reports/bugs.jsonl)")
+    s.set_defaults(fn=cmd_import_bugs)
     for name, fn in (("queue-get", cmd_queue_get), ("queue-edit", cmd_queue_edit),
                      ("queue-retry", cmd_queue_retry), ("queue-requeue", cmd_queue_requeue),
                      ("queue-remove", cmd_queue_remove)):

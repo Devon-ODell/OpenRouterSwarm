@@ -271,6 +271,13 @@ a restart, a provider that did not answer — spends nothing: the task comes bac
 in two minutes, the model is not scored for it, and after three of them the task
 is parked with `needs harness look` for a person rather than split into guesses.
 
+Player bug reports reach the queue on their own. Every five minutes the daemon
+reads the arcade's `reports/bugs.jsonl` past a cursor in `state/<slug>/bugs.cursor`
+and files each new one as a `bugfix` task with `origin: "player"` — priority by
+severity, the build and the game state in the detail so its seed reproduces the
+run, and acceptance criteria that ask for a failing test first.
+`bridge.py import-bugs --repo P` does the same by hand.
+
 The Cursor panel's first line says what the swarm is doing — the task, the role,
 the model, the round it is on and how long the turn has taken — from
 `state/<slug>/now.json`, which the daemon rewrites on every tick. Under it: how

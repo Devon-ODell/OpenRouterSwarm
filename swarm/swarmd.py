@@ -3513,6 +3513,7 @@ def run_daemon(c, max_tasks=None):
     for w in workers:
         w.start()
     last_plan, last_sync, last_beat, dry_runs, plan_fails = 0.0, time.time(), time.time(), 0, 0
+    last_bugs = 0.0
     said = {}
     try:
         while not stop.is_set():
@@ -3524,6 +3525,15 @@ def run_daemon(c, max_tasks=None):
             if time.time() - last_sync > 900:
                 last_sync = time.time()
                 sync_usage(account())
+            if time.time() - last_bugs > 300:
+                last_bugs = time.time()
+                try:
+                    new = import_bugs(c, q)
+                    if new:
+                        log(f"queued {len(new)} player bug report(s): "
+                            + "; ".join(t["title"][:60] for t in new))
+                except Exception as e:      # a player's report must never stop the run
+                    log(f"could not read the bug reports: {type(e).__name__}: {e}")
             report_progress(workers, said)
             write_now(workers, c)
             if time.time() - last_beat > 3600:
@@ -3789,6 +3799,83 @@ def cmd_plan(a):
     b = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                owner_window=c.get("owner_window", ["00:00", "00:00"]))
     plan(c, Queue(c.get("max_depth", 1)), b, a.n)
+
+
+# ------------------------------------------------------------------ player bug reports
+
+BUG_SEVERITY_PRIORITY = {"broken": 2, "annoying": 1, "cosmetic": 0}
+
+
+def bug_task(row):
+    """(title, detail, priority) for a player's bug report, or None if it is not usable.
+
+    The arcade writes reports/bugs.jsonl "so a person or the swarm can read them", and nothing
+    in swarm/ ever read it. A report from someone who actually played the game is the best task
+    this swarm can be given, and it was going in a file nobody opened."""
+    if not isinstance(row, dict):
+        return None
+    summary = str(row.get("summary") or "").strip()
+    if not summary:
+        return None
+    game = str(row.get("game") or "site").strip() or "site"
+    severity = str(row.get("severity") or "annoying")
+    lines = [f"A player reported this while playing **{game}**.", "", f"> {summary}"]
+    if row.get("details"):
+        lines += ["", "What they added:", "", str(row["details"])[:2000]]
+    facts = [(k, row.get(k)) for k in ("version", "page", "viewport", "severity") if row.get(k)]
+    if facts:
+        lines += ["", "Report: " + ", ".join(f"{k} {v}" for k, v in facts)]
+    if row.get("state") is not None:
+        # The seed and the run state are what make a report reproducible.
+        lines += ["", "Game state at the time (use its seed to reproduce):", "",
+                  "```json", json.dumps(row["state"], indent=2)[:1500], "```"]
+    lines += ["", "Reproduce it first with a failing test, then fix it."]
+    return (f"Bug in {game}: {summary[:100]}", "\n".join(lines),
+            BUG_SEVERITY_PRIORITY.get(severity, 1))
+
+
+def import_bugs(c, q, path=None, limit=5):
+    """Queue the player bug reports this swarm has not seen. Returns the tasks it added.
+
+    The cursor is a byte-free high-water mark on the report id, so a report is queued once even
+    though the arcade's file only ever grows."""
+    path = Path(path or Path(c["repo"]) / "reports" / "bugs.jsonl")
+    if not path.is_file():
+        return []
+    try:
+        cursor = int(json.loads((STATE / "bugs.cursor").read_text())["id"])
+    except (OSError, ValueError, KeyError, TypeError):
+        cursor = 0
+    rows = []
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row.get("id"), int) and row["id"] > cursor:
+            rows.append(row)
+    added, seen = [], cursor
+    for row in sorted(rows, key=lambda r: r["id"]):
+        seen = max(seen, row["id"])
+        made = bug_task(row)
+        if not made:
+            continue
+        title, detail, priority = made
+        try:
+            task = q.add(title, detail, "bugfix", priority=priority, origin="player",
+                         acceptance=[f"a test reproduces the report and fails without the fix",
+                                     f"{row.get('game', 'the game')} no longer does it"])
+        except ValueError:
+            task = None
+        if task:
+            added.append(task)
+            journal("bug_imported", id=task["id"], report=row["id"], game=row.get("game"),
+                    severity=row.get("severity"), title=title)
+        if len(added) >= limit:
+            break
+    if seen > cursor:
+        (STATE / "bugs.cursor").write_text(json.dumps({"id": seen, "at": time.time()}))
+    return added
 
 
 # ------------------------------------------------------------------ launchd service
