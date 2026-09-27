@@ -48,3 +48,32 @@ STUDIO=/Users/devonodell/Desktop/internetmoney/video-games/openRouter-Studio
 
 Prefer `--drain`: it lets the task in flight finish instead of throwing away a
 turn that has already been paid for.
+
+
+## 2. `swarm add` has no `--repo`, so it trusts whatever config.json points at
+
+`swarm add` resolves its config through `cfg()` with no repository argument, so it
+writes to whichever repo `swarm/config.json` names and uses that file's settings —
+`max_queue`, `max_depth`, the validation limits — even when the target repository
+has a tuned config of its own.
+
+It is not silent: the per-repo resolution added on 2026-09-26 logs
+
+    WARNING using .../swarm/config.json while openRouter-Studio-ab0a4a.json exists
+    for this repo — its tuned settings are not in effect
+
+and journals `config_mismatch`. That warning fired while dispatching the roadmap's
+T-* packets on 2026-09-27. The tasks landed in the right queue only because
+config.json happened to name the studio.
+
+**Workaround, and what the roadmap already tells you to do:** prefix the dispatch
+command with the config, which is what `docs/roadmap/README.md` §8 prints:
+
+```sh
+FLINT_SWARM_CONFIG=/Users/devonodell/Desktop/OpenRouterSwarm/swarm/configs/openRouter-Studio-ab0a4a.json \
+  ./.venv/bin/python swarm/swarmd.py add "<title>" --detail "..." --priority 2
+```
+
+**The fix:** give `cmd_add` (and `plan`, `report`, `status`) a `--repo` and call
+`use_config(a.repo)` before `_setup()`, the way `cmd_grind` already does. About
+four lines plus a test that `add --repo <studio>` uses the tuned `max_queue`.
