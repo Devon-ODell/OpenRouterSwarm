@@ -215,9 +215,16 @@ class ConfigWarningTests(unittest.TestCase):
         self.assertFalse([w for w in swarmd.config_warnings(template) if "unknown setting" in w])
 
     def test_every_key_the_studio_config_uses_is_known(self):
-        studio = json.loads(
-            (Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.json").read_text())
-        self.assertFalse([w for w in swarmd.config_warnings(studio) if "unknown setting" in w])
+        self.assertFalse([w for w in swarmd.config_warnings(self.studio())
+                          if "unknown setting" in w])
+
+    def studio(self):
+        """The studio's tuned config. swarm/configs/ is gitignored — the swarm rewrites these
+        files — so this is per-machine and the test skips where it does not exist."""
+        path = Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.json"
+        if not path.is_file():
+            self.skipTest("no tuned studio config on this machine")
+        return json.loads(path.read_text())
 
     def test_a_private_key_is_left_alone(self):
         self.assertFalse(swarmd.config_warnings(self.cfg(_comment="why this is tuned so")))
@@ -268,15 +275,19 @@ class ConfigChangelogTests(unittest.TestCase):
     """The JSON holds values; the reasons live beside it."""
 
     def test_the_studio_config_is_values_not_history(self):
-        c = json.loads(
-            (Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.json").read_text())
+        path = Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.json"
+        if not path.is_file():
+            self.skipTest("no tuned studio config on this machine")
+        c = json.loads(path.read_text())
         self.assertNotIn("_comment", c)
         for key, value in c.items():
             self.assertLess(len(str(value)), 600, f"{key} reads like prose, not a setting")
 
     def test_the_history_is_kept_where_it_can_be_corrected(self):
         log = Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.CHANGELOG.md"
-        self.assertTrue(log.is_file())
+        if not (Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.json").is_file():
+            self.skipTest("no tuned studio config on this machine")
+        self.assertTrue(log.is_file(), "the config's history must live beside it")
         text = log.read_text()
         self.assertIn("qwen/qwen3-coder", text)
         self.assertIn("Corrections", text, "the stale claims are corrected, not just moved")
