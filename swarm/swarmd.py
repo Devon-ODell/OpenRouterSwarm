@@ -68,6 +68,7 @@ _sync_failed = {}
 _study_lock = threading.Lock()
 _study_calls = {}
 _edit_calls = {}      # worker -> edit_file/write_file calls its turns made this attempt
+_charges = {}         # worker -> dollars its turns were charged this attempt
 _held = {}            # worker -> when it last said it was waiting for the allowance
 _waiting = {}         # worker -> why it is not working, or absent while it is
 _ran_on = {}          # worker -> the model its last turn actually ran on, once a stand-in took it
@@ -516,6 +517,45 @@ def shutdown():
     with _process_lock:
         for p in _processes:
             kill_group(p)
+
+
+def reportable(note):
+    """A failure note with the machinery taken out: paths, log references, round counters.
+
+    "Split or parked" used to print raw log fragments — `_file tool: read_file round 3/26…` —
+    which say nothing to the person reading the report in the morning."""
+    note = re.sub(r"\s+", " ", str(note or "")).strip()
+    # A subprocess error's str() begins with the whole argv, sandbox profile and all.
+    # ...and release() truncates the note at 800 characters, so the argv is often unterminated.
+    note = re.sub(r"Command '\[.*?(?:\]'|$)", "the sandboxed command", note, flags=re.S)
+    note = re.sub(r"(?:;\s*)?(?:evidence|log|artifact):\s*\S+", "", note)
+    note = re.sub(r"\bround \d+(?:/\d+)?\b", "", note)
+    note = re.sub(r"(?:/[\w.@%+-]+){2,}", "", note)          # any leftover absolute path
+    return re.sub(r"\s{2,}", " ", note).strip(" ;,-")
+
+
+def describe_error(e):
+    """What to journal about an exception, without its command line.
+
+    All 12 "sandbox-exec" errors in this window were really "timed out after 420 seconds",
+    hidden past character 500 of a str() that began with the whole sandbox profile. argv is
+    never recorded: it has held a 25 KB prompt, and prompts do not belong in the journal."""
+    row = {"kind": type(e).__name__}
+    if isinstance(e, subprocess.TimeoutExpired):
+        row["timeout"] = e.timeout
+        row["err"] = f"timed out after {e.timeout} seconds"
+    elif isinstance(e, subprocess.CalledProcessError):
+        row["returncode"] = e.returncode
+        row["err"] = f"exited {e.returncode}"
+    else:
+        row["err"] = str(e)[:500]
+    for name in ("stderr", "output"):
+        out = getattr(e, name, None)
+        if out:
+            row["stderr"] = (out.decode("utf-8", "replace") if isinstance(out, bytes)
+                             else str(out))[-1000:]
+            break
+    return row
 
 
 def drain(tally):
@@ -1217,6 +1257,15 @@ def count_study(worker, n=0, reset=False):
         return _study_calls[worker]
 
 
+def count_usd(worker, usd=0.0, reset=False):
+    """What one worker's turns have been charged since its attempt began."""
+    with _study_lock:
+        if reset:
+            return round(_charges.pop(worker, 0.0), 6)
+        _charges[worker] = round(_charges.get(worker, 0.0) + usd, 6)
+        return _charges[worker]
+
+
 def count_edits(worker, n=0, reset=False):
     """Edit calls one worker's turns made since its attempt began.
 
@@ -1342,6 +1391,23 @@ def all_resting(ledger, c):
     return f"every model is resting; {model} is back at {dt.datetime.fromtimestamp(until):%H:%M:%S} (`swarm wake` ends the rest now)"
 
 
+def read_charges(path, role, worker, model):
+    """Bank what a finished turn was charged, one `charge` row each, and return the total."""
+    total = 0.0
+    try:
+        rows = [json.loads(l) for l in Path(path).read_text().splitlines() if l.strip()]
+    except (OSError, ValueError):
+        return 0.0
+    for row in rows:
+        usd = round(float(row.get("usd") or 0.0), 6)
+        total = round(total + usd, 6)
+        journal("charge", role=role, worker=worker, model=row.get("model") or model, usd=usd)
+    if total:
+        count_usd(worker, total)
+    Path(path).unlink(missing_ok=True)
+    return total
+
+
 def route_to_paid(c, role, worker, model, why):
     """Swap in a paid stand-in for this turn, or None when none is reachable or affordable."""
     alt = paid_stand_in(c, model)
@@ -1426,12 +1492,19 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     # Shared when the budget is monthly, per-repository when it is daily. flint charges real
     # costs here and refuses a paid request the remaining budget can no longer cover.
     env["FLINT_SPEND_FILE"] = str(spend_file(c))
+    # flint knows what OpenRouter charged; this is how that number gets back here.
+    charge_file = LOGS / f"{worker}-{role}-{time.time_ns()}.charges.jsonl"
+    env["FLINT_CHARGE_FILE"] = str(charge_file)
     if spend_cap(c) is not None:
         env["FLINT_SPEND_CAP"] = str(spend_cap(c))
     if spend_reset_day(c) is not None:
         env["FLINT_SPEND_RESET_DAY"] = str(spend_reset_day(c))
+    # The prompt is 10-25 KB. In argv it shows up in `ps`, in every exception's str() and in
+    # any crash report, so it goes to a file the attempt is keeping anyway.
+    prompt_file = LOGS / f"{worker}-{role}-{time.time_ns()}.prompt.txt"
+    prompt_file.write_text(prompt)
     cmd = [c.get("python", sys.executable), str(ROOT / "flint.py"),
-           "-p", prompt, "-C", str(cwd), "-m", model,
+           "--prompt-file", str(prompt_file), "-C", str(cwd), "-m", model,
            "--read-only" if role in READ_ONLY_ROLES else "--yolo"]
     cmd = sandboxed(cmd, cwd, c)
     timeout = turn_timeout(c, role)
@@ -1461,8 +1534,10 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     studied = len(re.findall(r"^tool: study$", progress, re.M))
     count_study(worker, studied)
     count_edits(worker, len(re.findall(r"^tool: (?:edit_file|write_file)$", progress, re.M)))
+    usd = read_charges(charge_file, role, worker, model)
     journal("turn", role=role, worker=worker, model=model, rc=p.returncode,
-            secs=round(time.time() - t0), chars=len(out), log=str(logfile), study_calls=studied)
+            secs=round(time.time() - t0), chars=len(out), log=str(logfile), study_calls=studied,
+            usd=usd)
     error = progress[-1200:]
     with open(logfile, "a") as f:  # keep the answer beside the progress for later review
         f.write(f"\n--- answer from {model} (exit {p.returncode}) ---\n{out}\n")
@@ -2138,6 +2213,7 @@ class Worker(threading.Thread):
         self.execution_class = task.get("execution_class", "standard")
         count_study(self.name, reset=True)
         count_edits(self.name, reset=True)
+        count_usd(self.name, reset=True)
         note, info = "attempt interrupted before completion", {}
         try:
             self.stage, note, info = self._attempt(task, goal, info)
@@ -2164,7 +2240,7 @@ class Worker(threading.Thread):
                 log(f"learning update failed; task outcome retained: {exc}", self.name)
             # One row per attempt that spent model calls: the MIT experiment's raw data.
             journal("attempt", id=task["id"], title=task["title"], stage=self.stage,
-                    goal_item=info.get("goal_item"),
+                    goal_item=info.get("goal_item"), usd=count_usd(self.name, reset=True),
                     failure_class=None if self.stage == "accepted" else self.failure_class,
                     edit_calls=info.get("edit_calls"),
                     mit=info.get("mit"), injected=info.get("mit_injected", False),
@@ -2692,9 +2768,9 @@ class Worker(threading.Thread):
                     self.q.release(task["id"], False, "run stopped; changes retained", defer=1,
                                    failure_class="harness")
                     return
-                log(f"error on {task['id']}: {e}", self.name)
-                journal("error", id=task["id"], err=str(e)[:500],
-                        tb=traceback.format_exc()[-1200:])
+                described = describe_error(e)
+                log(f"error on {task['id']}: {described['kind']}: {described['err']}", self.name)
+                journal("error", id=task["id"], tb=traceback.format_exc()[-1200:], **described)
                 # A turn that timed out is still a failed attempt: let it split like any other,
                 # or the task is shelved with no smaller pieces to try.
                 # An unexpected exception in the supervisor is ours, not the task's.
@@ -3294,12 +3370,27 @@ def build_report(c, hours=24):
     _, ahead = git(["rev-list", "--count", f"{base}..{t}"], cwd=repo)
     _, commits = git(["log", "--format=- %h %s", "-n", "30", f"{base}..{t}"], cwd=repo)
     accepted = [a for a in L["accepted"] if a["t"] >= since]
-    tasks = [j for j in _read(STATE / "journal.jsonl") if j["event"] == "task" and j["t"] >= since]
-    stages = {}
+    rows = _read(STATE / "journal.jsonl")
+    tasks = [j for j in rows if j["event"] == "task" and j["t"] >= since]
+    attempts = [j for j in rows if j["event"] == "attempt" and j["t"] >= since]
+    stages, classes = {}, {}
     for j in tasks:
         stages[j.get("stage", "?")] = stages.get(j.get("stage", "?"), 0) + 1
+        if not j.get("ok") and j.get("failure_class"):
+            classes[j["failure_class"]] = classes.get(j["failure_class"], 0) + 1
     parked = [d for d in _read(STATE / "done.jsonl")
               if d.get("status") in ("parked", "split") and d.get("finished", 0) >= since]
+    # Each task's own last outcome, so the report says what happened rather than guessing.
+    last = {j["id"]: j for j in rows if j["event"] == "task"}
+    # What the window cost, from OpenRouter's own numbers rather than a local price table.
+    spent = round(sum(a.get("usd") or 0.0 for a in attempts), 6)
+    landed_n = sum(1 for a in attempts if a.get("stage") == "accepted")
+    by_model = {}
+    for a in attempts:
+        m = by_model.setdefault(a.get("implementer") or "?", {"attempts": 0, "landed": 0, "usd": 0.0})
+        m["attempts"] += 1
+        m["landed"] += a.get("stage") == "accepted"
+        m["usd"] = round(m["usd"] + (a.get("usd") or 0.0), 6)
     b = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                owner_window=c.get("owner_window", ["00:00", "00:00"])).snapshot()
 
@@ -3323,12 +3414,42 @@ def build_report(c, hours=24):
                    f"{s.get('quality', '–')} | {a['title']} | `{a['implementer']}` | "
                    f"{a.get('persona') or a.get('origin')} |")
     out += ["", "## Outcomes", "", ", ".join(f"{k}: {v}" for k, v in sorted(stages.items())) or "no tasks finished"]
-    import experiment
-    out += ["", "## MIT corpus experiment (every attempt so far)", "",
-            experiment.markdown(experiment.summary(STATE / "journal.jsonl"))]
+    if classes:
+        out += ["", "Whose failures these were: "
+                + ", ".join(f"{k} {v}" for k, v in sorted(classes.items(), key=lambda kv: -kv[1]))
+                + ". Only `task` failures say the work was wrong."]
+    out += ["", "## Cost", ""]
+    if spent:
+        out += [f"${spent:.4f} across {len(attempts)} attempt(s); "
+                + (f"${spent / landed_n:.4f} per landed commit ({landed_n} landed)."
+                   if landed_n else "nothing landed in this window."),
+                "", "| model | attempts | landed | $ | $ per landed |", "|---|---:|---:|---:|---:|"]
+        for name, m in sorted(by_model.items(), key=lambda kv: -kv[1]["usd"]):
+            per = f"{m['usd'] / m['landed']:.4f}" if m["landed"] and m["usd"] else "–"
+            out.append(f"| `{name}` | {m['attempts']} | {m['landed']} | {m['usd']:.4f} | {per} |")
+    else:
+        out += ["No paid turns were charged in this window."]
+    # An experiment nobody is running is a section that says nothing, every morning.
+    if (c.get("mit_experiment") or {}).get("enabled") and c.get("inject_corpus", True):
+        import experiment
+        out += ["", "## MIT corpus experiment (every attempt so far)", "",
+                experiment.markdown(experiment.summary(STATE / "journal.jsonl"))]
     if parked:
-        out += ["", "## Split or parked (needs a human look)", ""]
-        out += [f"- {d['status']}: {d['title']} — {d.get('note', '')[:160].strip()}" for d in parked]
+        out += ["", "## Split or parked (needs a human look)", "",
+                "One line each, with whose failure it was. `harness` and `model` mean the task "
+                "itself was never shown to be wrong.", ""]
+        for d in parked:
+            j = last.get(d["id"], {})
+            stage = j.get("stage") or ""
+            raw = j.get("note") or d.get("note") or ""
+            # Classify the note as it was written: cleaning it for display strips the very
+            # words — sandbox, the timeout, the path — that say whose failure it was.
+            why = j.get("failure_class") or failure_class(stage, raw,
+                                                          edited=j.get("edit_calls"))
+            note = reportable(raw)
+            out.append(f"- **{d['status']}** · {why}"
+                       + (f" · {stage}" if stage else "")
+                       + f" · {d['title']} — {note[:140] or 'no reason recorded'}")
     out += ["", "## Agent leaderboard", "", "| role | arm | pulls | mean reward | posterior |", "|---|---|---:|---:|---:|"]
     for row in Ledger(STATE / "learn.json").leaderboard():
         out.append(f"| {row['role']} | `{row['arm']}` | {row['pulls']} | {row['mean']:.2f} | {row['posterior']:.2f} |")

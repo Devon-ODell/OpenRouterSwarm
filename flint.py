@@ -844,12 +844,28 @@ class Agent:
         self.total_cost = round(self.total_cost + usd, 6)
         if usd:
             self.spend.add(usd, self.model)
+            self._record_charge(usd)
         if self.wallet is not None:
             self.spend_usd = round(self.spend_usd + usd, 6)
             snap = self.wallet.record(usd, self.model)
             if usd:
                 self._note(f"[dim]spend: ${usd:.4f} this request, "
                            f"${snap['spent']:.4f} of ${snap['cap']:.2f} allowance[/]")
+
+    def _record_charge(self, usd):
+        """Append this request's charge to FLINT_CHARGE_FILE, for the caller to bank.
+
+        391 paid_fallback rows were recorded and not one carried a confirmed charge, so cost per
+        landed commit and cost per model could not be worked out at all. The number here is
+        OpenRouter's own, not a local price table."""
+        path = os.environ.get("FLINT_CHARGE_FILE")
+        if not path:
+            return
+        try:
+            with open(path, "a") as f:
+                f.write(json.dumps({"at": time.time(), "model": self.model, "usd": usd}) + "\n")
+        except OSError as e:                # a charge is banked, never fatal to the turn
+            print(f"could not record the charge: {e}", file=sys.stderr, flush=True)
 
     def _note(self, msg):
         (console.print if not self.headless else
@@ -1358,6 +1374,9 @@ def run_unattended(goal, model, hours=8, test_command=None):
 def main():
     ap = argparse.ArgumentParser(description="flint — a tiny terminal coding agent on OpenRouter")
     ap.add_argument("-p", "--prompt", help="run one task non-interactively and print the result")
+    ap.add_argument("--prompt-file", metavar="PATH",
+                    help="read that task from a file instead. A swarm prompt is 10-25 KB, and in "
+                         "argv it lands in `ps` and in every exception's message.")
     ap.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"model slug (default {DEFAULT_MODEL})")
     ap.add_argument("--yolo", action="store_true", help="auto-approve edits and shell commands")
     ap.add_argument("--read-only", action="store_true", help="allow only file reading, listing and searching")
@@ -1374,6 +1393,13 @@ def main():
     if a.reset_cap:
         Throttle().clear_block()
 
+    if a.prompt_file:
+        if a.prompt is not None:
+            ap.error("give a prompt with --prompt or --prompt-file, not both")
+        try:
+            a.prompt = Path(a.prompt_file).expanduser().read_text()
+        except OSError as e:
+            ap.error(f"could not read --prompt-file: {e}")
     prompt = (a.prompt if a.prompt != "-" else sys.stdin.read()) if a.prompt is not None else ""
     from nonstop import parse_trigger
     trigger = parse_trigger(prompt)
