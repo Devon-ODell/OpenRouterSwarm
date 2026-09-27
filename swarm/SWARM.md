@@ -260,6 +260,14 @@ a restart, a provider that did not answer — spends nothing: the task comes bac
 in two minutes, the model is not scored for it, and after three of them the task
 is parked with `needs harness look` for a person rather than split into guesses.
 
+`swarm service install --repo P [--hours H] [--autostart]` writes a launchd
+agent (`~/Library/LaunchAgents/com.flint.swarm.<slug>.plist`) that restarts a
+crashed daemon, with the repository's own config already selected.
+`--autostart` is what makes it come back at login and after a reboot, and it is
+off unless you ask: this daemon spends real money. `swarm service status` says
+whether it is installed, loaded and set to autostart; `swarm service uninstall`
+removes it.
+
 `owner_window` (disabled by default) pauses the swarm during set local hours.
 
 Most settings take effect without a restart. A worker re-reads the config

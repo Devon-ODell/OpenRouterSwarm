@@ -20,7 +20,7 @@ The supervisor never merges into your checkout: accepted work accumulates on
 merge what you want. Agents and tests run in a write-restricting macOS
 sandbox; it contains accidents, not a determined attacker.
 """
-import argparse, datetime as dt, fcntl, hashlib, json, os, random, re, shlex, shutil, signal
+import argparse, datetime as dt, fcntl, hashlib, json, os, plistlib, random, re, shlex, shutil, signal
 import subprocess, sys, threading, time, traceback, uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -3281,6 +3281,87 @@ def cmd_plan(a):
     plan(c, Queue(c.get("max_depth", 1)), b, a.n)
 
 
+# ------------------------------------------------------------------ launchd service
+
+LAUNCH_AGENTS = Path("~/Library/LaunchAgents")
+
+
+def service_label(repo):
+    return f"com.flint.swarm.{repo_slug(repo)}"
+
+
+def service_plist_path(repo):
+    return (LAUNCH_AGENTS / f"{service_label(repo)}.plist").expanduser()
+
+
+def service_plist(repo, hours=None, autostart=False, goal="GOAL.md"):
+    """The launchd job for one repository's swarm.
+
+    RunAtLoad is off unless asked for: this daemon spends real money, so coming back by itself
+    after a reboot has to be a decision someone made, not a side effect of installing."""
+    repo = str(Path(repo).expanduser().resolve())
+    args = [python_for(load_cfg(repo)), str(HERE / "swarmd.py"), "grind", repo]
+    if goal:
+        args += ["--goal", goal]
+    if hours:
+        args += ["--hours", str(hours)]
+    # Not LOGS: use_repo rebinds that to the per-repo directory, and this is written before
+    # any repo is in use. launchd needs the directory to exist before it will start the job.
+    logs = HERE / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    out = str(logs / f"{repo_slug(repo)}.out")
+    return {
+        "Label": service_label(repo),
+        "ProgramArguments": args,
+        "EnvironmentVariables": {"FLINT_SWARM_CONFIG": str(config_path_for(repo))},
+        "WorkingDirectory": str(ROOT),
+        "StandardOutPath": out,
+        "StandardErrorPath": out,
+        # Restart a crash, but never fight a clean `swarm stop`.
+        "KeepAlive": {"SuccessfulExit": False},
+        "RunAtLoad": bool(autostart),
+        "ProcessType": "Background",
+    }
+
+
+def launchctl(*args):
+    r = subprocess.run(["launchctl", *args], capture_output=True, text=True)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def cmd_service(a):
+    """Install, inspect or remove the launchd job that keeps this repository's swarm running."""
+    if sys.platform != "darwin":
+        sys.exit("swarm service manages a macOS launchd agent; this is not macOS")
+    repo = str(Path(a.repo or load_cfg().get("repo", ".")).expanduser().resolve())
+    path, label, uid = service_plist_path(repo), service_label(repo), os.getuid()
+    if a.action == "status":
+        rc, out = launchctl("print", f"gui/{uid}/{label}")
+        print(json.dumps({"label": label, "plist": str(path), "installed": path.is_file(),
+                          "loaded": rc == 0, "autostart": (
+                              plistlib.loads(path.read_bytes()).get("RunAtLoad", False)
+                              if path.is_file() else None)}, indent=2))
+        if rc == 0:
+            print("\n".join(l for l in out.splitlines() if re.search(r"state|pid|last exit", l)))
+        return
+    if a.action == "uninstall":
+        rc, out = launchctl("bootout", f"gui/{uid}/{label}")
+        path.unlink(missing_ok=True)
+        print(f"removed {path}" + ("" if rc == 0 else f" (it was not loaded: {out[:200]})"))
+        return
+    job = service_plist(repo, hours=a.hours, autostart=a.autostart, goal=a.goal)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    launchctl("bootout", f"gui/{uid}/{label}")     # replace any earlier copy
+    path.write_bytes(plistlib.dumps(job))
+    rc, out = launchctl("bootstrap", f"gui/{uid}", str(path))
+    if rc != 0:
+        sys.exit(f"wrote {path} but launchctl refused it: {out[:400]}")
+    print(f"installed {label}\n  config: {job['EnvironmentVariables']['FLINT_SWARM_CONFIG']}"
+          f"\n  log:    {job['StandardOutPath']}"
+          f"\n  {'starts at login and after a reboot' if a.autostart else 'does NOT start on its own — run `launchctl kickstart gui/%d/%s` to start it' % (uid, label)}"
+          f"\n  stop:   swarm stop --drain   ·   remove: swarm service uninstall --repo {repo}")
+
+
 def cmd_stop(a):
     """Stop this repository's daemon: now, or after the task(s) in flight finish."""
     _setup()
@@ -3363,6 +3444,15 @@ def main():
     p2 = sub.add_parser("plan")
     p2.add_argument("-n", type=int, default=5)
     p2.set_defaults(fn=cmd_plan)
+    sv = sub.add_parser("service", help="a launchd agent that restarts this repository's swarm")
+    sv.add_argument("action", choices=("install", "status", "uninstall"))
+    sv.add_argument("--repo", help="the repository to grind (default: the configured one)")
+    sv.add_argument("--hours", type=float, help="stop after this many hours per run")
+    sv.add_argument("--goal", default="GOAL.md")
+    sv.add_argument("--autostart", action="store_true",
+                    help="also start at login and after a reboot. This daemon spends money, so "
+                         "it is off unless you ask for it.")
+    sv.set_defaults(fn=cmd_service)
     st = sub.add_parser("stop", help="stop this repository's daemon")
     st.add_argument("--drain", action="store_true",
                     help="finish the task(s) in flight first, instead of killing them mid-turn")

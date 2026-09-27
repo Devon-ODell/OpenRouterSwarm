@@ -379,3 +379,105 @@ class StopDrainTests(unittest.TestCase):
         self.assertEqual((drained["how"], drained["draining"]), ("drain", [proc.pid]))
         self.assertEqual(drained["stopped"], [])
         self.assertEqual((stopped["how"], stopped["stopped"]), ("stop", [proc.pid]))
+
+
+class ServiceTests(unittest.TestCase):
+    """The launchd agent that brings a swarm back after a reboot.
+
+    After the reboot on 2026-09-26 nothing came back until someone asked, and the easy way to
+    bring it back by hand was the one that loaded the wrong config.
+    """
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.root = Path(d.name)
+        (self.root / "configs").mkdir()
+        (self.root / "logs").mkdir()
+        self.repo = self.root / "studio"
+        self.repo.mkdir()
+        self.default = self.root / "config.json"
+        self.default.write_text(json.dumps(
+            {"repo": str(self.repo), "test_cmd": "true", "python": sys.executable}))
+        for attr, value in (("HERE", self.root), ("CONFIG", self.default),
+                            ("LAUNCH_AGENTS", self.root / "LaunchAgents"),
+                            ("EXAMPLE", self.root / "config.example.json")):
+            p = patch.object(swarmd, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        os.environ.pop("FLINT_SWARM_CONFIG", None)
+
+    def job(self, **kw):
+        return swarmd.service_plist(str(self.repo), **kw)
+
+    def test_it_is_named_and_filed_by_the_repositorys_slug(self):
+        slug = swarmd.repo_slug(self.repo)
+        self.assertEqual(swarmd.service_label(self.repo), f"com.flint.swarm.{slug}")
+        self.assertEqual(swarmd.service_plist_path(self.repo).name,
+                         f"com.flint.swarm.{slug}.plist")
+
+    def test_it_carries_the_repositorys_own_config(self):
+        tuned = self.root / "configs" / f"{swarmd.repo_slug(self.repo)}.json"
+        tuned.write_text(json.dumps({"repo": str(self.repo), "test_cmd": "tuned"}))
+        self.assertEqual(self.job()["EnvironmentVariables"]["FLINT_SWARM_CONFIG"], str(tuned))
+
+    def test_it_grinds_the_repository_it_was_asked_for(self):
+        args = self.job(hours=12)["ProgramArguments"]
+        self.assertEqual(args[1:], [str(self.root / "swarmd.py"), "grind",
+                                    str(self.repo.resolve()), "--goal", "GOAL.md",
+                                    "--hours", "12"])
+
+    def test_the_log_goes_under_the_logs_directory(self):
+        out = self.job()["StandardOutPath"]
+        self.assertEqual(out, str(self.root / "logs" / f"{swarmd.repo_slug(self.repo)}.out"))
+        self.assertEqual(self.job()["StandardErrorPath"], out)
+        self.assertTrue(Path(out).parent.is_dir(), "launchd will not start without it")
+
+    def test_a_crash_is_restarted_but_a_clean_stop_is_not_fought(self):
+        self.assertEqual(self.job()["KeepAlive"], {"SuccessfulExit": False})
+
+    def test_autostart_is_off_unless_it_is_asked_for(self):
+        """This daemon spends real money from a shared pot."""
+        self.assertIs(self.job()["RunAtLoad"], False)
+        self.assertIs(self.job(autostart=True)["RunAtLoad"], True)
+
+    def test_the_plist_is_valid(self):
+        import plistlib
+        path = self.root / "t.plist"
+        path.write_bytes(plistlib.dumps(self.job(hours=12, autostart=True)))
+        self.assertEqual(plistlib.loads(path.read_bytes())["Label"],
+                         swarmd.service_label(self.repo))
+        lint = subprocess.run(["plutil", "-lint", str(path)], capture_output=True, text=True)
+        self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
+
+    def test_install_writes_the_file_and_bootstraps_it(self):
+        calls = []
+
+        def fake(*args):
+            calls.append(args)
+            return 0, ""
+        args = Mock(action="install", repo=str(self.repo), hours=8.0, goal="GOAL.md",
+                    autostart=False)
+        with patch.object(swarmd, "launchctl", side_effect=fake), \
+             patch("builtins.print"), patch.object(swarmd.sys, "platform", "darwin"):
+            swarmd.cmd_service(args)
+        path = swarmd.service_plist_path(self.repo)
+        self.assertTrue(path.is_file())
+        self.assertEqual(calls[0][0], "bootout")   # replaces any earlier copy first
+        self.assertEqual(calls[1][:2], ("bootstrap", f"gui/{os.getuid()}"))
+
+    def test_uninstall_removes_the_file_even_when_it_was_not_loaded(self):
+        path = swarmd.service_plist_path(self.repo)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(__import__("plistlib").dumps(self.job()))
+        args = Mock(action="uninstall", repo=str(self.repo))
+        with patch.object(swarmd, "launchctl", return_value=(1, "not loaded")), \
+             patch("builtins.print"), patch.object(swarmd.sys, "platform", "darwin"):
+            swarmd.cmd_service(args)
+        self.assertFalse(path.exists())
+
+    def test_it_refuses_politely_off_macos(self):
+        args = Mock(action="status", repo=str(self.repo))
+        with patch.object(swarmd.sys, "platform", "linux"), self.assertRaises(SystemExit) as e:
+            swarmd.cmd_service(args)
+        self.assertIn("macOS", str(e.exception))
