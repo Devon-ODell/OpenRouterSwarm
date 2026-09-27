@@ -549,7 +549,7 @@ class SwarmTests(unittest.TestCase):
         worker = swarmd.Worker(0, cfg, q, Mock(), threading.Event())
         seen = {}
 
-        def capture(tid, ok, note="", defer=0, split_now=False, failure_class="task"):
+        def capture(tid, ok, note="", defer=0, split_now=False, failure_class="task", park=False):
             seen.update(ok=ok, note=note, split_now=split_now, failure_class=failure_class)
             worker.stop.set()
             return None
@@ -577,7 +577,7 @@ class SwarmTests(unittest.TestCase):
             (cwd / "broken").write_text("half a change\n")
             raise swarmd.AgentTimeout(role, "test", 900, "turn.log")
 
-        def capture(tid, ok, note="", defer=0, split_now=False, failure_class="task"):
+        def capture(tid, ok, note="", defer=0, split_now=False, failure_class="task", park=False):
             seen.update(split_now=split_now, failure_class=failure_class)
             worker.stop.set()
             return None

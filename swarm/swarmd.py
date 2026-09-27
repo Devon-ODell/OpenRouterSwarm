@@ -47,7 +47,8 @@ LOGS.mkdir(exist_ok=True)
 DEFAULT_MODEL = "inclusionai/ling-3.0-flash-fin:free"
 KINDS = ("feature", "bugfix", "test", "refactor")
 META = ("persona", "planner_model", "priority", "depth", "parent", "origin", "acceptance",
-        "depends_on", "root", "strategy", "execution_class", "allow_test_changes", "serves")
+        "depends_on", "root", "strategy", "execution_class", "allow_test_changes", "serves",
+        "packet")
 # Only a person may authorise a task to change existing tests. A planner or decomposer that
 # could set this on its own subtasks would have found the way to make any red suite green.
 TEST_CHANGE_ORIGINS = frozenset({"human", "cursor"})
@@ -146,7 +147,8 @@ RELOADABLE = frozenset({
     "max_repairs", "reviewer_exclude", "plan_cooldown", "plan_batch", "allowance_recheck",
     "monthly_usd", "daily_usd", "spend_reset_day", "daily_cap", "reserve", "owner_window",
     "max_queue", "max_depth", "inject_corpus", "allow_paid", "study", "tick", "max_diff",
-    "validation_commands", "test_cmd", "keep_worktrees"})
+    "validation_commands", "test_cmd", "keep_worktrees", "scope_gate", "idle_improvement",
+    "idle_improvement_cooldown", "max_review_formats"})
 # Changing these under a running daemon would strand worktrees, state or threads.
 RESTART_ONLY = frozenset({"repo", "trunk", "workers", "sandbox_write", "base_branch", "python",
                           "goal_file", "roadmap_file"})
@@ -893,7 +895,8 @@ class Queue:
 
     MAX_HARNESS_FAILURES = 3
 
-    def release(self, tid, ok, note="", defer=0, split_now=False, failure_class="task"):
+    def release(self, tid, ok, note="", defer=0, split_now=False, failure_class="task",
+                park=False):
         """Returns the task with its new status: done, retry, split, parked or held.
 
         `failure_class` decides whether this failure counts against the task at all. A harness
@@ -911,7 +914,8 @@ class Queue:
             rows = [r for r in rows if r["id"] != tid]
             task.pop("claimed", None)
             harness = not ok and not defer and failure_class == "harness"
-            task["attempts"] = task.get("attempts", 0) + (0 if defer or harness else 1)
+            park = bool(park) and not ok and not defer
+            task["attempts"] = task.get("attempts", 0) + (0 if defer or harness or park else 1)
             if not harness:
                 task["note"] = note[-800:]
             if defer:
@@ -920,6 +924,10 @@ class Queue:
                 rows.append(task)
             elif ok:
                 task["status"] = "done"
+            elif park:
+                # A second attempt cannot supply the scope the first one was missing, and a
+                # split would only produce two tasks with the same gap. This needs a person.
+                task["status"] = "parked"
             elif harness:
                 # This says nothing about the task, so it costs the task nothing and teaches the
                 # next attempt nothing. It is still counted: a task that only ever fails this way
@@ -1204,7 +1212,60 @@ def note_interrupted(c, q):
 # and after two attempts a split or a park — so a step limit, a sandbox timeout or a restart
 # cost a task one of its two lives and scored the model down for it. 90 of 121 finished tasks
 # were split or parked, every deep-game milestone among them.
-TASK_STAGES = frozenset({"tests_failed", "rejected", "weakened_tests"})
+TASK_STAGES = frozenset({"tests_failed", "rejected", "weakened_tests", "out_of_scope"})
+
+# A path, or a symbol, written plainly enough that an implementer could open it.
+NAMES_A_PATH = re.compile(
+    r"[\w./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|json|md|html|css|scss|sh|go|rs|java|rb|"
+    r"c|h|cc|cpp|hpp|yml|yaml|toml|sql|swift|kt)\b")
+NAMES_A_SYMBOL = re.compile(r"\b(?:def|class|function|const|fn|func|struct|interface)\s+\w+"
+                            r"|\b\w+\(\)|`[^`\n]{2,60}`")
+# Phrasing with no wrong answer. On its own this is not a defect — plenty of good tasks say
+# "and so on" in passing — so it only counts against a task that also names no observable.
+BROAD_ASK = re.compile(
+    r"\b(?:everything|anything else|all (?:the )?(?:code|files|tests|games|issues)|"
+    r"as (?:needed|appropriate|you see fit)|and so on|etc\.?|various (?:issues|places|files)|"
+    r"wherever (?:needed|possible|appropriate)|"
+    r"(?:improve|clean up|tidy|refactor|fix) (?:the )?(?:whole|entire|rest of the|codebase)|"
+    r"any (?:other )?(?:issues|bugs|problems)(?: you (?:can )?find)?)\b", re.I)
+
+
+def scope_gap(task, c=None):
+    """Why this task cannot be handed to an implementer as written, or "" when it can.
+
+    A roadmap packet arrives with acceptance criteria, verification commands and the files it
+    concerns, and `dispatch_roadmap` will not hand it out until its gates are evidenced. Work
+    that arrives any other way — a planner batch, a question the editor turned into a task, a
+    report typed in by hand — reaches the same implementer with whatever text it happened to
+    carry, and bypasses every one of those checks. A request broad enough to have no wrong
+    answer then spends an implementer turn, a full suite, a review and a repair before anyone
+    discovers it had no scope. This applies the packet's guarantees to every task, before a
+    model is paid to find the gap.
+
+    It is deliberately hard to fail: a task is refused only when it declared acceptance
+    criteria that say no more than its title does, and nothing in it names a file, a symbol
+    or a command either — or when it reads as open-ended however it arrived."""
+    title = (task.get("title") or "").strip()
+    text = f"{title}\n{task.get('detail') or ''}"
+    declared = task.get("acceptance")
+    rows = [r for r in (declared or []) if isinstance(r, str) and r.strip()]
+    # An acceptance criterion that repeats the title states no more than the title did.
+    if [r for r in rows if r.strip().lower() != title.lower()]:
+        return ""
+    broad = BROAD_ASK.search(text)
+    if broad:
+        return (f"open-ended request ({broad.group(0).strip()!r}) with no acceptance criterion "
+                "beyond its title: say what must be true when it is done")
+    if declared is None:
+        # Nothing was declared at all, so there is no vacuous declaration to object to. The
+        # queue's own `criteria()` is what decides whether a task may be added; this gate
+        # judges what a task claims about itself, not what it omitted.
+        return ""
+    if not (NAMES_A_PATH.search(text) or NAMES_A_SYMBOL.search(text)):
+        return ("nothing here names a file, a symbol or an observable, so there is no way to "
+                "tell a finished attempt from an abandoned one: add an acceptance criterion "
+                "or name the code it concerns")
+    return ""
 # Not the model answering badly: the baseline was already broken, trunk moved under the attempt,
 # the supervisor declined it, or the run was stopped.
 HARNESS_STAGES = frozenset({"baseline", "conflict", "refused", "interrupted", "deferred",
@@ -1470,6 +1531,26 @@ def waiting(worker, why):
         _waiting[worker] = why
 
 
+def forget_worker(worker):
+    """Drop everything this worker's last task left behind.
+
+    Every one of these maps is keyed by worker name and outlives the task that filled it.
+    A worker that finished a turn on a paid stand-in kept `_ran_on`; one whose wait was cut
+    short by a stop kept `_waiting`; a killed turn kept `_active_turns` and `_turn_logs`.
+    The next task then reported the previous task's model, the previous task's reason for
+    not working, and a round counter read out of a log that had stopped growing."""
+    for book in (_waiting, _ran_on, _active_turns, _turn_logs, _held):
+        book.pop(worker, None)
+    with _study_lock:
+        for book in (_study_calls, _edit_calls, _charges):
+            book.pop(worker, None)
+
+
+def live_workers(workers):
+    """The names of workers that are still running, for reports that must not quote a dead one."""
+    return {w.name for w in workers if w.is_alive()}
+
+
 def count_study(worker, n=0, reset=False):
     """Study-tool calls made by one worker's turns since its attempt began."""
     with _study_lock:
@@ -1656,42 +1737,48 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     model = model or (pool(c) or [DEFAULT_MODEL])[0]
     _ran_on.pop(worker, None)
     whole_turn = max(1, int(max_steps or 1))
-    while True:
-        if _stop.is_set():
-            raise Stopped("swarm is stopping")
-        ok, wait, why = budget.check()
-        if ok:
-            # Starting is not finishing. 21 turns paused part-way on the budget (exit 6) and
-            # everything they had done to that point was thrown away, so a turn whose rounds do
-            # not all fit goes to a paid model now rather than halfway through. If no paid model
-            # is reachable it still runs: a short turn may finish, and idling until midnight is
-            # certainly worse.
-            if not budget.check(need=whole_turn)[0]:
-                route_to_paid(c, role, worker, model,
-                              f"only part of a {whole_turn}-round turn fits the free allowance")
-                model = _ran_on.get(worker, model)
-            break
-        # The local count only climbs until midnight. Before paying for this turn or waiting
-        # on it, ask OpenRouter whether the free requests are really gone.
-        if recheck_allowance(c, budget):
-            continue
-        # Free capacity is gone. If this swarm has a dollar budget left, the turn runs on a
-        # paid model rather than idling until midnight; `paid_stand_in` returns None once the
-        # budget is spent, and during the owner's window no paid model is reached for at all.
-        if budget.paid_would_help():
-            alt = route_to_paid(c, role, worker, model, why)
-            if alt:
-                model = alt
+    try:
+        while True:
+            if _stop.is_set():
+                raise Stopped("swarm is stopping")
+            ok, wait, why = budget.check()
+            if ok:
+                # Starting is not finishing. 21 turns paused part-way on the budget (exit 6) and
+                # everything they had done to that point was thrown away, so a turn whose rounds do
+                # not all fit goes to a paid model now rather than halfway through. If no paid model
+                # is reachable it still runs: a short turn may finish, and idling until midnight is
+                # certainly worse.
+                if not budget.check(need=whole_turn)[0]:
+                    route_to_paid(c, role, worker, model,
+                                  f"only part of a {whole_turn}-round turn fits the free allowance")
+                    model = _ran_on.get(worker, model)
                 break
-        # The allowance can be hours from resetting; saying so once a quarter hour is enough,
-        # and the worker records that it is waiting rather than working.
-        waiting(worker, f"waiting for the allowance: {why}")
-        if time.time() - _held.get(worker, 0) > 900:
-            _held[worker] = time.time()
-            log(f"{role}: holding {wait/60:.0f}m — {why}", worker)
-        _stop.wait(max(1, min(wait, 60)))
-    _held.pop(worker, None)
-    waiting(worker, None)
+            # The local count only climbs until midnight. Before paying for this turn or waiting
+            # on it, ask OpenRouter whether the free requests are really gone.
+            if recheck_allowance(c, budget):
+                continue
+            # Free capacity is gone. If this swarm has a dollar budget left, the turn runs on a
+            # paid model rather than idling until midnight; `paid_stand_in` returns None once the
+            # budget is spent, and during the owner's window no paid model is reached for at all.
+            if budget.paid_would_help():
+                alt = route_to_paid(c, role, worker, model, why)
+                if alt:
+                    model = alt
+                    break
+            # The allowance can be hours from resetting; saying so once a quarter hour is enough,
+            # and the worker records that it is waiting rather than working.
+            waiting(worker, f"waiting for the allowance: {why}")
+            if time.time() - _held.get(worker, 0) > 900:
+                _held[worker] = time.time()
+                log(f"{role}: holding {wait/60:.0f}m — {why}", worker)
+            _stop.wait(max(1, min(wait, 60)))
+    finally:
+        # Whatever ends the wait — a stop, a cap, a provider going away — the worker is
+        # no longer holding for the allowance. Leaving the note behind made `now.json`
+        # report a reason from a turn that had already finished, and the panel's idle
+        # line kept quoting it while the swarm was demonstrably working.
+        _held.pop(worker, None)
+        waiting(worker, None)
 
     env = dict(os.environ)
     env["FLINT_MAX_STEPS"] = str(max_steps)
@@ -2300,7 +2387,7 @@ def write_now(workers, c=None):
 
     The panel's top line was a list of counters — free requests, a spend meter, a corpus chunk
     count — none of which says whether the swarm is working or what on."""
-    rows = []
+    rows, live = [], live_workers(workers)
     for w in workers:
         task, since = getattr(w, "task", None), getattr(w, "started", 0)
         if not (task and since and w.is_alive()):
@@ -2325,8 +2412,13 @@ def write_now(workers, c=None):
             first = min(u for _, u, _ in resting)
             note["idle"] = "all models resting"
             note["back"] = first
-        elif _waiting:
-            note["idle"] = sorted(_waiting.values())[0]
+        else:
+            # Only a worker that is still running can still be waiting. A reason left behind
+            # by a finished or replaced worker used to sit in the panel's idle line for the
+            # rest of the shift, describing an allowance hold that had long since cleared.
+            held = sorted(why for name, why in _waiting.items() if name in live)
+            if held:
+                note["idle"] = held[0]
     tmp = (STATE / "now.json").with_suffix(".tmp")
     try:
         tmp.write_text(json.dumps(note))
@@ -2596,9 +2688,9 @@ class Worker(threading.Thread):
         self.agent_timed_out = False
         self.failure_class = "task"
         self.execution_class = task.get("execution_class", "standard")
-        count_study(self.name, reset=True)
-        count_edits(self.name, reset=True)
-        count_usd(self.name, reset=True)
+        # Not just the counters: a task starts with no inherited model, waiting reason or
+        # live-turn log either, or its first status line describes the task before it.
+        forget_worker(self.name)
         note, info = "attempt interrupted before completion", {}
         try:
             self.stage, note, info = self._attempt(task, goal, info)
@@ -2687,10 +2779,52 @@ class Worker(threading.Thread):
             raise ModelError("reviewer modified the candidate it was asked to inspect")
         return review
 
+    def reviewed(self, tree, diff, tests, adv, impl, allowed):
+        """(review, reviewer, error) for this candidate, retrying a reviewer that cannot
+        produce a readable verdict.
+
+        `parse_review` refuses a malformed, stale or unsupported review, and that refusal used
+        to end the attempt: an implementation whose tests had just passed was thrown away
+        because a third model could not emit JSON. A review that cannot be read is a fact
+        about the reviewer, not about the candidate. So the same tree, the same diff and the
+        same test output go to another reviewer, and only a run of reviewers that all fail
+        ends the attempt. It costs the repair budget nothing — no repair is warranted while
+        nothing has yet been said about the code."""
+        tries = max(1, 1 + int(self.c.get("max_review_formats", 2)))
+        tried, err = set(), None
+        for n in range(tries):
+            try:
+                review = self.review(tree, diff, tests, adv, avoid={impl} | tried,
+                                     allow_test_changes=allowed)
+                return review, (self.last_model or adv), None
+            except (ModelError, StepLimit) as exc:
+                ran, err = self.last_model or adv, exc
+                if "modified the candidate" in str(exc):
+                    # Not a formatting slip: the tree this review was about no longer exists,
+                    # so there is nothing left for another reviewer to be asked about.
+                    return None, ran, exc
+                tried.add(ran)
+                self.evidence.record("review_unreadable", reviewer=ran, tried=n + 1,
+                                     reason=str(exc)[:300])
+                nxt = self.pick(tried | {impl} | self.no_review(), role="adversary")
+                if nxt is None or n == tries - 1:
+                    return None, ran, exc
+                log(f"reviewer {ran} returned no usable verdict ({str(exc)[:90]}); putting the "
+                    f"same candidate to {nxt}", self.name)
+                adv = nxt
+        return None, adv, err
+
     def _attempt(self, task, goal, info):
         c, w = self.c, self.name
         if task.get("kind") == "harness":
             return "refused", "target a separate harness checkout; live harness editing is disabled", info
+        gap = scope_gap(task, c) if c.get("scope_gate", True) else ""
+        if gap:
+            # Before the worktree, before the baseline suite, before the first request.
+            log(f"{task['id']} has no workable scope: {gap}", w)
+            journal("out_of_scope", id=task["id"], title=task["title"],
+                    origin=task.get("origin"), gap=gap)
+            return "out_of_scope", gap, info
         log(f"claim {task['id']} — {task['title']}", w)
         self.ensure_worktree(task)
         wd = self.wt
@@ -2806,12 +2940,10 @@ class Worker(threading.Thread):
                 return "rejected", "test command modified the candidate; fix test isolation/ignored files", info
             review = None
             if ok:
-                try:
-                    review = self.review(tree, diff, tests, adv, avoid={impl}, allow_test_changes=allowed)
-                except (ModelError, StepLimit) as exc:
-                    info["reviewer"] = self.last_model or adv   # the model that failed to deliver
+                review, adv, exc = self.reviewed(tree, diff, tests, adv, impl, allowed)
+                info["reviewer"] = adv          # the model that answered, or failed to
+                if exc is not None:
                     return "review_error", str(exc), info
-                adv = info["reviewer"] = self.last_model or adv
                 info["same_model_review"] = adv == impl
                 if review["verdict"] == "approve":
                     info["review"] = review
@@ -3127,7 +3259,8 @@ class Worker(threading.Thread):
                 # A timeout only forces a split when there was work to be too big for. With no
                 # diff there is nothing to divide, and the timeout is ours, not the task's.
                 final = self.q.release(task["id"], ok, note, failure_class=self.failure_class,
-                                       split_now=self.agent_timed_out and self.stage != "agent_timeout")
+                                       split_now=self.agent_timed_out and self.stage != "agent_timeout",
+                                       park=self.stage == "out_of_scope")
                 journal("task", id=task["id"], title=task["title"], ok=ok, stage=self.stage,
                         failure_class=None if ok else self.failure_class,
                         worker=self.name, note=note[:300])
@@ -3181,6 +3314,13 @@ class Worker(threading.Thread):
                     except Exception as exc:
                         log(f"could not split '{final['title']}': {exc}", self.name)
                 self.stop.wait(30)
+            finally:
+                # Between tasks a worker is not working on anything. `task` and `started` used
+                # to keep the last task's values while the worker sat in claim(), so the panel
+                # showed a finished task as still running with an elapsed time that kept
+                # climbing — the single most misleading line the status ever printed.
+                self.task, self.started, self.doing = None, 0, None
+                forget_worker(self.name)
 
 
 # ------------------------------------------------------------------ planning
@@ -3541,6 +3681,7 @@ KNOWN_KEYS = frozenset({
     "corpus_db", "corpus_root", "corpus_k", "study", "inject_corpus", "mit_experiment",
     "sandbox", "sandbox_write", "keep_worktrees", "notify", "baseline_ttl", "personas",
     "restart_on_change", "restart_min_interval", "role_models",
+    "scope_gate", "idle_improvement", "idle_improvement_cooldown", "max_review_formats",
     "execution_class", "_comment"})
 # Seconds a round of tool use really takes on these models, from the studio's own turns.
 SECONDS_PER_ROUND = 47
@@ -3701,23 +3842,79 @@ def holder():
             f"  Stop it:   kill -INT {d['pid']}   (or Ctrl-C in its terminal)")
 
 
+# What holds a roadmap packet, and the one thing that would release it. A blocker with no
+# stated next action is the same as no blocker at all: the run stalls and the report says
+# only that it stalled.
+BLOCKER_ACTIONS = {
+    "dependency": "land the packet(s) it waits on, or repoint this packet's depends_on",
+    "coordinator_gate": "record the gate's evidence in docs/roadmap/EXECUTION.json and commit it",
+    "coordinator_owned": "this packet is the coordinator's to accept; record it in "
+                         "EXECUTION.json under packets.<id> with its evidence",
+    "attempt_failed": "read the attempt's evidence, then record packets.<id>.retry "
+                      "{reason, at} in EXECUTION.json to authorise another run",
+    "unverified_completion": "the queue says done but no integrated commit for it is on trunk; "
+                             "record the accepted commit, or packets.<id>.retry to run it again",
+    "queue_full": "nothing — it is next in line once the queue drains",
+}
+_roadmap_said = {}      # the last set of root blockers logged, so a stable stall says so once
+
+
+def retry_recorded(evidence, since):
+    """Whether a person recorded a repair or a decision for a packet after its last attempt.
+
+    Making a failed packet visible is only half of it. Re-dispatching it on the next tick
+    would run it straight back into the failure that stopped it, once every tick, for the
+    rest of the shift. So it stays held until the ledger carries a `retry`, `repair` or
+    `decision` with a reason, timestamped after the attempt that failed."""
+    note = evidence.get("retry") or evidence.get("repair") or evidence.get("decision")
+    if not isinstance(note, dict) or not str(note.get("reason") or "").strip():
+        return False
+    at = note.get("at")
+    if at in (None, ""):
+        return False                      # undated authorisation would re-authorise every failure
+    try:
+        when = float(at)
+    except (TypeError, ValueError):
+        try:
+            when = dt.datetime.fromisoformat(str(at)).timestamp()
+        except ValueError:
+            return False
+    return when > (since or 0)
+
+
 def dispatch_roadmap(c, q):
     """Dispatch only committed packets whose dependencies and owner gates are evidenced.
 
     The coordinator ledger stays authoritative for human gates. Live queue/commit
     evidence is reported separately so workers cannot accept their own gates.
-    """
+
+    Every packet that is neither accepted nor in flight is written to the execution report
+    with the reason it is held and the one thing that would release it. A packet whose
+    attempt failed used to be skipped by a bare `title in history` test: no blocker, no log
+    line, no queue entry. A roadmap that had stopped moving was indistinguishable from a
+    roadmap with nothing left to do."""
     repo, trunk = Path(c["repo"]), trunk_name(c)
+
     def committed(path):
         _, raw = git(["show", f"{trunk}:{path}"], cwd=repo, check=True)
         return json.loads(raw)
+
     rows = committed(c["roadmap_file"])["tasks"]
     ledger = committed("docs/roadmap/EXECUTION.json")
     if ledger.get("implementation_started") is not True:
         raise ValueError("roadmap implementation has not been activated")
     with q.locked():
         pending, done = _read(q.path), _read(q.done)
-    history = {r["title"]: r for r in done + pending}
+    titles = {p["id"]: p.get("title", p["id"]) for p in rows}
+    of_title = {p.get("title"): p["id"] for p in rows}
+    # Every queue row a packet has produced, oldest first. Rows queued before packets carried
+    # their id are matched on title, which is all they were ever keyed by.
+    tries = {p["id"]: [] for p in rows}
+    live = {r["id"] for r in pending}
+    for r in sorted(done + pending, key=lambda r: r.get("created", 0)):
+        pid = r.get("packet") or of_title.get(r.get("title"))
+        if pid in tries:
+            tries[pid].append(r)
     accepted = {}
     for packet in rows:
         pid = packet["id"]
@@ -3728,41 +3925,95 @@ def dispatch_roadmap(c, q):
                 accepted[pid] = evidence
             elif commit and git(["merge-base", "--is-ancestor", commit, trunk], cwd=repo)[0] == 0:
                 accepted[pid] = evidence
-        queued = history.get(packet["title"], {})
-        match = re.search(r"integrated ([0-9a-f]{40}) on", queued.get("note", ""))
-        if queued.get("status") == "done" and match:
-            commit = match.group(1)
-            if git(["merge-base", "--is-ancestor", commit, trunk], cwd=repo)[0] == 0:
-                accepted[pid] = {"status": "accepted", "queue_id": queued["id"],
-                                 "accepted_commit": commit, "evidence": queued["note"]}
-    added, blocked = [], {}
+        for queued in tries[pid]:
+            match = re.search(r"integrated ([0-9a-f]{40}) on", queued.get("note") or "")
+            if queued.get("status") == "done" and match:
+                commit = match.group(1)
+                if git(["merge-base", "--is-ancestor", commit, trunk], cwd=repo)[0] == 0:
+                    accepted[pid] = {"status": "accepted", "queue_id": queued["id"],
+                                     "accepted_commit": commit, "evidence": queued["note"]}
+    added, blocked, flight = [], {}, []
+
+    def hold(pid, reason, waiting_on=(), **extra):
+        blocked[pid] = {"title": titles.get(pid, pid), "reason": reason,
+                        "waiting_on": list(waiting_on),
+                        "next_action": BLOCKER_ACTIONS[reason], **extra}
+
     for packet in rows:
         pid = packet["id"]
-        if packet["dispatch"] != "swarm" or pid in accepted or packet["title"] in history:
+        if pid in accepted:
             continue
-        missing = [dep for dep in packet["depends_on"] if dep not in accepted]
-        missing += [gate for gate in packet.get("coordinator_gates", [])
-                    if not ledger.get("gates", {}).get(gate, {}).get("evidence")]
+        if packet["dispatch"] != "swarm":
+            hold(pid, "coordinator_owned")
+            continue
+        attempt = tries[pid][-1] if tries[pid] else None
+        if attempt and attempt["id"] in live:
+            flight.append({"queue_id": attempt["id"], "packet": pid, "title": attempt["title"],
+                           "claimed": bool(attempt.get("claimed"))})
+            continue
+        missing = [dep for dep in packet.get("depends_on", []) if dep not in accepted]
+        gates = [g for g in packet.get("coordinator_gates", [])
+                 if not ledger.get("gates", {}).get(g, {}).get("evidence")]
         if missing:
-            blocked[pid] = missing
+            hold(pid, "dependency", missing)
+            continue
+        if gates:
+            hold(pid, "coordinator_gate", gates)
+            continue
+        if attempt and not retry_recorded(ledger.get("packets", {}).get(pid, {}),
+                                          attempt.get("finished") or attempt.get("created")):
+            hold(pid, "unverified_completion" if attempt.get("status") == "done"
+                 else "attempt_failed",
+                 queue_id=attempt["id"], attempt_status=attempt.get("status"),
+                 attempt_note=(attempt.get("note") or "")[:400], attempts=len(tries[pid]))
             continue
         if len(pending) + len(added) >= 5:
+            hold(pid, "queue_full", queued=len(pending) + len(added))
             continue
+        title = packet["title"] if not tries[pid] else f"{packet['title']} (retry {len(tries[pid]) + 1})"
         detail = (packet["detail"] + "\n\nREAD: docs/roadmap/README.md and this packet in "
                   + c["roadmap_file"] + "\nVERIFICATION:\n" + "\n".join(packet.get("commands", [])))
-        task = q.add(packet["title"], detail, "feature", origin="roadmap",
+        task = q.add(title, detail, "feature", origin="roadmap", packet=pid,
                      priority=packet["priority"], execution_class=packet["execution_class"],
                      acceptance=packet["acceptance"], serves=1)
         if task:
             added.append(task)
             log(f"roadmap {pid}: queued {task['id']}")
+    downstream = {p["id"]: [] for p in rows}
+    for p in rows:
+        for dep in p.get("depends_on", []):
+            if dep in downstream:
+                downstream[dep].append(p["id"])
+    for pid, row in blocked.items():
+        row["blocks"] = sorted(downstream.get(pid, []))
+        # A root blocker waits on nothing that is itself blocked. Clearing one of those is
+        # what actually moves the roadmap; the rest resolve on their own once it does.
+        row["root"] = not any(dep in blocked for dep in row["waiting_on"])
+    roots = {pid: row for pid, row in blocked.items() if row["root"]}
+    mark = json.dumps(sorted((pid, row["reason"]) for pid, row in roots.items()))
+    if roots and mark != _roadmap_said.get("blockers"):
+        _roadmap_said["blockers"] = mark
+        for pid, row in sorted(roots.items()):
+            log(f"roadmap {pid} ({row['title']}) is held — {row['reason']}: {row['next_action']}")
+        journal("roadmap_blocked", roots=sorted(roots),
+                reasons={pid: row["reason"] for pid, row in roots.items()})
+    elif not roots:
+        _roadmap_said.pop("blockers", None)
     report = {"updated": dt.datetime.now().isoformat(), "accepted": accepted,
-              "blocked": blocked, "pending": [{"id": t["id"], "title": t["title"]}
-                                               for t in pending + added]}
+              "blocked": blocked, "roots": sorted(roots), "in_flight": flight,
+              "pending": [{"id": t["id"], "title": t["title"]} for t in pending + added]}
     tmp = STATE / "roadmap-execution.tmp"
     tmp.write_text(json.dumps(report, indent=2) + "\n")
     tmp.replace(STATE / "roadmap-execution.json")
     return added
+
+
+def read_roadmap():
+    """The last roadmap execution report, for `swarm status` and the panel."""
+    try:
+        return json.loads((STATE / "roadmap-execution.json").read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def hours_left(hours):

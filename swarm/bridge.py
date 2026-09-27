@@ -685,6 +685,9 @@ def cmd_status(a):
           "config_warnings": swarmd.config_warnings(c),
           "config_tuned_available": str(tuned) if tuned.is_file() else None,
           "trunk": swarmd.trunk_name(c), "trunk_ahead": int(ahead) if str(ahead or "").isdigit() else None,
+          # A roadmap run whose packets are all held looks exactly like an idle one from the
+          # queue alone. The report says which packet is held, why, and what releases it.
+          "roadmap": swarmd.read_roadmap() if c.get("roadmap_file") else None,
           "queue": [queue_row(t, pending) for t in pending],
           "max_queue": c.get("max_queue", 20),
           "kinds": list(swarmd.KINDS),
