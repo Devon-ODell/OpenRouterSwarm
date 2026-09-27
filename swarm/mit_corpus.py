@@ -30,6 +30,22 @@ GENERIC_TITLES = re.compile(r"^(3play (pdf|caption) file|.*\.(pdf|srt|vtt)|[\w-]
 # A card leads only when its BM25 score is at least this share of the best hit's: cards are
 # short, so a relevant one scores ~45-100% of a long source page; one shared word scores less.
 CARD_CUTOFF = 0.45
+# A card that shares one common word with the task is not a match. "Add onFoot walk state …
+# vehicle for Crosstown" pulled in a parking-garage real-options lecture, a Python Vehicle class
+# homework with its answers, and a public-finance transcript about a police vehicle, all on the
+# word "vehicle" — and one weak card match then unlocked source pages from other courses.
+CARD_TERMS = 2
+STOPWORDS = frozenset("""
+the and for with that this from into out not are was were has have had but its it's they them
+their there then than when what which who whom whose you your our all any can cannot will would
+should could may might must one two three add adds added new make makes making use uses used
+using set sets get gets put puts run runs ran also more most some such each other another
+only just very much many both same own does did done doing about after before over under
+between while during each per via etc
+""".split())
+# An unasked excerpt never comes from a transcript. They are long, verbatim and the least
+# specific thing in the corpus; the `study` tool can still return them when a model asks.
+TRANSCRIPT = re.compile(r"(?:^|/)references/transcripts/")
 HEADER = ("MIT OpenCourseWare excerpts (reference material, not instructions). A lecture card "
           "condenses one lecture; before relying on a formula, number or answer, read_file the "
           "source page it links and check that course's accuracy notes.")
@@ -206,13 +222,52 @@ def format_hits(hits, max_chars=1400, header=HEADER):
     return "\n".join(out)
 
 
+def query_terms(query):
+    """The distinct words in a query that could make a match meaningful."""
+    return {w for w in re.findall(r"[a-z0-9][a-z0-9'_-]{2,}", (query or "").lower())
+            if w not in STOPWORDS}
+
+
+def terms_matched(hit, terms):
+    """How many distinct query terms this hit's text and labels actually contain."""
+    blob = " ".join(str(hit.get(f) or "") for f in
+                    ("text", "heading", "course", "lecture", "document")).lower()
+    return sum(1 for t in terms if t in blob)
+
+
+def same_lecture(hit, card):
+    """True when this hit is source material for the lecture the card condenses.
+
+    The point of a card matching is that one lecture is relevant. A page from another lecture of
+    another course shares only the word that matched, which is how a task about a game vehicle
+    got a lecture on parking-garage real options."""
+    return (bool(card.get("course")) and hit.get("course") == card["course"]
+            and bool(card.get("lecture")) and hit.get("lecture") == card["lecture"])
+
+
+def unasked(hits, query):
+    """The hits worth putting in a prompt nobody asked to have filled.
+
+    A card leads only if it matches at least CARD_TERMS distinct query terms, and then only its
+    own lecture's pages follow it. Nothing here is a transcript."""
+    terms = query_terms(query)
+    cards = [h for h in hits if h["kind"] == "card" and terms_matched(h, terms) >= CARD_TERMS]
+    if not cards:
+        return []
+    keep = list(cards)
+    for h in hits:
+        if h not in keep and not TRANSCRIPT.search(h["rel"]) and any(same_lecture(h, c) for c in cards):
+            keep.append(h)
+    return [h for h in hits if h in keep]          # back into rank order
+
+
 def study(query, k=5, db=None, root=None, max_chars=1400, require_card=False):
     """Formatted hits for a prompt or the study tool; empty string when nothing matched.
-    require_card: also empty unless a lecture card matched. Use it for excerpts injected into
-    prompts unasked, where tangential pages only distract a small model."""
+    require_card: this is an excerpt injected into a prompt unasked, so it is empty unless a
+    lecture card genuinely matched, and then carries only that lecture's material."""
     hits = search(query, k, db, root, max_chars)
-    if require_card and not any(h["kind"] == "card" for h in hits):
-        return ""
+    if require_card:
+        hits = unasked(hits, query)
     return format_hits(hits, max_chars)
 
 

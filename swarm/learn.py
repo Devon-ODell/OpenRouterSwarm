@@ -437,17 +437,31 @@ def _rank(lesson):
     return lesson["mean"] + 0.3 / math.sqrt(1 + lesson["n"])
 
 
-def format_playbook(lessons, pitfalls):
+def exhibit_files(text):
+    """The files an exhibit's diff is about, from the `# path` lines exhibit() writes."""
+    return {m.group(1) for m in re.finditer(r"^# (\S+)$", text or "", re.M)}
+
+
+def format_playbook(lessons, pitfalls, paths=(), max_diff=600):
+    """The playbook for one task's prompt.
+
+    `paths` are the files this task touches. The wall of shame was 4.1 KB of diffs from
+    unrelated tasks in every prompt, so the names stay — that is the deterrent — and at most one
+    diff is shown, only when it is about a file this task is going to touch."""
     shame = [p for p in pitfalls if p.get("kind") == "shame"]
     pitfalls = [p for p in pitfalls if p.get("kind") != "shame"]
+    paths = set(paths or ())
+    relevant = next((s for s in shame
+                     if s.get("exhibit") and paths & exhibit_files(s["exhibit"])), None)
     out = []
     if shame:
         out.append("HUNG FROM THE RAFTERS — faulty code agents shipped in this repository, kept "
                    "under their names as a warning to everyone. Study it. Do not be the next exhibit:")
         for s in shame:
             out.append(f"- `{s['model']}` {CRIME.get(s['stage'], s['stage'])} on '{s['title']}': {s['text']}")
-            if s.get("exhibit"):
-                out.append("  ```diff\n" + "\n".join("  " + l for l in s["exhibit"].splitlines()) + "\n  ```")
+            if s is relevant:
+                diff = s["exhibit"][:max_diff]
+                out.append("  ```diff\n" + "\n".join("  " + l for l in diff.splitlines()) + "\n  ```")
     if lessons:
         out.append("PLAYBOOK — lessons this swarm earned in this repository:")
         out += [f"- {'★ ' if l['pinned'] else ''}{l['text']}" for l in lessons]

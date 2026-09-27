@@ -125,19 +125,37 @@ class LearnTests(unittest.TestCase):
     def test_the_wall_of_shame_reaches_every_prompt(self):
         for i, stage in enumerate(("rejected", "weakened_tests", "tests_failed", "rejected")):
             self.L.hang(f"model-{i}:free", {"id": f"t{i}", "title": f"task {i}"}, stage,
-                        f"defect {i}", f"+bad line {i}")
+                        f"defect {i}", f"# src/mod{i}.py\n+bad line {i}")
         lessons, pitfalls = self.L.playbook()
         wall = [p for p in pitfalls if p["kind"] == "shame"]
         self.assertEqual(len(wall), 3)
         self.assertEqual(wall[0]["stage"], "weakened_tests")  # cheating hangs highest
+        # Every name is on the wall, whatever the task: that is what the wall is for.
         text = learn.format_playbook(lessons, pitfalls)
         self.assertIn("HUNG FROM THE RAFTERS", text)
         self.assertIn("`model-1:free` weakened existing tests to fake a pass on 'task 1': defect 1", text)
+        self.assertNotIn("+bad line", text, "an unrelated diff is 4 KB of prompt for nothing")
+        # The diff comes too, once, for the exhibit about a file this task is going to touch.
+        text = learn.format_playbook(lessons, pitfalls, {"src/mod3.py"})
         self.assertIn("  +bad line 3", text)
+        self.assertNotIn("+bad line 1", text)
+        self.assertEqual(text.count("```diff"), 1)
         board = {r["arm"]: r for r in self.L.leaderboard()}
         self.assertEqual(board, {})  # faults are counted against implementer arms only once they exist
         self.L.update("implementer", "model-0:free", 0.0)
         self.assertEqual({r["arm"]: r["faults"] for r in self.L.leaderboard()}, {"model-0:free": 1})
+
+    def test_only_600_characters_of_a_diff_reach_the_prompt(self):
+        self.L.hang("m:free", {"id": "t", "title": "big"}, "rejected", "defect",
+                    "# src/a.py\n" + "+x = 1\n" * 400)
+        lessons, pitfalls = self.L.playbook()
+        text = learn.format_playbook(lessons, pitfalls, {"src/a.py"})
+        self.assertLess(len(text), 1_400)
+
+    def test_an_exhibits_files_come_from_the_diff_it_kept(self):
+        self.assertEqual(learn.exhibit_files("# src/a.py\n+x\n# tests/b.py\n+y"),
+                         {"src/a.py", "tests/b.py"})
+        self.assertEqual(learn.exhibit_files(""), set())
 
     def test_breakthrough_needs_judged_excellence_or_an_outlier(self):
         self.assertTrue(is_breakthrough(0.9, {"breakthrough": True, "impact": 8, "creativity": 5}, []))
@@ -385,11 +403,13 @@ class ReinforcementTests(SwarmBase):
         rafters = (swarmd.STATE / "RAFTERS.md").read_text()
         self.assertIn("`sloppy:free` shipped a defect the reviewer proved", rafters)
         self.assertIn(w.branch, rafters)
-        # The next implementer sees the exhibit, named, with the offending code.
+        # The next implementer is told who shipped what, by name.
         self.assertIn("HUNG FROM THE RAFTERS", prompts[1])
         self.assertIn("`sloppy:free` shipped a defect the reviewer proved on 'Paginate results'", prompts[1])
-        self.assertIn("+page = items[offset:offset + size - 1]", prompts[1])
         self.assertNotIn("HUNG FROM THE RAFTERS", prompts[0])
+        # The diff itself is not pasted: this task names no file the exhibit is about, and an
+        # unrelated diff in every prompt was 4.1 KB of the 16.6 KB that crowded out the code.
+        self.assertNotIn("+page = items[offset:offset + size - 1]", prompts[1])
 
     def test_a_reviewer_that_cannot_deliver_a_verdict_is_penalised(self):
         repo, _ = self.repo()

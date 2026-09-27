@@ -48,9 +48,13 @@ edits the current directory directly. The swarm never edits your checkout.
    was split out of names), already read, numbered exactly as `read_file`
    prints them so an `edit_file` `old_str` can be copied straight out. A file
    too long to show becomes an outline of its definitions with line numbers.
-   The turn's rounds are for editing, not for finding the file. On the corpus side of the MIT experiment (below) it also carries
-   MIT lecture-card excerpts when a lecture card matches the task, and every
-   role in the attempt can call the `study` tool.
+   The turn's rounds are for editing, not for finding the file. The contract and
+   its acceptance criteria come last, which is the text a model attends to most.
+   On the corpus side of the MIT experiment (below) the prompt also carries MIT
+   lecture-card excerpts — but only when a card matches at least two distinct
+   words of the task, and then only that lecture's own pages, never a
+   transcript. `inject_corpus: false` keeps excerpts out of a repository's
+   prompts altogether; either way every role can still call the `study` tool.
 4. **Gate**: the test command must pass and no existing assertion may be removed.
 5. **Adversary**: a different model tries to break the change and must end
    with exactly `APPROVE: …`. A rejection leaves its failing test on the branch.

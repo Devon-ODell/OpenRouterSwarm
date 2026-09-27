@@ -176,9 +176,15 @@ class ContextPackTests(unittest.TestCase):
     def test_the_implementer_prompt_carries_it(self):
         pack = self.pack(self.task("Fix games/crosstown/game.js"))
         prompt = swarmd.IMPLEMENTER.format(goal="g", spec="s", previous="", playbook="",
-                                           corpus="", context=pack, test_cmd="true")
+                                           corpus="", context=pack, test_cmd="true",
+                                           title="Fix games/crosstown/game.js")
         self.assertIn("function init(seed) {", prompt)
         self.assertIn("CODE THIS TASK TOUCHES", prompt)
+        # The task's own contract is the last thing the model reads, and the code comes before
+        # the reference material rather than after it.
+        self.assertLess(prompt.index("CODE THIS TASK TOUCHES"), prompt.index("THE TASK, IN FULL"))
+        self.assertTrue(prompt.startswith("You are the IMPLEMENTER"))
+        self.assertIn("YOUR TASK: Fix games/crosstown/game.js", prompt)
 
     def test_the_repair_prompt_carries_it(self):
         from swarm.workflow import REPAIR
@@ -187,7 +193,7 @@ class ContextPackTests(unittest.TestCase):
         self.assertIn("function init(seed) {", prompt)
 
     def test_the_fast_implementer_prompt_carries_it(self):
-        prompt = swarmd.FAST_IMPLEMENTER.format(goal="g", spec="s", test_cmd="true",
+        prompt = swarmd.FAST_IMPLEMENTER.format(goal="g", spec="s", test_cmd="true", title="t",
                                                  context=self.pack(self.task("Fix games/crosstown/game.js")))
         self.assertIn("function init(seed) {", prompt)
 
@@ -197,7 +203,7 @@ class ContextPackTests(unittest.TestCase):
         for name in ("IMPLEMENTER", "FAST_IMPLEMENTER"):
             keys = set(re.findall(r"\{(\w+)\}", getattr(swarmd, name)))
             self.assertLessEqual(keys, {"goal", "spec", "previous", "playbook", "corpus",
-                                        "context", "test_cmd"}, name)
+                                        "context", "test_cmd", "title"}, name)
 
 
 class NamedPathsTests(unittest.TestCase):

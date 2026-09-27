@@ -772,6 +772,101 @@ class Queue:
 
 # ------------------------------------------------------------------ corpus
 
+# ------------------------------------------------------------------ failure classes
+
+# Whose problem a failure is. Queue.release treated them all alike — a note, an attempt spent,
+# and after two attempts a split or a park — so a step limit, a sandbox timeout or a restart
+# cost a task one of its two lives and scored the model down for it. 90 of 121 finished tasks
+# were split or parked, every deep-game milestone among them.
+TASK_STAGES = frozenset({"tests_failed", "rejected", "weakened_tests"})
+# Not the model answering badly: the baseline was already broken, trunk moved under the attempt,
+# the supervisor declined it, or the run was stopped.
+HARNESS_STAGES = frozenset({"baseline", "conflict", "refused", "interrupted", "deferred",
+                            "agent_timeout"})
+HARNESS_NOTE = re.compile(
+    r"step limit|stopped after \d+ rounds|timed out|timeout|exceeded \d+s|sandbox|"
+    r"interrupted before completion|deferred|killed|sigkill|provider (?:unavailable|kept failing)|"
+    r"not available|empty response|connection|\b50\d\b|\b429\b", re.I)
+MODEL_NOTE = re.compile(r"no usable json|malformed|unparseable|could not parse|invalid json|"
+                        r"wrote .*as (?:reply )?text|did not follow", re.I)
+
+
+def failure_class(stage, note="", edited=None):
+    """`task`, `model` or `harness` — the only distinction worth acting on differently.
+
+    task     the change was wrong: the tests failed, or the reviewer proved a defect.
+    model    the model did not produce usable output, or edited and still changed nothing.
+    harness  this swarm lost the turn: rounds, wall clock, a restart, a sandbox, a provider.
+    """
+    note = str(note or "")
+    if stage in TASK_STAGES:
+        return "task"
+    if stage in HARNESS_STAGES:
+        return "harness"
+    if stage == "model_error":
+        # A provider that returned 5xx or nothing at all is not a model answering badly.
+        return "harness" if HARNESS_NOTE.search(note) else "model"
+    if stage == "review_error":
+        return "harness" if HARNESS_NOTE.search(note) else "model"
+    if stage == "no_change":
+        # Having tried an edit and still changed nothing is the model's doing. Never reaching an
+        # edit is this harness running the rounds out on it.
+        return "model" if edited else "harness"
+    if MODEL_NOTE.search(note):
+        return "model"
+    if HARNESS_NOTE.search(note):
+        return "harness"
+    return "task"
+
+
+# ------------------------------------------------------------------ earlier attempts
+
+# The one line of a failure that says what to do differently.
+FAILING = re.compile(r"^(?:FAIL|ERROR):.*|^E\s{2,}.*|^\s*(?:Assertion|Type|Value|Name|Attribute|"
+                     r"Index|Key|Import|Module|Syntax|Runtime|OS|IO)Error\b.*|^\s*assert\s.*",
+                     re.M)
+
+
+def first_failing_line(text):
+    """The first line of a test failure worth repeating, or ""."""
+    m = FAILING.search(text or "")
+    return re.sub(r"\s+", " ", m.group(0)).strip()[:200] if m else ""
+
+
+def attempt_lines(task, limit=3, max_chars=1_200):
+    """What earlier attempts at this task actually hit, one line each.
+
+    This was `json.dumps(sorted(prior)[-3:])[-6000:]`: a JSON dump cut off mid-string, made
+    mostly of absolute paths the model cannot open, at the point in the prompt where the model
+    is most likely to be reading."""
+    relevant = {task["id"], task.get("parent"), *(task.get("depends_on") or [])}
+    rows = []
+    for path in (STATE / "attempts").glob("*/attempt.json"):
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if row.get("task", {}).get("id") in relevant and row.get("finished"):
+            rows.append(row)
+    out = []
+    for row in sorted(rows, key=lambda r: r["finished"])[-limit:]:
+        when = dt.datetime.fromtimestamp(row["finished"]).strftime("%m-%d %H:%M")
+        stage = row.get("phase") or "unknown"
+        model = row.get("implementer") or row.get("active_model") or "?"
+        note = re.sub(r"\s+", " ", str(row.get("note") or "")).strip()
+        # Paths and evidence directories are noise here; the failing line is the signal.
+        note = re.sub(r"(?:; )?evidence: \S+", "", note).strip(" ;")
+        failing = first_failing_line(row.get("note") or "")
+        line = f"- {when} {stage} on {model}: {failure_class(stage, note)}"
+        if note and note != stage:
+            line += f" — {note[:160]}"
+        if failing:
+            line += f" ({failing})"
+        out.append(line)
+    text = "\n".join(out)
+    return text[:max_chars]
+
+
 # ------------------------------------------------------------------ context pack
 
 # Paths a task names in its own words. Anything outside this set is a guess about what matters,
@@ -963,6 +1058,11 @@ def mit_arm(c, rng=random):
     and the study tool), "off" (neither), or "none" when there is no corpus to test."""
     if not c.get("corpus_db") or not Path(c["corpus_db"]).expanduser().is_file():
         return "none"
+    # A repository that does not want lecture excerpts in its prompts says so once, here. The
+    # experiment's own switch does not mean that: with mit_experiment disabled every attempt is
+    # on the corpus side, which is how 187 of 189 studio attempts got excerpts.
+    if not c.get("inject_corpus", True):
+        return "off"
     exp = c.get("mit_experiment") or {}
     if not exp.get("enabled", True):
         return "on"
@@ -988,13 +1088,14 @@ class ModelError(RuntimeError):
 
 
 FAST_IMPLEMENTER = """Perform this small, fully specified edit.
+YOUR TASK: {title}
 PROJECT GOAL AND RULES
 {goal}
-TASK CONTRACT
-{spec}
 
 {context}
 
+TASK CONTRACT
+{spec}
 Follow repository instructions and the contract. Change only what the task requires.
 Do not commit, switch branches, merge or reset Git. Do not weaken existing tests.
 No network calls from code or tests, credentials, or live orders.
@@ -1249,19 +1350,21 @@ Do NOT write implementation code. Do NOT edit any file. Keep the spec under
 400 words. If the task is already satisfied by existing code, say exactly
 "ALREADY SATISFIED" and explain in one sentence."""
 
+# The order is deliberate. A model attends most to the end of a long prompt, so the task's own
+# contract, rules and acceptance criteria go last; the goal and the reference material, which
+# were previously the freshest text in a 16.6 KB prompt, come first.
 IMPLEMENTER = """You are the IMPLEMENTER in an engineering swarm.
+YOUR TASK: {title}
 
 PROJECT GOAL
 {goal}
 
-TASK
-{spec}
-{previous}
+{context}
+
 {playbook}
 
 {corpus}
-
-{context}
+{previous}
 
 Implement this task in the current repository. It is a checkout of the swarm's
 trunk, which already contains the swarm's earlier accepted work: build on it.
@@ -1281,6 +1384,10 @@ Rules that are not negotiable:
 - Do not commit, switch branches, merge or reset Git; the supervisor manages Git.
 - No network calls from code or tests, no credentials, no placing of live orders.
 - If a known algorithm or technique applies and a study tool is available, look it up.
+
+THE TASK, IN FULL — this contract controls the scope, and its acceptance
+criteria are what the reviewer will check:
+{spec}
 
 When done, print a summary under 150 words: what you changed and the final
 result of `{test_cmd}`."""
@@ -1803,20 +1910,16 @@ class Worker(threading.Thread):
                 "architect", ARCHITECT.format(goal=goal, title=task["title"], detail=task["detail"],
                  corpus=corpus, test_cmd=c["test_cmd"]), wd, c["steps"]["architect"], self.pick({impl}) or impl,
                 avoid={impl})
-        previous = "\nEARLIER ATTEMPTS:\n" + "\n---\n".join(task.get("notes", []))
-        # Parent handoffs are artifacts, not mutable model memory.
-        relevant = {task["id"], task.get("parent"), *task.get("depends_on", [])}
-        prior = []
-        for path in (STATE / "attempts").glob("*/attempt.json"):
-            row = json.loads(path.read_text())
-            if row["task"]["id"] in relevant and row.get("finished"):
-                prior.append((row["finished"], str(path.parent), row.get("note", "")))
-        previous += "\n" + json.dumps(sorted(prior)[-3:])[-6000:]
+        # What earlier attempts hit, as lines to act on. Parent handoffs stay artifacts on disk,
+        # not mutable model memory, so only their outcome is repeated here.
+        lines = attempt_lines(task)
+        previous = f"\nWHAT EARLIER ATTEMPTS AT THIS TASK HIT\n{lines}\n" if lines else ""
         self.evidence.record("implementing", implementer=impl)
         try:
             handoff = self.call("implementer", (FAST_IMPLEMENTER if fast else IMPLEMENTER).format(
                 goal=goal, spec=spec, previous=previous, corpus=corpus, test_cmd=c["test_cmd"],
-                context=context, playbook=format_playbook(lessons, pitfalls)),
+                context=context, title=task["title"][:200],
+                playbook=format_playbook(lessons, pitfalls, named_paths(task, kin))),
                 wd, c["steps"]["implementer"], impl)
             self.evidence.write("implementation.txt", handoff)
         except AgentTimeout:
