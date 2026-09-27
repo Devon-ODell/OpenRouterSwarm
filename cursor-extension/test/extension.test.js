@@ -302,7 +302,9 @@ test('provider usage is separate from local costs and missing values never becom
   send({ type: 'info', data: { provider_usage: { available: true, usage_daily: 1.23, usage_monthly: 4.56, checked_at: '2026-09-26T12:00:00Z' } } });
   let out = els.status.text();
   assert.ok(out.includes('OpenRouter key usage') && out.includes('$1.23') && out.includes('$4.56'));
-  assert.ok(out.includes('locally recorded response costs') && out.includes('all activity on this key'));
+  // The spend meter is labelled by where the number comes from: OpenRouter reported it, this
+  // panel did not price it locally. Renamed from "locally recorded response costs".
+  assert.ok(out.includes('$ spent this month (OpenRouter-reported)') && out.includes('all activity on this key'));
   send({ type: 'info', data: { provider_usage: { available: false } } });
   out = els.status.text();assert.ok(out.includes('usage unavailable'));assert.ok(!out.includes('OpenRouter key usage: <b>$0'));
   send({ type: 'info', data: {} });

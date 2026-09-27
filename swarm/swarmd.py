@@ -637,15 +637,24 @@ def restart_into_new_code(changed):
         return False
 
 
-def drain(tally):
-    """Stop after the tasks in flight finish, instead of killing them.
+# Two different things drain the workers: somebody asking the run to stop, and the harness
+# having been edited. They must not be confused — a source change that arrives while a stop is
+# pending used to turn that stop into a restart, and the run carried on after being told to end.
+_drain_reason = {"stop_requested": False}
+
+
+def drain(tally, stop=True):
+    """Finish the tasks in flight, then stop — or, with stop=False, then restart.
 
     54 attempts died mid-turn in this window because stopping meant SIGINT, and 5.6 hours of
     model work went with them."""
+    if stop:
+        _drain_reason["stop_requested"] = True
     if not tally.drain.is_set():
         tally.drain.set()
-        log("draining: finishing the task(s) in flight, then stopping")
-        journal("drain_requested")
+        log("draining: finishing the task(s) in flight, then "
+            + ("stopping" if stop else "restarting"))
+        journal("drain_requested", stop=stop)
 
 
 def sh(cmd, cwd=None, timeout=900, env=None):
@@ -3847,6 +3856,7 @@ def run_daemon(c, max_tasks=None, hours=None):
     _cfg_seen["mtime"] = config_mtime()     # so the first check is a real change, not this one
     source = source_fingerprint()
     restart_for, last_restart = [], time.time()
+    _drain_reason["stop_requested"] = False
     try:
         signal.signal(signal.SIGUSR1, lambda *_: drain(tally))
         log("edit the config to change settings without a restart; "
@@ -3866,6 +3876,11 @@ def run_daemon(c, max_tasks=None, hours=None):
             if tally.drain.is_set():
                 for w in workers:
                     w.join()
+                if restart_for and _drain_reason["stop_requested"]:
+                    log(f"not restarting into {', '.join(restart_for)}: this run was asked to "
+                        "stop, and a stop means stop")
+                    journal("self_restart_skipped", changed=restart_for, reason="stop requested")
+                    restart_for = []
                 if restart_for:
                     # Everything is finished and nothing is running: the only safe moment.
                     restart_into_new_code(restart_for)
@@ -3887,7 +3902,7 @@ def run_daemon(c, max_tasks=None, hours=None):
                     log(f"the harness changed on disk ({', '.join(changed)}); finishing the "
                         "task(s) in flight, then restarting into it")
                     journal("source_changed", changed=changed)
-                    drain(tally)
+                    drain(tally, stop=False)
             if time.time() - last_sync > 900:
                 last_sync = time.time()
                 sync_usage(account())

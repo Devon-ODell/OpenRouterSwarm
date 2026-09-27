@@ -3,7 +3,14 @@
 Owner asked on 2026-09-27 for these to wait. Nothing here is urgent; each has a
 workaround that is in use now.
 
-## 1. The Cursor panel's Stop button errors instead of stopping
+## 1. ~~The Cursor panel's Stop button errors instead of stopping~~ — FIXED 2026-09-27
+
+Fixed rather than deferred, because it kept not working: the extension was
+reinstalled as **0.4.0** and Cursor now has that version registered. Reload the
+window (`Developer: Reload Window`) if you have not since. The rest of this
+entry is kept as the record of what was wrong.
+
+### What it was
 
 **What you see.** Pressing Stop reports that `--repo` or `--all` is required.
 

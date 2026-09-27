@@ -2,7 +2,7 @@
   "name": "flint-swarm",
   "displayName": "Flint Swarm",
   "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers with a merged verdict, a queue you can edit, and MIT OpenCourseWare lookups.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "devon-odell",
   "license": "UNLICENSED",
   "private": true,

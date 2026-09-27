@@ -549,3 +549,55 @@ class StopSignalReachesABackgroundedDaemonTests(unittest.TestCase):
                 swarmd.start({"repo": ".", "workers": 1})
         self.assertIn(swarmd.signal.SIGINT, installed)
         self.assertIn(swarmd.signal.SIGTERM, installed)
+
+
+class StopBeatsRestartTests(unittest.TestCase):
+    """A stop means stop, even when the harness is edited while it is pending.
+
+    Seen live on 2026-09-27: `stop --repo --drain` was issued, a commit then changed swarmd.py,
+    and when the task in flight finished the daemon restarted itself instead of stopping. Both
+    paths set the same drain flag and the restart won.
+    """
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        p = patch.object(swarmd, "STATE", Path(d.name))
+        p.start()
+        self.addCleanup(p.stop)
+        swarmd._drain_reason["stop_requested"] = False
+        self.addCleanup(swarmd._drain_reason.update, {"stop_requested": False})
+
+    def test_asking_to_stop_records_that_it_was_a_stop(self):
+        with patch.object(swarmd, "log"):
+            swarmd.drain(swarmd.Tally())
+        self.assertTrue(swarmd._drain_reason["stop_requested"])
+
+    def test_draining_for_a_restart_does_not_count_as_a_stop(self):
+        with patch.object(swarmd, "log"):
+            swarmd.drain(swarmd.Tally(), stop=False)
+        self.assertFalse(swarmd._drain_reason["stop_requested"])
+
+    def test_the_log_says_which_one_it_is(self):
+        lines = []
+        with patch.object(swarmd, "log", lambda m, worker="swarm": lines.append(m)):
+            swarmd.drain(swarmd.Tally(), stop=False)
+            swarmd.drain(swarmd.Tally(), stop=True)
+        self.assertIn("then restarting", lines[0])
+        self.assertIn("then stopping", lines[1])
+
+    def test_a_stop_already_pending_is_not_undone_by_a_later_source_change(self):
+        tally = swarmd.Tally()
+        with patch.object(swarmd, "log"):
+            swarmd.drain(tally)                    # somebody asked it to stop
+            swarmd.drain(tally, stop=False)        # then the harness changed under it
+        self.assertTrue(swarmd._drain_reason["stop_requested"],
+                        "the stop request was forgotten and the run would have restarted")
+
+    def test_the_journal_records_which_kind_of_drain_it_was(self):
+        with patch.object(swarmd, "log"):
+            swarmd.drain(swarmd.Tally(), stop=False)
+        rows = [json.loads(l) for l in
+                (swarmd.STATE / "journal.jsonl").read_text().splitlines() if l.strip()]
+        self.assertEqual(rows[0]["event"], "drain_requested")
+        self.assertIs(rows[0]["stop"], False)

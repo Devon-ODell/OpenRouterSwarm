@@ -431,9 +431,27 @@ async function startGrind(repo) {
   }
 }
 
+/** The repository a swarm command should act on: the one the caller named, else the one the
+ *  open file belongs to, else the one the swarm is configured for. The last fallback matters for
+ *  Stop: wanting to stop a run is not a reason to have a file from that repo open, and without
+ *  it the button refused from the command palette and targeted the wrong repository when the
+ *  open file happened to belong to a different one. */
+async function swarmRepo(repo) {
+  if (repo) return repo;
+  const open = repoFor(currentEditor() && currentEditor().document.uri);
+  try {
+    const info = await bridgeJson(['info']);
+    if (info.configured_repo) {
+      if (!open || open === info.configured_repo) return info.configured_repo;
+      return open;                       // an explicit file elsewhere wins over the default
+    }
+  } catch (e) { /* fall through to whatever the editor knows */ }
+  return open;
+}
+
 async function stopGrind(repo, drain) {
-  repo = repo || repoFor(currentEditor() && currentEditor().document.uri);
-  if (!repo) { vscode.window.showWarningMessage('Open a file in a Git repository first.'); return; }
+  repo = await swarmRepo(repo);
+  if (!repo) { vscode.window.showWarningMessage('No swarm repository: open a file in one, or run `swarm grind <repo>` once to configure it.'); return; }
   const name = path.basename(repo);
   if (drain === undefined) {
     // Stopping now kills the turn in flight and loses model work already paid for, so the
@@ -824,7 +842,7 @@ function activate(context) {
   reg('flintSwarm.queueTask', cmdQueue);
   reg('flintSwarm.studySelection', cmdStudy);
   reg('flintSwarm.startGrind', () => startGrind());
-  reg('flintSwarm.stopGrind', stopGrind);
+  reg('flintSwarm.stopGrind', () => stopGrind());
   reg('flintSwarm.showPanel', () => panel.reveal());
   reg('flintSwarm.showActivity', () => showActivity());
   reg('flintSwarm.showReport', showReport);
