@@ -308,6 +308,22 @@ pacing, `max_queue`, `inject_corpus` and the `corpus_*` keys, logging
 `base_branch`, `python` and `goal_file` still need a restart, and the daemon
 says so rather than pretending to apply them.
 
+Work survives a restart. At startup the daemon looks for attempts that were cut
+short but left a diff on their branch, saves it as `retained.patch` beside the
+attempt, and the next attempt at that task re-applies it to a fresh worktree and
+goes straight to the gate instead of paying a model to write it again. Nothing
+is trusted: the change still faces the tests and the adversary, and if the patch
+no longer applies to trunk the attempt just proceeds normally.
+
+The daemon also watches its own source. It keeps `swarmd` in memory but spawns
+`flint.py` afresh every turn, so editing the harness while it runs used to leave
+it half on one version and half on another with nothing said. Now it finishes
+the task in flight, checks the new code compiles, and replaces itself with
+`execv` — same pid, same lock, same command. `FLINT_RUN_DEADLINE` carries the
+end of the shift across, so a restart at hour 7 of 8 does not start another 8.
+`restart_on_change: false` turns it off; `restart_min_interval` (300s) stops an
+autosaving editor thrashing it.
+
 Stopping is per repository. `swarm stop` and `bridge.py stop --repo P` signal
 the pid in that repository's `state/<slug>/daemon.pid`, and only after `ps`
 confirms it is still that repository's daemon; swarms on other repositories keep

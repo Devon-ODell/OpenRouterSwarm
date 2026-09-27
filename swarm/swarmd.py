@@ -559,6 +559,74 @@ def describe_error(e):
     return row
 
 
+# ------------------------------------------------------------------ running the current code
+
+# The daemon imports swarmd once and keeps it, but spawns flint.py afresh for every turn. Edit
+# the harness while it runs and it becomes half one version and half another: new flint against
+# old supervisor, with no sign of it in any log.
+def source_files():
+    return sorted({ROOT / "flint.py", ROOT / "nonstop.py", *(HERE.glob("*.py"))})
+
+
+def source_fingerprint():
+    out = {}
+    for f in source_files():
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        out[str(f)] = (round(st.st_mtime, 3), st.st_size)
+    return out
+
+
+def source_changed(before):
+    """The files whose contents changed under a running daemon."""
+    now = source_fingerprint()
+    return sorted(Path(k).name for k in set(before) | set(now) if before.get(k) != now.get(k))
+
+
+def source_compiles():
+    """(ok, why). A half-saved edit must not be restarted into."""
+    for f in source_files():
+        try:
+            compile(f.read_text(), str(f), "exec")
+        except SyntaxError as e:
+            return False, f"{f.name}:{e.lineno}: {e.msg}"
+        except (OSError, ValueError) as e:
+            return False, f"{f.name}: {e}"
+    return True, ""
+
+
+def restart_into_new_code(changed, hours=None):
+    """Replace this process with the same command on the new code. Never returns if it works.
+
+    execv keeps the pid, so the daemon.pid note and anything watching it stay correct, and
+    Python marks its own descriptors close-on-exec, so the lock this daemon holds is released
+    as it goes — verified rather than assumed. Nothing is running at this point: the workers
+    have been drained and their children killed."""
+    ok, why = source_compiles()
+    if not ok:
+        log(f"the harness changed but will not compile, so this run keeps the code it started "
+            f"with: {why}")
+        journal("self_restart_refused", changed=changed, reason=why)
+        return False
+    log(f"restarting into the edited harness ({', '.join(changed)})")
+    journal("self_restart", changed=changed)
+    shutdown()                                  # kill anything still running before we go
+    for path in (STATE / "now.json",):
+        path.unlink(missing_ok=True)
+    env = dict(os.environ)
+    if hours:
+        # The shift ends when it was always going to end, not `hours` from this restart.
+        env["FLINT_RUN_DEADLINE"] = str(time.time() + hours * 3600)
+    try:
+        os.execve(sys.executable, [sys.executable, *sys.argv], env)
+    except OSError as e:                        # nothing was lost; carry on as we are
+        log(f"could not restart into the new code: {e}")
+        journal("self_restart_failed", changed=changed, error=str(e)[:200])
+        return False
+
+
 def drain(tally):
     """Stop after the tasks in flight finish, instead of killing them.
 
@@ -1010,6 +1078,106 @@ class Queue:
 
 
 # ------------------------------------------------------------------ corpus
+
+# ------------------------------------------------------------------ resuming interrupted work
+
+def resume_file():
+    return STATE / "resume.json"
+
+
+def load_resume():
+    try:
+        rows = json.loads(resume_file().read_text())
+        return rows if isinstance(rows, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_resume(rows):
+    tmp = resume_file().with_suffix(".tmp")
+    tmp.write_text(json.dumps(rows, indent=2))
+    tmp.replace(resume_file())
+
+
+def take_resume(task_id):
+    """The retained work for this task, removed as it is handed over.
+
+    One shot: a patch that will not apply must not be retried on every attempt for ever."""
+    rows = load_resume()
+    row = rows.pop(task_id, None)
+    if row is not None:
+        save_resume(rows)
+    return row
+
+
+def retained_diff(c, attempt):
+    """The work an interrupted attempt left behind, as a patch, or "".
+
+    Two places it can be. _cleanup commits unaccepted work to the attempt's branch, so usually
+    it is a commit; when the daemon was killed before cleanup ran it is still sitting in the
+    worktree. Both are read the same way, against the commit the attempt started from."""
+    base, branch = attempt.get("base_commit"), attempt.get("branch")
+    if not base or not branch:
+        return ""
+    # git() strips its output, and `git apply` rejects a patch with no trailing newline.
+    if git(["rev-parse", "--verify", "-q", f"{branch}^{{commit}}"], cwd=c["repo"])[0] == 0:
+        rc, diff = git(["diff", "--unified=3", base, branch], cwd=c["repo"])
+        if rc == 0 and diff.strip():
+            return diff + "\n"
+    wt = Path(attempt.get("worktree") or "")
+    if wt.is_dir() and (wt / ".git").exists():
+        git(["add", "-A"], cwd=wt)
+        rc, diff = git(["diff", "--cached", "--unified=3", base], cwd=wt)
+        if rc == 0 and diff.strip():
+            return diff + "\n"
+    return ""
+
+
+def find_interrupted(c, q):
+    """Attempts a restart cut short that still have work on disk, keyed by task id.
+
+    54 attempts died this way in one day — 5.6 hours of model turns — and every one of them was
+    implemented again from nothing. The work is on a branch; this is how it gets picked up."""
+    pending = {t["id"]: t for t in q.pending()}
+    found = {}
+    for path in sorted((STATE / "attempts").glob("*/attempt.json")):
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        task = row.get("task") or {}
+        if row.get("finished") or task.get("id") not in pending:
+            continue
+        diff = retained_diff(c, row)
+        if not diff:
+            continue
+        patch = path.parent / "retained.patch"
+        patch.write_text(diff)
+        # The newest interrupted attempt for a task wins; attempts sort by name, not by time.
+        if found.get(task["id"], {}).get("started", 0) <= row.get("started", 0):
+            found[task["id"]] = {
+                "attempt": row.get("id"), "branch": row.get("branch"),
+                "base_commit": row.get("base_commit"), "patch": str(patch),
+                "implementer": row.get("implementer") or row.get("active_model"),
+                "started": row.get("started", 0), "lines": diff.count("\n") + 1}
+    return found
+
+
+def note_interrupted(c, q):
+    """Record what can be resumed, once, at daemon startup."""
+    try:
+        found = find_interrupted(c, q)
+    except Exception as e:                      # never let this stop a run from starting
+        log(f"could not look for interrupted work: {type(e).__name__}: {e}")
+        return {}
+    if found:
+        save_resume(found)
+        for tid, row in found.items():
+            log(f"{tid}: {row['lines']} lines of work survived an interrupted attempt "
+                f"({row['attempt']}); it will be verified rather than written again")
+        journal("resume_available", tasks=sorted(found), attempts=[r["attempt"] for r in found.values()])
+    return found
+
 
 # ------------------------------------------------------------------ failure classes
 
@@ -2359,6 +2527,33 @@ class Worker(threading.Thread):
         git(["worktree", "add", "-b", self.branch, str(self.wt), trunk_name(self.c)],
             cwd=self.c["repo"], check=True)
 
+    def adopt_retained(self, task, wd):
+        """Re-apply work an interrupted attempt left behind, or None.
+
+        The patch is applied to a worktree freshly branched from trunk rather than the old
+        worktree being reused: trunk has moved on, and a stale checkout is a worse starting
+        point than none. If it no longer applies, the attempt simply proceeds as normal — the
+        model writes it again, which is exactly what used to happen every time."""
+        row = take_resume(task["id"])
+        if not row:
+            return None
+        patch = Path(row.get("patch") or "")
+        if not patch.is_file():
+            return None
+        rc, out = git(["apply", "--index", "--whitespace=nowarn", str(patch)], cwd=wd)
+        if rc != 0:
+            log(f"{task['id']}: the retained work no longer applies to trunk; "
+                f"implementing it again ({out.strip()[:160]})", self.name)
+            journal("resume_failed", id=task["id"], attempt=row.get("attempt"),
+                    reason=out.strip()[:300])
+            git(["reset", "--hard"], cwd=wd)     # leave the worktree exactly as it was
+            return None
+        log(f"{task['id']}: re-applied {row.get('lines', '?')} lines from the interrupted "
+            f"attempt {row.get('attempt')}; verifying rather than rewriting", self.name)
+        journal("resumed", id=task["id"], attempt=row.get("attempt"),
+                implementer=row.get("implementer"), lines=row.get("lines"))
+        return row
+
     def own_branch(self):
         rc, ref = git(["symbolic-ref", "-q", "HEAD"], cwd=self.wt)
         return rc == 0 and ref == f"refs/heads/{self.branch}"
@@ -2527,23 +2722,32 @@ class Worker(threading.Thread):
         # not mutable model memory, so only their outcome is repeated here.
         lines = attempt_lines(task)
         previous = f"\nWHAT EARLIER ATTEMPTS AT THIS TASK HIT\n{lines}\n" if lines else ""
-        self.evidence.record("implementing", implementer=impl)
-        try:
-            handoff = self.call("implementer", (FAST_IMPLEMENTER if fast else IMPLEMENTER).format(
-                goal=goal, spec=spec, previous=previous, corpus=corpus, test_cmd=c["test_cmd"],
-                context=context, title=task["title"][:200],
-                playbook=format_playbook(lessons, pitfalls, named_paths(task, kin))),
-                wd, c["steps"]["implementer"], impl)
-            self.evidence.write("implementation.txt", handoff)
-        except AgentTimeout:
-            self.evidence.record("timeout_recovery", note="verify partial implementation through normal gates")
-        except StepLimit:
-            self.evidence.record("step_limit", note="verify the partial implementation before continuing")
-        except ModelError as exc:
-            info["implementer"] = self.last_model or impl
-            return "model_error", str(exc), info
-        # After a handoff the model that actually wrote the code is its author.
-        impl = info["implementer"] = self.last_model or impl
+        # Work a restart cut short, if there is any: re-apply it and go straight to the gate.
+        # It still faces the tests and the adversary; nothing is trusted, only reused.
+        resumed = self.adopt_retained(task, wd)
+        if resumed:
+            info["resumed_from"] = resumed.get("attempt")
+            impl = info["implementer"] = resumed.get("implementer") or impl
+            self.evidence.record("resumed", attempt=resumed.get("attempt"), implementer=impl,
+                                 lines=resumed.get("lines"))
+        else:
+            self.evidence.record("implementing", implementer=impl)
+            try:
+                handoff = self.call("implementer", (FAST_IMPLEMENTER if fast else IMPLEMENTER).format(
+                    goal=goal, spec=spec, previous=previous, corpus=corpus, test_cmd=c["test_cmd"],
+                    context=context, title=task["title"][:200],
+                    playbook=format_playbook(lessons, pitfalls, named_paths(task, kin))),
+                    wd, c["steps"]["implementer"], impl)
+                self.evidence.write("implementation.txt", handoff)
+            except AgentTimeout:
+                self.evidence.record("timeout_recovery", note="verify partial implementation through normal gates")
+            except StepLimit:
+                self.evidence.record("step_limit", note="verify the partial implementation before continuing")
+            except ModelError as exc:
+                info["implementer"] = self.last_model or impl
+                return "model_error", str(exc), info
+            # After a handoff the model that actually wrote the code is its author.
+            impl = info["implementer"] = self.last_model or impl
         adv = self.pick({impl} | self.no_review()) or impl
         info["reviewer"] = adv
         info["same_model_review"] = adv == impl
@@ -3302,6 +3506,7 @@ KNOWN_KEYS = frozenset({
     "daily_usd", "monthly_usd", "spend_reset_day", "allowance_recheck", "editor_wallet",
     "corpus_db", "corpus_root", "corpus_k", "study", "inject_corpus", "mit_experiment",
     "sandbox", "sandbox_write", "keep_worktrees", "notify", "baseline_ttl", "personas",
+    "restart_on_change", "restart_min_interval",
     "execution_class", "_comment"})
 # Seconds a round of tool use really takes on these models, from the studio's own turns.
 SECONDS_PER_ROUND = 47
@@ -3453,7 +3658,29 @@ def holder():
             f"  Stop it:   kill -INT {d['pid']}   (or Ctrl-C in its terminal)")
 
 
+def hours_left(hours):
+    """Hours until this shift ends, honouring a deadline carried across a self-restart.
+
+    Without this a daemon that restarts at hour 7 of 8 would run another full 8 hours, and a
+    run that restarts often would never end at all."""
+    deadline = os.environ.get("FLINT_RUN_DEADLINE")
+    if deadline:
+        try:
+            left = (float(deadline) - time.time()) / 3600
+        except ValueError:
+            return hours
+        if left <= 0:
+            return None                      # the shift is over; caller decides what that means
+        if hours is None or left < hours:
+            return left
+    return hours
+
+
 def start(c, hours=None, max_tasks=None, awake=False):
+    if os.environ.get("FLINT_RUN_DEADLINE") and hours_left(hours) is None:
+        log("the shift this daemon was restarted into is already over; not starting")
+        return
+    hours = hours_left(hours)
     with open(STATE / "daemon.lock", "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -3473,7 +3700,7 @@ def start(c, hours=None, max_tasks=None, awake=False):
             timer.start()
         signal.signal(signal.SIGTERM, lambda *_: shutdown())
         try:
-            run_daemon(c, max_tasks)
+            run_daemon(c, max_tasks, hours=hours)
         finally:
             if timer:
                 timer.cancel()
@@ -3483,13 +3710,14 @@ def start(c, hours=None, max_tasks=None, awake=False):
             log("stopped. `swarm report` summarises the run.")
 
 
-def run_daemon(c, max_tasks=None):
+def run_daemon(c, max_tasks=None, hours=None):
     repo = Path(c["repo"])
     budget = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                     owner_window=c.get("owner_window", ["00:00", "00:00"]))
     q, stop, tally = Queue(c.get("max_depth", 1)), _stop, Tally(max_tasks)
     ledger = Ledger(STATE / "learn.json")
     q.recover()
+    note_interrupted(c, q)
     log(f"swarm up — repo={repo.name} trunk={trunk_name(c)} workers={c['workers']}")
     log(f"config: {CONFIG} ({config_kind()})")
     log(json.dumps(budget.snapshot()))
@@ -3503,6 +3731,8 @@ def run_daemon(c, max_tasks=None):
     recheck_allowance(c, budget)
 
     _cfg_seen["mtime"] = config_mtime()     # so the first check is a real change, not this one
+    source = source_fingerprint()
+    restart_for, last_restart = [], time.time()
     try:
         signal.signal(signal.SIGUSR1, lambda *_: drain(tally))
         log("edit the config to change settings without a restart; "
@@ -3520,8 +3750,28 @@ def run_daemon(c, max_tasks=None):
             if tally.drain.is_set():
                 for w in workers:
                     w.join()
+                if restart_for:
+                    # Everything is finished and nothing is running: the only safe moment.
+                    restart_into_new_code(restart_for, hours=hours)
+                    restart_for = []          # it refused; carry on with the code we have
+                    tally.drain.clear()
+                    workers = [Worker(i, c, q, budget, stop, ledger, tally)
+                               for i in range(c["workers"])]
+                    for w in workers:
+                        w.start()
+                    continue
                 log(f"finished {tally.n} task(s); stopping")
                 break
+            # An editor that autosaves must not be able to thrash the daemon.
+            if (not restart_for and c.get("restart_on_change", True)
+                    and time.time() - last_restart > c.get("restart_min_interval", 300)):
+                changed = source_changed(source)
+                if changed:
+                    source, restart_for, last_restart = source_fingerprint(), changed, time.time()
+                    log(f"the harness changed on disk ({', '.join(changed)}); finishing the "
+                        "task(s) in flight, then restarting into it")
+                    journal("source_changed", changed=changed)
+                    drain(tally)
             if time.time() - last_sync > 900:
                 last_sync = time.time()
                 sync_usage(account())
