@@ -20,7 +20,7 @@ Every command prints JSON. `ask` streams one JSON object per line as models fini
     bridge.py vote     --model M --useful 1|0
     bridge.py wallet   [--cap 5] [--reset] [--enable | --disable] [--account]
     bridge.py grind-cmd --repo PATH [--goal G] [--test-cmd T] [--hours H]
-    bridge.py stop     --repo PATH | --all
+    bridge.py stop     --repo PATH [--drain] | --all
 
 `ask` runs read-only flint agents (read_file, list_files, search, study; no edits, no shell)
 in the macOS sandbox, several free models in parallel, then one more model merges their
@@ -756,6 +756,7 @@ def cmd_stop(a):
               "reason": "no swarm daemon is running on this repository"})
         return 0
     pid, args = int(note["pid"]), proc_args(int(note["pid"]))
+    how = "drain" if getattr(a, "drain", False) else "stop"
     noted = str(note.get("repo") or "")
     # A pid file outlives the run that wrote it, so the pid may belong to something else now.
     if "swarmd.py" not in args or (noted and noted != repo) or (not noted and repo not in args):
@@ -763,12 +764,14 @@ def cmd_stop(a):
               "error": f"pid {pid} is not this repository's swarm daemon; not signalling it"})
         return 2
     try:
-        os.kill(pid, signal.SIGINT)
+        # A drain lets the task in flight finish; SIGINT kills it where it stands.
+        os.kill(pid, signal.SIGUSR1 if how == "drain" else signal.SIGINT)
     except (ProcessLookupError, PermissionError) as e:
         emit({"ok": False, "repo": repo, "pid": pid, "stopped": [],
               "error": f"{type(e).__name__}: {e}"})
         return 2
-    emit({"ok": True, "repo": repo, "stopped": [pid]})
+    emit({"ok": True, "repo": repo, "how": how,
+          "stopped": [] if how == "drain" else [pid], "draining": [pid] if how == "drain" else []})
     return 0
 
 
@@ -867,6 +870,8 @@ def main(argv=None):
     s.set_defaults(fn=cmd_activity)
     s = sub.add_parser("stop")
     s.add_argument("--repo", help="the repository whose daemon to stop")
+    s.add_argument("--drain", action="store_true",
+                   help="finish the task in flight first, instead of killing it mid-turn")
     s.add_argument("--all", action="store_true",
                    help="stop every swarm daemon on this machine, whatever repository it works on")
     s.set_defaults(fn=cmd_stop)

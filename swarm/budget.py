@@ -95,6 +95,17 @@ class Budget:
 
         return True, 0, f"within budget ({spent}/{usable}, {self.reserve} reserved)"
 
+    def retune(self, cap=None, reserve=10, owner_window=("00:00", "00:00")):
+        """Apply an edited config to a running budget, or raise and leave it as it was.
+
+        The daemon reloads its config between tasks, and pacing is one of the things people
+        edit; without this the numbers in the file and the numbers in force drift apart until
+        someone restarts."""
+        fresh = Budget(cap=cap, reserve=reserve, owner_window=owner_window)
+        self.cap, self.reserve = fresh.cap, fresh.reserve
+        self.win_start, self.win_end = fresh.win_start, fresh.win_end
+        return self
+
     def paid_would_help(self, state=None):
         """True when free capacity is the only thing in the way.
 

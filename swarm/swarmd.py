@@ -9,6 +9,7 @@ personas are chosen by Thompson sampling on the rewards they earn, and every
 accepted change leaves a lesson for the agents that come after it.
 
     swarm grind ~/code/project --goal "what it should become"   # nonstop
+    swarm stop [--drain]                         # now, or after the task in flight
     swarm grind                                  # resume the configured target
     swarm run --hours 8                          # bounded run
     swarm report                                 # what happened while you were away
@@ -133,6 +134,74 @@ def config_kind(path=None):
     if path.parent == HERE / "configs":
         return "per-repo"
     return "environment" if os.environ.get("FLINT_SWARM_CONFIG") else "default"
+
+
+# What an edit to the config file can change without a restart, checked between tasks.
+# "These settings take effect when the daemon next starts" cost 25 daemon starts in 26 hours
+# and killed 54 attempts in flight — 5.6 hours of work.
+RELOADABLE = frozenset({
+    "models", "paid_models", "steps", "role_timeouts", "turn_timeout", "test_timeout",
+    "max_repairs", "reviewer_exclude", "plan_cooldown", "plan_batch", "allowance_recheck",
+    "monthly_usd", "daily_usd", "spend_reset_day", "daily_cap", "reserve", "owner_window",
+    "max_queue", "max_depth", "inject_corpus", "allow_paid", "study", "tick", "max_diff",
+    "validation_commands", "test_cmd", "keep_worktrees"})
+# Changing these under a running daemon would strand worktrees, state or threads.
+RESTART_ONLY = frozenset({"repo", "trunk", "workers", "sandbox_write", "base_branch", "python",
+                          "goal_file"})
+_cfg_lock = threading.Lock()
+# 0 until a daemon takes its baseline in run_daemon. Reloading is that daemon's business: any
+# other process holds a config it assembled itself, and pouring the file over it would replace
+# settings its caller chose — a bridge command's repo-specific test_cmd, say.
+_cfg_seen = {"mtime": 0.0}
+
+
+def config_mtime():
+    try:
+        return CONFIG.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def watch_config(c, budget=None):
+    """Apply an edited config to a running daemon. Returns the keys that changed.
+
+    Called between tasks, so nothing in flight is interrupted — which is the whole point: a
+    restart to pick up a setting used to kill the attempt that was running."""
+    with _cfg_lock:
+        mtime = config_mtime()
+        if not _cfg_seen["mtime"] or not mtime or mtime == _cfg_seen["mtime"]:
+            return []
+        _cfg_seen["mtime"] = mtime
+        try:
+            fresh = json.loads(CONFIG.read_text())
+        except (OSError, ValueError) as e:
+            log(f"config changed but could not be read; keeping the running settings: {e}")
+            return []
+        changed, blocked = [], []
+        for key, value in fresh.items():
+            if key in RESTART_ONLY:
+                if c.get(key) != value:
+                    blocked.append(key)
+            elif (key in RELOADABLE or key.startswith("corpus_")) and c.get(key) != value:
+                c[key] = value
+                changed.append(key)
+        for key in [k for k in c if k in RELOADABLE and k not in fresh]:
+            del c[key]                 # removed from the file: back to its default
+            changed.append(key)
+        if changed and {"daily_cap", "reserve", "owner_window"} & set(changed) and budget:
+            try:
+                budget.retune(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
+                              owner_window=c.get("owner_window", ["00:00", "00:00"]))
+            except ValueError as e:
+                log(f"config: pacing left as it was ({e})")
+        if changed:
+            log(f"config reloaded: {', '.join(sorted(changed))}")
+            journal("config_reload", keys=sorted(changed), path=str(CONFIG))
+        if blocked:
+            for key in sorted(blocked):
+                log(f"restart needed for {key}: it cannot change while the daemon is running")
+            journal("config_restart_needed", keys=sorted(blocked), path=str(CONFIG))
+        return changed
 
 
 def use_config(repo):
@@ -400,6 +469,17 @@ def shutdown():
     with _process_lock:
         for p in _processes:
             kill_group(p)
+
+
+def drain(tally):
+    """Stop after the tasks in flight finish, instead of killing them.
+
+    54 attempts died mid-turn in this window because stopping meant SIGINT, and 5.6 hours of
+    model work went with them."""
+    if not tally.drain.is_set():
+        tally.drain.set()
+        log("draining: finishing the task(s) in flight, then stopping")
+        journal("drain_requested")
 
 
 def sh(cmd, cwd=None, timeout=900, env=None):
@@ -1829,6 +1909,7 @@ class Worker(threading.Thread):
         self.task = None
         self.last_model = None
         self.agent_timed_out = False
+        self.failure_class = "task"
 
     # -- helpers -----------------------------------------------------------
 
@@ -2424,6 +2505,9 @@ class Worker(threading.Thread):
 
     def run(self):
         while not self.stop.is_set() and not self.tally.drain.is_set():
+            # Between tasks, never inside one: an edited config reaches this run without a
+            # restart, and a restart is what killed 54 attempts in this window.
+            watch_config(self.c, self.budget)
             task = self.q.claim()
             if not task:
                 self.stop.wait(20)
@@ -2955,6 +3039,13 @@ def run_daemon(c, max_tasks=None):
     # OpenRouter says otherwise; settle that before the first turn is routed.
     recheck_allowance(c, budget)
 
+    _cfg_seen["mtime"] = config_mtime()     # so the first check is a real change, not this one
+    try:
+        signal.signal(signal.SIGUSR1, lambda *_: drain(tally))
+        log("edit the config to change settings without a restart; "
+            f"`swarm stop --drain` or `kill -USR1 {os.getpid()}` stops after this task")
+    except ValueError:
+        pass                                # not the main thread; a bounded run in a test
     workers = [Worker(i, c, q, budget, stop, ledger, tally) for i in range(c["workers"])]
     for w in workers:
         w.start()
@@ -3190,6 +3281,23 @@ def cmd_plan(a):
     plan(c, Queue(c.get("max_depth", 1)), b, a.n)
 
 
+def cmd_stop(a):
+    """Stop this repository's daemon: now, or after the task(s) in flight finish."""
+    _setup()
+    note = daemon_note()
+    if not note:
+        print("no swarm daemon is running on this repository")
+        return
+    pid, how = int(note["pid"]), ("drain" if a.drain else "stop")
+    try:
+        os.kill(pid, signal.SIGUSR1 if a.drain else signal.SIGINT)
+    except (ProcessLookupError, PermissionError) as e:
+        sys.exit(f"could not {how} pid {pid}: {type(e).__name__}: {e}")
+    print(f"sent {how} to pid {pid}"
+          + (" — it will finish the task(s) in flight first" if a.drain
+             else " — work in progress is kept on its branch"))
+
+
 def cmd_wake(a):
     """End every model's rest now (e.g. after a provider outage is over)."""
     _setup()
@@ -3255,6 +3363,10 @@ def main():
     p2 = sub.add_parser("plan")
     p2.add_argument("-n", type=int, default=5)
     p2.set_defaults(fn=cmd_plan)
+    st = sub.add_parser("stop", help="stop this repository's daemon")
+    st.add_argument("--drain", action="store_true",
+                    help="finish the task(s) in flight first, instead of killing them mid-turn")
+    st.set_defaults(fn=cmd_stop)
     sub.add_parser("wake", help="end every model's rest now").set_defaults(fn=cmd_wake)
     m = sub.add_parser("models", help="list free tool-capable models; --write sets the pool")
     m.add_argument("--write", action="store_true")

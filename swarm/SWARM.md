@@ -262,10 +262,21 @@ is parked with `needs harness look` for a person rather than split into guesses.
 
 `owner_window` (disabled by default) pauses the swarm during set local hours.
 
-Stopping is per repository. `bridge.py stop --repo P` signals the pid in that
-repository's `state/<slug>/daemon.pid`, and only after `ps` confirms it is still
-that repository's daemon; swarms on other repositories keep working. `--all` is
-the machine-wide sweep, and now has to be asked for by name.
+Most settings take effect without a restart. A worker re-reads the config
+between tasks — never inside one — and applies `models`, `paid_models`, `steps`,
+the timeouts, `max_repairs`, `reviewer_exclude`, the plan and spend settings,
+pacing, `max_queue`, `inject_corpus` and the `corpus_*` keys, logging
+`config reloaded: <keys>`. `repo`, `trunk`, `workers`, `sandbox_write`,
+`base_branch`, `python` and `goal_file` still need a restart, and the daemon
+says so rather than pretending to apply them.
+
+Stopping is per repository. `swarm stop` and `bridge.py stop --repo P` signal
+the pid in that repository's `state/<slug>/daemon.pid`, and only after `ps`
+confirms it is still that repository's daemon; swarms on other repositories keep
+working. `--all` is the machine-wide sweep, and now has to be asked for by name.
+`--drain` (or `kill -USR1 <pid>`) stops after the task in flight finishes
+instead of killing it: 54 attempts and 5.6 hours of model work died mid-turn in
+one day because stopping meant SIGINT.
 
 ## Safety
 

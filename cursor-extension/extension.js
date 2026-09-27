@@ -434,14 +434,19 @@ async function stopGrind(repo) {
   repo = repo || repoFor(currentEditor() && currentEditor().document.uri);
   if (!repo) { vscode.window.showWarningMessage('Open a file in a Git repository first.'); return; }
   const name = path.basename(repo);
+  // Stopping now kills the turn in flight and loses the model work already paid for, so the
+  // gentler option is offered first.
   const ok = await vscode.window.showWarningMessage(
-    `Stop the swarm on ${name}? Work in progress is kept on its branch, and swarms on other repositories keep running.`,
-    { modal: true }, 'Stop');
-  if (ok !== 'Stop') return;
+    `Stop the swarm on ${name}? Swarms on other repositories keep running.`,
+    { modal: true }, 'Finish this task first', 'Stop now');
+  if (ok !== 'Stop now' && ok !== 'Finish this task first') return;
+  const drain = ok === 'Finish this task first';
   try {
-    const res = await bridgeJson(['stop', '--repo', repo]);
+    const res = await bridgeJson(drain ? ['stop', '--repo', repo, '--drain'] : ['stop', '--repo', repo]);
     if (res.ok === false) vscode.window.showErrorMessage(`Flint swarm: ${res.error}`);
-    else vscode.window.showInformationMessage(res.stopped.length ? `Stopped the swarm on ${name}.` : `No swarm is running on ${name}.`);
+    else if (drain && (res.draining || []).length) vscode.window.showInformationMessage(`The swarm on ${name} will stop after the task in flight.`);
+    else if ((res.stopped || []).length) vscode.window.showInformationMessage(`Stopped the swarm on ${name}.`);
+    else vscode.window.showInformationMessage(`No swarm is running on ${name}.`);
   } catch (e) {
     vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
   }
