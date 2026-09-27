@@ -100,13 +100,24 @@ class StopOneSwarmTests(unittest.TestCase):
         self.assertIn("--repo", out[0]["error"])
 
     def test_all_still_stops_every_swarm(self):
+        """`--all` is machine-wide by design, so this test must never actually send the signal.
+
+        It did, once: run while a real 8-hour shift was going, it swept up the live daemon's pid
+        alongside the two stand-ins and SIGINT'd somebody's running swarm. The behaviour under
+        test is *which pids it picks*, and that can be checked without signalling any of them.
+        """
         a, _ = self.daemon("alpha")
         b, _ = self.daemon("beta")
-        rc, out = self.run_bridge("stop", "--all")
+        signalled = []
+        with patch.object(bridge.os, "kill", side_effect=lambda pid, sig: signalled.append(pid)):
+            rc, out = self.run_bridge("stop", "--all")
         self.assertEqual(rc, 0)
         self.assertEqual(out[0]["scope"], "all")
-        self.assertEqual(sorted(out[0]["stopped"]), sorted([a.pid, b.pid]))
-        self.assertTrue(self.died(a) and self.died(b))
+        # Any real daemon on this machine would be in the sweep too; these two must be.
+        self.assertLessEqual({a.pid, b.pid}, set(signalled))
+        self.assertEqual(set(out[0]["stopped"]), set(signalled))
+        self.assertIsNone(a.poll(), "the test signalled a process for real")
+        self.assertIsNone(b.poll(), "the test signalled a process for real")
 
     def test_no_daemon_is_not_an_error(self):
         rc, out = self.run_bridge("stop", "--repo", str(self.repos["alpha"]))
