@@ -131,6 +131,16 @@
         "command": "flintSwarm.showEvidence",
         "title": "Show What Happened on a Swarm Task",
         "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showBoard",
+        "title": "Show the Scrum Board",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showCompleted",
+        "title": "Show Verified Completed Work",
+        "category": "Flint Swarm"
       }
     ],
     "menus": {

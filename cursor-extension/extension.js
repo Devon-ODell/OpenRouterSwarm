@@ -597,6 +597,71 @@ async function restartGrind(repo) {
   }
 }
 
+// One read-only board tab per repository; never changes task or daemon state.
+const boards = new Map();
+async function showBoard(completedOnly = false) {
+  const repo = repoFor(currentEditor() && currentEditor().document.uri);
+  const root = flintRoot();
+  if (!repo || !root) return;
+  if (boards.has(repo)) {
+    const current = boards.get(repo);
+    current.completedOnly = completedOnly;
+    current.view.reveal();
+    await current.refresh();
+    return;
+  }
+  const view = vscode.window.createWebviewPanel('flintSwarm.board', 'Swarm scrum board',
+    vscode.ViewColumn.One, { enableScripts: true, localResourceRoots: [] });
+  const state = { view, completedOnly, busy: false, closed: false };
+  state.refresh = async () => {
+    if (state.busy || state.closed) return;
+    state.busy = true;
+    try {
+      const data = await new Promise((resolve, reject) => {
+        cp.execFile(pythonFor(root), [path.join(root, 'swarm', 'board.py'), '--repo', repo],
+          { timeout: 60000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => {
+            if (error) return reject(error);
+            try { resolve(JSON.parse(stdout)); } catch (e) { reject(e); }
+          });
+      });
+      if (!state.closed) {
+        state.data = data;
+        view.title = state.completedOnly ? 'Verified completed' : 'Swarm scrum board';
+        view.webview.html = require('./board-view').html(data, state.completedOnly);
+      }
+    } catch (e) {
+      if (!state.closed) vscode.window.showErrorMessage(`Swarm board could not refresh: ${e.message}. Any displayed snapshot is stale.`);
+    } finally { state.busy = false; }
+  };
+  boards.set(repo, state);
+  view.onDidDispose(() => { state.closed = true; boards.delete(repo); });
+  view.webview.onDidReceiveMessage(async (m) => {
+    if (m.type === 'toggle') state.completedOnly = !state.completedOnly;
+    if (m.type === 'refresh' || m.type === 'toggle') await state.refresh();
+    const card = state.data && state.data.cards.find(c => c.id === m.id);
+    if (card && m.type === 'diff' && /^[0-9a-f]{40}$/.test(card.commit || '')) {
+      await showCommit({ repo, sha: card.commit });
+    }
+    if (card && m.type === 'evidence' && card.evidence) {
+      try {
+        const base = fs.realpathSync(path.join(root, 'swarm', 'state'));
+        const folder = fs.realpathSync(card.evidence);
+        if (!folder.startsWith(base + path.sep) || !folder.includes(path.sep + 'attempts' + path.sep)) return;
+        const files = fs.readdirSync(folder).filter(n => /^(attempt|contract|review-\d+|gate-\d+)\.json$|^gate-.*\.log$|^HANDOFF\.md$/.test(n));
+        let content = `# Evidence: ${card.title}\n\nCommit: ${card.commit || 'not integrated'}\n\nDeployment / manual preview: unverified.\n`;
+        for (const name of files.sort()) {
+          const file = fs.realpathSync(path.join(folder, name));
+          if (!file.startsWith(folder + path.sep)) continue;
+          content += `\n## ${name}\n\n\`\`\`text\n${fs.readFileSync(file, 'utf8').slice(-30000)}\n\`\`\`\n`;
+        }
+        const doc = await vscode.workspace.openTextDocument({ content, language: 'markdown' });
+        await vscode.window.showTextDocument(doc, { preview: true });
+      } catch (e) { vscode.window.showErrorMessage(`Could not open evidence: ${e.message}`); }
+    }
+  });
+  await state.refresh();
+}
+
 async function showLanded(repo) {
   repo = repo || repoFor(currentEditor() && currentEditor().document.uri);
   if (!repo) return;
@@ -815,6 +880,7 @@ class SwarmPanel {
 <body>
 <div id="status"></div>
 <div class="row"><button id="start" class="secondary">Start swarm</button><button id="stop" class="secondary" title="Kill the turn in flight">Stop now</button><button id="drain" class="secondary" title="Finish the task in flight, then stop">Stop after this task</button><button id="restart" class="secondary" title="Drain, then start again on the same config">Restart</button><button id="report" class="secondary">Report</button></div>
+<div class="row"><button id="board" class="secondary">Scrum board ↗</button><button id="completed" class="secondary">Verified completed ↗</button></div>
 <nav id="tabs" role="tablist">
   <button class="tab" id="tab-ask" data-tab="ask" role="tab" aria-selected="true">Swarm</button>
   <button class="tab" id="tab-queue" data-tab="queue" role="tab" aria-selected="false">Queue<span id="qcount" class="badge" hidden></span></button>
@@ -882,6 +948,8 @@ class SwarmPanel {
       await showCommit(m);
     } else if (m.type === 'report') {
       await showReport();
+    } else if (m.type === 'board' || m.type === 'completed') {
+      await showBoard(m.type === 'completed');
     } else if (m.type === 'togglePaid') {
       await togglePaid(m.to);
     } else if (m.type === 'evidence') {
@@ -940,6 +1008,8 @@ function activate(context) {
   reg('flintSwarm.startGrind', () => startGrind());
   reg('flintSwarm.stopGrind', () => stopGrind());
   reg('flintSwarm.showPanel', () => panel.reveal());
+  reg('flintSwarm.showBoard', () => showBoard());
+  reg('flintSwarm.showCompleted', () => showBoard(true));
   reg('flintSwarm.togglePaid', cmdTogglePaid);
   reg('flintSwarm.showEvidence', async () => {
     const repo = repoFor(currentEditor() && currentEditor().document.uri);

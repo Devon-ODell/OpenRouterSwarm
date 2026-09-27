@@ -452,6 +452,8 @@
     if (e.target.closest('#activity')) { vscode.postMessage({ type: 'activity' }); return; }
     if (e.target.closest('#budget')) { vscode.postMessage({ type: 'budget' }); return; }
     if (e.target.closest('#paidToggle')) { vscode.postMessage({ type: 'togglePaid' }); return; }
+    if (e.target.closest('#board')) { vscode.postMessage({ type: 'board' }); return; }
+    if (e.target.closest('#completed')) { vscode.postMessage({ type: 'completed' }); return; }
     if (e.target.closest('#qclear')) {
       vscode.postMessage({ type: 'queueClear', repo: status && status.repo });
       return;
