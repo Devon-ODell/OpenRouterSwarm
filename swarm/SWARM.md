@@ -337,6 +337,45 @@ working. `--all` is the machine-wide sweep, and now has to be asked for by name.
 instead of killing it: 54 attempts and 5.6 hours of model work died mid-turn in
 one day because stopping meant SIGINT.
 
+## Scope, spare time and evidence
+
+Before a worker opens a worktree it checks that the task says enough to be
+worked at all. A task whose declared acceptance says no more than its title,
+or that reads as open-ended ("clean up the whole codebase as needed"), is
+parked with the reason rather than spending an implementer turn, a suite, a
+review and a repair to discover it had nothing to aim at. It is parked and not
+retried: a second attempt cannot supply what the first one was missing. Set
+`scope_gate: false` to turn this off. The Cursor task form runs the same check
+as a preview, so the answer arrives while you are still looking at the form.
+
+When there is genuinely nothing else to do — no task ready, nothing in flight,
+no roadmap packet held, and more than half an hour of the shift left — the
+daemon looks for one improvement of its own (`idle_improvement`, on by default,
+`idle_improvement_cooldown` seconds between cycles). One is open at a time, the
+cycles persist across restarts in `idle-improvements.json`, whatever it proposes
+goes through the same scope gate, and it is queued at priority -1 so any real
+task outranks it. "Nothing worth doing" is a valid answer and is recorded as one.
+
+A reviewer that cannot produce a readable verdict is replaced rather than ending
+the attempt: the same candidate goes to another reviewer, up to
+`max_review_formats` extra times (default 2). This does not touch the repair
+budget — nothing has yet been said about the code.
+
+Each attempt writes its own bundle to `state/<repo>/attempts/<task id>-<worker>-<stamp>/`
+with `HANDOFF.md`, `attempt.json`, the contract, the reviews and the gate logs.
+The newest `keep_attempts` bundles (default 300) are kept. The panel links to
+them from the queue and the parked list; `bridge.py evidence --repo R --id T`
+prints them.
+
+### Known gap: browser acceptance criteria
+
+A packet whose acceptance is a browser behaviour cannot be verified from this
+repository — the browser, the page and the harness that drives them all live in
+the target game repository. The swarm reports such a packet honestly rather than
+treating an absent browser as a pass, but it cannot close one on its own. Those
+criteria need a check in the game repository's own suite, invoked through its
+`test_cmd`, before the swarm can accept work against them.
+
 ## Safety
 
 Agents and the test command run under a macOS `sandbox-exec` profile: writes
@@ -418,6 +457,26 @@ blocked for coordinator review; future waves cannot bypass them. Coordinator
 gates still require real evidence entered by the coordinator. Live packet status,
 accepted commits and missing gates are in the repository's swarm state directory
 as `roadmap-execution.json`; the committed ledger records coordinator decisions.
+
+Every packet that is neither accepted nor in flight appears in `blocked` there,
+with `reason` (`dependency`, `coordinator_gate`, `coordinator_owned`,
+`attempt_failed`, `unverified_completion` or `queue_full`), what it is
+`waiting_on`, what it `blocks`, and the one `next_action` that would release it.
+`roots` lists the blockers that wait on nothing else already held or already
+being worked: those are the ones a person has to act on, and they are logged and
+journalled once each time the set changes.
+
+A packet whose attempt failed is held rather than retried. To authorise another
+run, record a dated decision in the committed ledger and the next dispatch picks
+it up as `<title> (retry 2)`:
+
+```json
+{"packets": {"F02": {"retry": {"reason": "browser was missing; installed on the runner",
+                               "at": "2026-09-27T21:40:00"}}}}
+```
+
+The `at` must be later than the failed attempt. An undated note authorises
+nothing, because it would re-authorise every future failure too.
 
 Use `grind /path/to/repo --hours 8 --goal GOAL.md` for a bounded shift. Preflight
 verification counts toward the deadline, which survives daemon code restarts.

@@ -106,12 +106,26 @@
           + (sp.resets ? ` <span class="dim">· back ${R.esc(sp.resets)}</span>` : '')
           + (spent ? ' <span class="err">— spent</span>' : ''));
       }
+      const paid = status.paid_fallback || 'off';
+      const paidWord = { off: 'OFF — free models only', auto: 'on, as a rescue when no free model answers',
+        always: 'ON from the first request' }[paid] || paid;
+      bits.push(`<span class="${paid === 'off' ? 'ok' : 'warn'}">paid requests: <b>${R.esc(paidWord)}</b></span>`
+        + ` <button class="icon" id="paidToggle" title="${paid === 'off' ? 'Allow paid models as a rescue' : 'Switch paid requests off'}">${paid === 'off' ? '🔒' : '⏻'}</button>`);
       const w = status.wallet;
       if (w) {
         bits.push(`editor wallet: recorded <b>${money(w.spent)}</b> of ${money(w.cap)} cap` +
           (w.remaining <= 0 ? ' <span class="err">— spent</span>' : '') +
           ` <button class="icon" id="budget" title="Change the paid budget">✎</button>`);
-      } else bits.push('<span class="dim">paid models off</span> <button class="icon" id="budget" title="Set a paid budget">✎</button>');
+      } else bits.push('<span class="dim">no editor wallet configured</span> <button class="icon" id="budget" title="Set a paid budget">✎</button>');
+      const held = status.roadmap && status.roadmap.roots;
+      if (held && held.length) {
+        const rows = status.roadmap.blocked || {};
+        bits.push(`<span class="err">roadmap held on ${held.length} packet(s)</span>: `
+          + held.slice(0, 3).map((id) => `<b>${R.esc(id)}</b> — ${R.esc((rows[id] || {}).next_action || '')}`).join('; '));
+      }
+      const idle = status.idle;
+      if (idle && idle.standing_down) bits.push(`<span class="dim">spare-time work paused: ${R.esc(idle.standing_down)}</span>`);
+      else if (idle && idle.active) bits.push('<span class="dim">one spare-time improvement is in the queue</span>');
     }
     if (info && info.provider_usage) {
       const u = info.provider_usage;
@@ -232,6 +246,7 @@
     if (t.harness_failures) bits.push(`<span class="warn">${t.harness_failures} harness failure${t.harness_failures > 1 ? 's' : ''}</span>`);
     if (t.failure_class) bits.push(`last failure: <b>${R.esc(t.failure_class)}</b>`);
     if (t.allow_test_changes) bits.push('<span class="tag">may change tests</span>');
+    if (t.scope_gap) bits.push('<span class="warn" title="' + R.esc(t.scope_gap) + '">no workable scope</span>');
     if (t.depends_on && t.depends_on.length) bits.push(`waits for ${t.depends_on.length}`);
     if (t.blocks && t.blocks.length) bits.push(`blocks ${t.blocks.length}`);
     const wait = waitFor(t);
@@ -250,6 +265,7 @@
       `<span class="qmeta">${queueMeta(t)}</span>`));
     row.appendChild(el('div', 'qactions',
       (waitFor(t) ? `<button class="icon qretry" title="Try this task now, without waiting out the backoff">↻</button>` : '') +
+      (t.evidence ? `<button class="icon qevidence" title="What happened on the last attempt">🔍</button>` : '') +
       `<button class="icon qedit" title="Edit this task">✎</button>` +
       `<button class="icon qdel" title="Remove this task from the queue">✕</button>`));
     if (open.has(t.id)) {
@@ -260,6 +276,7 @@
           t.acceptance.map((a) => `<li>${R.esc(a)}</li>`).join('') + '</ul></div>');
       }
       if (t.note) parts.push(`<div class="note">last note: ${R.esc(String(t.note).slice(0, 400))}</div>`);
+      if (t.scope_gap) parts.push(`<div class="note warn">This will be parked rather than worked: ${R.esc(t.scope_gap)}</div>`);
       if (t.blocks && t.blocks.length) {
         parts.push(`<div class="note">other tasks waiting on this one: ${t.blocks.map((b) => R.esc(b.title)).join(', ')}</div>`);
       }
@@ -434,6 +451,7 @@
     if (tabBtn) { showTab(tabBtn.dataset.tab); return; }
     if (e.target.closest('#activity')) { vscode.postMessage({ type: 'activity' }); return; }
     if (e.target.closest('#budget')) { vscode.postMessage({ type: 'budget' }); return; }
+    if (e.target.closest('#paidToggle')) { vscode.postMessage({ type: 'togglePaid' }); return; }
     if (e.target.closest('#qclear')) {
       vscode.postMessage({ type: 'queueClear', repo: status && status.repo });
       return;
@@ -458,6 +476,10 @@
       const id = row.dataset.id, t = queued(id);
       if (e.target.closest('.qretry')) {
         vscode.postMessage({ type: 'queueRetry', id, repo: status && status.repo });
+        return;
+      }
+      if (e.target.closest('.qevidence')) {
+        vscode.postMessage({ type: 'evidence', id, repo: status && status.repo });
         return;
       }
       if (e.target.closest('.qdel')) {

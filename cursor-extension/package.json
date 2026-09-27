@@ -121,6 +121,16 @@
         "title": "Refresh Swarm Status",
         "category": "Flint Swarm",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "flintSwarm.togglePaid",
+        "title": "Turn Paid Requests On or Off",
+        "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showEvidence",
+        "title": "Show What Happened on a Swarm Task",
+        "category": "Flint Swarm"
       }
     ],
     "menus": {
@@ -220,8 +230,8 @@
             "Spend from the paid budget only when no free model answered.",
             "Answer with paid models from the start. Fastest and most reliable; spends the budget quickest."
           ],
-          "default": "auto",
-          "description": "Whether a question may fall back to a paid model, spending from the budget set with \"Flint Swarm: Set the Paid Model Budget\" (default $5 in total)."
+          "default": "off",
+          "description": "Whether a question may fall back to a paid model, spending from the budget set with \"Flint Swarm: Set the Paid Model Budget\" (default $5 in total). Free-only by default: turn it on deliberately, from the panel or with \"Flint Swarm: Turn Paid Requests On or Off\"."
         }
       }
     }

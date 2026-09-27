@@ -470,6 +470,9 @@ def queue_row(t, rows, full=False):
            "allow_test_changes": bool(t.get("allow_test_changes")),
            "harness_failures": t.get("harness_failures", 0),
            "blocks": [{"id": r["id"], "title": r["title"]} for r in swarmd.Queue.blocked_by(t["id"], rows)],
+           "scope_gap": swarmd.scope_gap(t),
+           "evidence": next((str(p / "HANDOFF.md") for p, _ in swarmd.attempts_for(t["id"])
+                             if (p / "HANDOFF.md").is_file()), None),
            "note": (t.get("notes") or [t.get("note")] or [None])[-1]}
     row["detail"] = detail if full else detail[:400]
     row["detail_truncated"] = not full and len(detail) > 400
@@ -714,14 +717,57 @@ def cmd_task(a):
     detail = want
     if where:
         detail += f"\n\nThe developer pointed at {where}:\n```\n{code[:4000]}\n```"
+    draft = {"title": a.title.strip(), "detail": detail, "kind": a.kind,
+             "priority": a.priority, "acceptance": [want], "origin": "cursor"}
+    # The same gate the worker applies before it spends anything, run here so the answer
+    # arrives while the developer is still looking at the form rather than an hour later as
+    # a parked task. A question typed into an editor is exactly the kind of request that
+    # reaches an implementer with nothing in it to aim at.
+    gap = swarmd.scope_gap(draft, c)
+    q = swarmd.Queue(c.get("max_depth", 1), c.get("max_queue", 20))
+    if a.preview:
+        pending = q.pending()
+        seen = {r["title"].strip().lower() for r in pending + swarmd._read(q.done)}
+        emit({"ok": True, "preview": True, "repo": c["repo"], "task": draft, "where": where,
+              "scope_gap": gap, "duplicate": draft["title"].lower() in seen,
+              "queued": len(pending), "max_queue": c.get("max_queue", 20),
+              "queue_full": len(pending) >= c.get("max_queue", 20),
+              "test_cmd": c.get("test_cmd"), "trunk": swarmd.trunk_name(c),
+              "is_target": is_target(c["repo"]), "daemon_running": daemon_running()})
+        return 0
     try:
-        t = swarmd.Queue(c.get("max_depth", 1), c.get("max_queue", 20)).add(
-            a.title, detail, a.kind, priority=a.priority, origin="cursor", acceptance=[want])
+        t = q.add(a.title, detail, a.kind, priority=a.priority, origin="cursor",
+                  acceptance=[want])
     except ValueError as e:
         emit({"ok": False, "error": str(e)})
         return 2
-    emit({"ok": bool(t), "id": t and t["id"], "duplicate_or_full": not t, "is_target": is_target(c["repo"]),
-          "daemon_running": daemon_running()})
+    emit({"ok": bool(t), "id": t and t["id"], "duplicate_or_full": not t, "scope_gap": gap,
+          "is_target": is_target(c["repo"]), "daemon_running": daemon_running()})
+    return 0
+
+
+def cmd_evidence(a):
+    """What was recorded about one task's attempts, newest first.
+
+    The panel had an evidence link for parked tasks that never resolved: it looked for
+    `attempts/<task id>-*` and the daemon wrote `attempts/<worker>`, overwriting it on the
+    next task. Both ends now agree, and this is what the link opens."""
+    c = config_for(a.repo)
+    swarmd.use_repo(c)
+    rows = []
+    for path, data in swarmd.attempts_for(a.id):
+        files = sorted(f.name for f in path.iterdir() if f.is_file()) if path.is_dir() else []
+        rows.append({
+            "attempt": data.get("id") or path.name, "dir": str(path),
+            "phase": data.get("phase"), "note": (data.get("note") or "")[:600],
+            "started": data.get("started"), "finished": data.get("finished"),
+            "seconds": data.get("seconds"), "branch": data.get("branch"),
+            "commit": data.get("commit"), "strategy": data.get("strategy"),
+            "role_calls": data.get("role_calls"), "repairs": data.get("repairs"),
+            "reviewer": data.get("reviewer"), "reviewed_tree": data.get("reviewed_tree"),
+            "handoff": str(path / "HANDOFF.md") if (path / "HANDOFF.md").is_file() else None,
+            "files": [{"name": n, "path": str(path / n)} for n in files]})
+    emit({"ok": True, "repo": c["repo"], "id": a.id, "attempts": rows})
     return 0
 
 
@@ -905,6 +951,13 @@ def main(argv=None):
             s.add_argument("--detail", default="")
             s.add_argument("--kind", default="feature", choices=swarmd.KINDS)
             s.add_argument("--priority", type=int, default=1)
+            s.add_argument("--preview", action="store_true",
+                           help="say what would be queued, and whether it is workable, "
+                                "without queueing it")
+    s = sub.add_parser("evidence")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--id", required=True)
+    s.set_defaults(fn=cmd_evidence)
     for name, fn in (("landed", cmd_landed), ("parked", cmd_parked)):
         s = sub.add_parser(name)
         s.add_argument("--repo", required=True)

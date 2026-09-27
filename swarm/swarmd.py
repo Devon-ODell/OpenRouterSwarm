@@ -1249,8 +1249,11 @@ def scope_gap(task, c=None):
     text = f"{title}\n{task.get('detail') or ''}"
     declared = task.get("acceptance")
     rows = [r for r in (declared or []) if isinstance(r, str) and r.strip()]
-    # An acceptance criterion that repeats the title states no more than the title did.
-    if [r for r in rows if r.strip().lower() != title.lower()]:
+    # A criterion counts only if it says more than the title did and is not itself an
+    # open-ended ask. The editor copies a task's detail into its acceptance, so "clean up the
+    # whole codebase as needed" would otherwise arrive as its own acceptance criterion and
+    # pass a check meant to catch exactly that.
+    if [r for r in rows if r.strip().lower() != title.lower() and not BROAD_ASK.search(r)]:
         return ""
     broad = BROAD_ASK.search(text)
     if broad:
@@ -2828,7 +2831,12 @@ class Worker(threading.Thread):
         log(f"claim {task['id']} — {task['title']}", w)
         self.ensure_worktree(task)
         wd = self.wt
-        self.evidence = Attempt(STATE, self.branch.split("/")[-1], task, wd, self.branch)
+        # Named for the task, not the worker. `attempts/w0` was overwritten by every task that
+        # worker took, so a parked task's evidence was gone by the time anyone looked for it —
+        # and the panel's own lookup already globbed `attempts/<task id>-*`, which nothing had
+        # ever written. One directory per attempt: the link resolves and the history survives.
+        self.evidence = Attempt(STATE, f"{task['id']}-{self.branch.split('/')[-1]}-"
+                                       f"{dt.datetime.now():%Y%m%d-%H%M%S}", task, wd, self.branch)
         info["artifact"] = str(self.evidence.path)
         info["attempt_id"] = self.evidence.data["id"]
         _, self.review_base = git(["rev-parse", "HEAD"], cwd=wd, check=True)
@@ -3916,7 +3924,7 @@ KNOWN_KEYS = frozenset({
     "sandbox", "sandbox_write", "keep_worktrees", "notify", "baseline_ttl", "personas",
     "restart_on_change", "restart_min_interval", "role_models",
     "scope_gate", "idle_improvement", "idle_improvement_cooldown", "max_review_formats",
-    "execution_class", "_comment"})
+    "keep_attempts", "execution_class", "_comment"})
 # Seconds a round of tool use really takes on these models, from the studio's own turns.
 SECONDS_PER_ROUND = 47
 
@@ -4244,6 +4252,40 @@ def dispatch_roadmap(c, q):
     return added
 
 
+def attempts_for(tid):
+    """Every recorded attempt at one task, newest first, as (directory, attempt.json)."""
+    out = []
+    for path in sorted((STATE / "attempts").glob(f"{tid}-*"), reverse=True):
+        try:
+            out.append((path, json.loads((path / "attempt.json").read_text())))
+        except (OSError, ValueError):
+            out.append((path, {}))
+    return out
+
+
+def prune_attempts(keep=300):
+    """Keep the newest attempt bundles and drop the rest.
+
+    One directory per attempt is what makes a task's evidence findable; it is also what makes
+    the directory grow without limit. A shift lands a few dozen, so a few hundred is several
+    weeks of history."""
+    try:
+        bundles = sorted((STATE / "attempts").iterdir(), key=lambda p: p.stat().st_mtime,
+                         reverse=True)
+    except OSError:
+        return 0
+    dropped = 0
+    for path in bundles[keep:]:
+        try:
+            shutil.rmtree(path)
+            dropped += 1
+        except OSError:
+            pass
+    if dropped:
+        log(f"pruned {dropped} old attempt bundle(s); keeping the newest {keep}")
+    return dropped
+
+
 def read_roadmap():
     """The last roadmap execution report, for `swarm status` and the panel."""
     try:
@@ -4328,6 +4370,7 @@ def run_daemon(c, max_tasks=None, hours=None):
     ledger = Ledger(STATE / "learn.json")
     q.recover()
     note_interrupted(c, q)
+    prune_attempts(int(c.get("keep_attempts", 300)))
     log(f"swarm up — repo={repo.name} trunk={trunk_name(c)} workers={c['workers']}")
     log(f"config: {CONFIG} ({config_kind()})")
     log(json.dumps(budget.snapshot()))

@@ -227,9 +227,29 @@ async function queueTask(title, ctx) {
   const detail = await vscode.window.showInputBox({ prompt: 'What must be true when it is done? (acceptance, optional)', placeHolder: 'e.g. parse_orders([]) returns [] and a test proves it' });
   if (detail === undefined) return;
   const args = ['task', '--repo', repo, '--title', title, '--detail', detail || title];
+  const withCtx = (extra) => (ctx
+    ? withTempFile(ctx.text, (f) => bridgeJson([...args, ...extra, '--file', ctx.file,
+      '--start', String(ctx.start), '--end', String(ctx.end), '--selection-file', f]))
+    : bridgeJson([...args, ...extra]));
+  // Say what will be queued before it is queued. The same scope check the worker runs before
+  // it spends anything runs here too, so a request with nothing to aim at is caught while the
+  // developer is still looking at it — not an hour later, as a parked task.
+  const pre = await withCtx(['--preview']).catch(() => null);
+  if (pre) {
+    if (pre.duplicate) { vscode.window.showWarningMessage(`"${title}" has already been queued or tried.`); return; }
+    if (pre.queue_full) { vscode.window.showWarningMessage(`The queue is full (${pre.queued}/${pre.max_queue}).`); return; }
+    const lines = [`${pre.task.kind} · P${pre.task.priority} · verified with \`${pre.test_cmd || 'the configured checks'}\``];
+    if (pre.where) lines.push(`about ${pre.where}`);
+    lines.push('', 'Done when:', ...(pre.task.acceptance || []).map((x) => `  • ${x}`));
+    if (pre.scope_gap) lines.push('', `⚠ ${pre.scope_gap}`);
+    const buttons = pre.scope_gap ? ['Queue anyway', 'Edit'] : ['Queue', 'Edit'];
+    const act = await vscode.window.showInformationMessage(
+      `Queue "${title}"?`, { modal: true, detail: lines.join('\n') }, ...buttons);
+    if (act === 'Edit') { await queueTask(title, ctx); return; }
+    if (!act) return;
+  }
   try {
-    const res = ctx ? await withTempFile(ctx.text, (f) => bridgeJson([...args, '--file', ctx.file, '--start', String(ctx.start), '--end', String(ctx.end), '--selection-file', f]))
-      : await bridgeJson(args);
+    const res = await withCtx([]);
     if (res.duplicate_or_full) { vscode.window.showWarningMessage('Not queued: that title was already tried, or the queue is full.'); return; }
     const hint = res.daemon_running ? 'The running swarm will pick it up next.'
       : res.is_target ? 'Start the swarm to work on it.' : 'The swarm is set up for another repository; start it here to work on this task.';
@@ -243,6 +263,75 @@ async function queueTask(title, ctx) {
 
 async function cmdQueue() {
   await queueTask(null, await codeContext(currentEditor()));
+}
+
+const PAID_LABEL = {
+  off: 'Free models only.',
+  auto: 'Paid models only when no free model answered.',
+  always: 'Paid models from the start — the budget goes quickest this way.',
+};
+
+/** Flip paid requests on or off, globally and visibly. */
+async function togglePaid(to) {
+  const c = cfg();
+  const now = c.get('paidFallback') || 'off';
+  const next = to || (now === 'off' ? 'auto' : 'off');
+  await c.update('paidFallback', next, vscode.ConfigurationTarget.Global);
+  vscode.window.setStatusBarMessage(
+    next === 'off' ? '$(circle-slash) Swarm: paid requests OFF' : `$(credit-card) Swarm: paid requests ${next}`, 5000);
+  if (next !== 'off') {
+    const w = await bridgeJson(['wallet']).catch(() => null);
+    if (w && w.wallet && w.wallet.remaining <= 0) {
+      vscode.window.showWarningMessage('Paid requests are on, but the editor wallet has nothing left. Set a budget first.');
+    }
+  }
+  refreshStatus();
+  return next;
+}
+
+async function cmdTogglePaid() {
+  const now = cfg().get('paidFallback') || 'off';
+  const pick = await vscode.window.showQuickPick(
+    ['off', 'auto', 'always'].map((v) => ({ label: v === now ? `$(check) ${v}` : v, value: v, description: PAID_LABEL[v] })),
+    { placeHolder: `Paid requests are currently "${now}"` });
+  if (pick) await togglePaid(pick.value);
+}
+
+/** What happened on a task: the attempt bundles the daemon recorded, newest first. */
+async function showEvidence(m) {
+  const repo = panelRepo(m);
+  if (!repo || !m.id) return;
+  let res;
+  try {
+    res = await bridgeJson(['evidence', '--repo', repo, '--id', m.id]);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
+    return;
+  }
+  const attempts = res.attempts || [];
+  if (!attempts.length) {
+    vscode.window.showInformationMessage('No attempt has been recorded for that task yet.');
+    return;
+  }
+  const withHandoff = attempts.filter((a) => a.handoff);
+  const target = withHandoff.length === 1 ? withHandoff[0] : await vscode.window.showQuickPick(
+    attempts.map((a) => ({
+      label: a.attempt,
+      description: [a.phase, a.commit && a.commit.slice(0, 8), a.seconds && `${Math.round(a.seconds)}s`]
+        .filter(Boolean).join(' · '),
+      detail: (a.note || '').slice(0, 160),
+      attempt: a,
+    })), { placeHolder: 'Which attempt?' }).then((p) => p && p.attempt);
+  if (!target) return;
+  const file = target.handoff || (target.files.find((f) => f.name === 'attempt.json') || {}).path;
+  if (!file) { vscode.window.showInformationMessage(`Evidence is in ${target.dir}`); return; }
+  const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
+  if (file.endsWith('.md')) {
+    await vscode.window.showTextDocument(doc, { preview: true });
+    vscode.commands.executeCommand('markdown.showPreview', doc.uri).then(undefined, () => {});
+  } else {
+    await vscode.window.showTextDocument(doc, { preview: true });
+  }
 }
 
 // ---------------------------------------------------------------- the queue
@@ -661,6 +750,9 @@ function refreshStatus() {
     try {
       if (repo) {
         const s = await bridgeJson(['status', '--repo', repo]);
+        // A $0 wallet and "paid requests are switched off" look identical in a meter, and
+        // only one of them is a decision somebody made. The panel shows the setting itself.
+        s.paid_fallback = cfg().get('paidFallback') || 'off';
         panel.post({ type: 'status', data: s });
         daemonRunning = !!s.daemon_running;
         try {
@@ -790,6 +882,10 @@ class SwarmPanel {
       await showCommit(m);
     } else if (m.type === 'report') {
       await showReport();
+    } else if (m.type === 'togglePaid') {
+      await togglePaid(m.to);
+    } else if (m.type === 'evidence') {
+      await showEvidence(m);
     } else if (m.type === 'queueGet') {
       await queueGet(m);
     } else if (m.type === 'queueEdit') {
@@ -844,6 +940,12 @@ function activate(context) {
   reg('flintSwarm.startGrind', () => startGrind());
   reg('flintSwarm.stopGrind', () => stopGrind());
   reg('flintSwarm.showPanel', () => panel.reveal());
+  reg('flintSwarm.togglePaid', cmdTogglePaid);
+  reg('flintSwarm.showEvidence', async () => {
+    const repo = repoFor(currentEditor() && currentEditor().document.uri);
+    const id = await vscode.window.showInputBox({ prompt: 'Swarm task id', placeHolder: 't1a2b3c4d5e6' });
+    if (id) await showEvidence({ repo, id: id.trim() });
+  });
   reg('flintSwarm.showActivity', () => showActivity());
   reg('flintSwarm.showReport', showReport);
   reg('flintSwarm.showQueue', showQueue);

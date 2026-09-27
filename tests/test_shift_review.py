@@ -17,6 +17,15 @@ from unittest.mock import Mock, patch
 from swarm import swarmd
 
 
+def capture(fn, args):
+    """Run a bridge command and return the JSON object it emitted."""
+    import contextlib, io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn(args)
+    return json.loads(buf.getvalue().strip().splitlines()[-1])
+
+
 def allows_a_turn():
     """A budget with free capacity, for the paths that only ask whether a turn may start."""
     return NS(check=lambda need=1: (True, 0, ""), paid_would_help=lambda: False)
@@ -318,3 +327,87 @@ class IdleImprovementTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EvidenceTests(Base):
+    """A task's evidence has to survive the next task, and the link to it has to resolve."""
+
+    def attempt_for(self, task, note="parked after two tries"):
+        from swarm import workflow
+        name = f"{task['id']}-w0-20260927-120000"
+        bundle = workflow.Attempt(self.root / "state", name, task, self.root / "wt", "swarm/w0")
+        bundle.finish("rejected", note)
+        return bundle
+
+    def test_an_attempt_is_filed_under_its_task_not_its_worker(self):
+        repo, _ = self.repo()
+        q = swarmd.Queue()
+        q.add("Change app.txt", "Write 'changed' into app.txt",
+              acceptance=["app.txt reads 'changed'"])
+        task = q.claim()
+
+        def fake(prompt, cwd, c, role, *args):
+            if role == "implementer":
+                (cwd / "app.txt").write_text("changed\n")
+                return "done"
+            return review(prompt) if role == "adversary" else "done"
+        w = swarmd.Worker(0, self.cfg(repo), q, Mock(), threading.Event())
+        with patch.object(swarmd, "flint", side_effect=fake):
+            w.do_task(task, "goal")
+        found = swarmd.attempts_for(task["id"])
+        self.assertEqual(len(found), 1)
+        self.assertTrue((found[0][0] / "HANDOFF.md").is_file())
+        # The old naming put every task in attempts/w0 and overwrote the last one.
+        self.assertNotEqual(found[0][0].name, "w0")
+
+    def test_the_bridge_finds_a_tasks_evidence(self):
+        from swarm import bridge
+        repo, _ = self.repo()
+        task = {"id": "t1a2b3c4", "title": "Change app.txt", "detail": "",
+                "acceptance": ["app.txt reads 'changed'"]}
+        self.attempt_for(task)
+        with patch.object(bridge.swarmd, "STATE", self.root / "state"), \
+             patch.object(bridge, "config_for", return_value={"repo": str(repo)}), \
+             patch.object(bridge.swarmd, "use_repo"):
+            out = capture(bridge.cmd_evidence, NS(repo=str(repo), id="t1a2b3c4"))
+        self.assertEqual(len(out["attempts"]), 1)
+        self.assertEqual(out["attempts"][0]["phase"], "rejected")
+        self.assertTrue(out["attempts"][0]["handoff"].endswith("HANDOFF.md"))
+        self.assertIn("attempt.json", [f["name"] for f in out["attempts"][0]["files"]])
+
+    def test_pruning_keeps_the_newest_bundles(self):
+        for i in range(5):
+            self.attempt_for({"id": f"t{i}", "title": f"task {i}", "detail": "",
+                              "acceptance": ["something observable"]})
+        self.assertEqual(swarmd.prune_attempts(keep=2), 3)
+        self.assertEqual(len(list((self.root / "state" / "attempts").iterdir())), 2)
+
+
+class TaskPreviewTests(Base):
+    """What the editor shows before it queues anything."""
+
+    def preview(self, repo, title, detail):
+        from swarm import bridge
+        c = {"repo": str(repo), "base_branch": "main", "test_cmd": "true", "max_queue": 20}
+        with patch.object(bridge.swarmd, "STATE", self.root / "state"), \
+             patch.object(bridge, "config_for", return_value=c), \
+             patch.object(bridge.swarmd, "use_repo"), \
+             patch.object(bridge, "is_target", return_value=True), \
+             patch.object(bridge, "daemon_running", return_value=False):
+            return capture(bridge.cmd_task, NS(
+                repo=str(repo), title=title, detail=detail, kind="feature", priority=1,
+                file=None, start=None, end=None, selection_file=None, preview=True))
+
+    def test_a_preview_queues_nothing(self):
+        repo, _ = self.repo()
+        out = self.preview(repo, "Add a pause key", "pressing P halts the loop in game.js")
+        self.assertTrue(out["preview"])
+        self.assertEqual(out["scope_gap"], "")
+        self.assertEqual(out["task"]["acceptance"], ["pressing P halts the loop in game.js"])
+        self.assertEqual(swarmd.Queue().pending(), [])
+
+    def test_a_preview_names_the_scope_gap_before_anything_is_spent(self):
+        repo, _ = self.repo()
+        out = self.preview(repo, "Improve everything", "clean up the whole codebase as needed")
+        self.assertIn("open-ended", out["scope_gap"])
+        self.assertEqual(swarmd.Queue().pending(), [])
