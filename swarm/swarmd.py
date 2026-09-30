@@ -31,11 +31,15 @@ ROOT = HERE.parent                      # LingAI-Trader/
 load_dotenv(ROOT / ".env", override=False)
 sys.path.insert(0, str(HERE))
 from budget import Budget               # noqa: E402
+from metrics import (RequestLog, BucketClock, Reconcile, WALL_BUCKETS,  # noqa: E402
+                     ACTIVE_MODEL, TESTING, REVIEWING, ALLOWANCE_BLOCKED, IDLE)
+from pacing import LatencyLearner, effective_steps        # noqa: E402
 from learn import (Ledger, format_playbook, is_breakthrough, json_array,  # noqa: E402
                    novelty, parse_scores, reward, weight, defect, exhibit,
                    FAULTY, CRIME, BREAKTHROUGH_WEIGHT, PENALTY_WEIGHT)
 from workflow import Attempt, STRATEGIES, REVIEW, REPAIR, contract, criteria, parse_review, failure_signature  # noqa: E501
 import sandbox                          # noqa: E402
+from workflow import validate_scope, path_allowed
 
 CONFIG = Path(os.environ.get("FLINT_SWARM_CONFIG") or HERE / "config.json").expanduser()
 STATE = HERE / "state"                  # per target repo once use_repo() runs
@@ -48,7 +52,7 @@ DEFAULT_MODEL = "inclusionai/ling-3.0-flash-fin:free"
 KINDS = ("feature", "bugfix", "test", "refactor")
 META = ("persona", "planner_model", "priority", "depth", "parent", "origin", "acceptance",
         "depends_on", "root", "strategy", "execution_class", "allow_test_changes", "serves",
-        "packet")
+        "packet", "allowed_paths", "verification_commands", "request_class", "must_run_first")
 # Only a person may authorise a task to change existing tests. A planner or decomposer that
 # could set this on its own subtasks would have found the way to make any red suite green.
 TEST_CHANGE_ORIGINS = frozenset({"human", "cursor"})
@@ -69,12 +73,17 @@ _sync_failed = {}
 _study_lock = threading.Lock()
 _study_calls = {}
 _edit_calls = {}      # worker -> edit_file/write_file calls its turns made this attempt
+_request_calls = {}   # worker -> actual request starts observed in its turn logs
 _charges = {}         # worker -> dollars its turns were charged this attempt
 _held = {}            # worker -> when it last said it was waiting for the allowance
 _waiting = {}         # worker -> why it is not working, or absent while it is
+_worker_clocks = {}   # worker -> its BucketClock for wall-time buckets (§13)
 _ran_on = {}          # worker -> the model its last turn actually ran on, once a stand-in took it
 _active_turns = {}   # worker -> live role and actual routed model
 _turn_logs = {}      # worker -> the log the live turn is writing, for its round counter
+_run = {}
+_run_lock = threading.RLock()
+_progress_seen = {}
 _recheck_lock = threading.Lock()
 _rechecked = {"at": 0.0, "said": False}   # last OpenRouter allowance check, and whether "still spent" was logged
 NO_CORPUS = os.path.join(os.devnull, "no-corpus.db")   # cannot exist: flint then hides `study`
@@ -92,7 +101,7 @@ def log(msg, worker="swarm"):
 
 def journal(event, **kw):
     rec = {"t": time.time(), "iso": dt.datetime.now().isoformat(timespec="seconds"),
-           "event": event, **kw}
+           "event": event, "run_id": _run.get("id"), **kw}
     with _journal_lock:
         with open(STATE / "journal.jsonl", "a") as f:
             f.write(json.dumps(rec) + "\n")
@@ -147,8 +156,9 @@ RELOADABLE = frozenset({
     "max_repairs", "reviewer_exclude", "plan_cooldown", "plan_batch", "allowance_recheck",
     "monthly_usd", "daily_usd", "spend_reset_day", "daily_cap", "reserve", "owner_window",
     "max_queue", "max_depth", "inject_corpus", "allow_paid", "study", "tick", "max_diff",
-    "validation_commands", "test_cmd", "keep_worktrees", "scope_gate", "idle_improvement",
-    "idle_improvement_cooldown", "max_review_formats"})
+    "validation_commands", "test_cmd", "keep_worktrees", "scope_gate", "idle_improvement", "auto_plan",
+    "idle_improvement_cooldown", "max_review_formats", "task_request_cap", "run_request_cap",
+    "max_role_calls"})
 # Changing these under a running daemon would strand worktrees, state or threads.
 RESTART_ONLY = frozenset({"repo", "trunk", "workers", "sandbox_write", "base_branch", "python",
                           "goal_file", "roadmap_file"})
@@ -578,7 +588,8 @@ def describe_error(e):
 # the harness while it runs and it becomes half one version and half another: new flint against
 # old supervisor, with no sign of it in any log.
 def source_files():
-    return sorted({ROOT / "flint.py", ROOT / "nonstop.py", *(HERE.glob("*.py"))})
+    return sorted({ROOT / "flint.py", ROOT / "nonstop.py",
+                   *(HERE / name for name in ("swarmd.py", "budget.py", "learn.py", "workflow.py", "sandbox.py"))})
 
 
 def source_fingerprint():
@@ -652,6 +663,8 @@ def drain(tally, stop=True):
     model work went with them."""
     if stop:
         _drain_reason["stop_requested"] = True
+    with _run_lock:
+        _run.update(state="Draining", stop_reason="Drain requested" if stop else "Source-change restart")
     if not tally.drain.is_set():
         tally.drain.set()
         log("draining: finishing the task(s) in flight, then "
@@ -727,6 +740,34 @@ def _write(path, rows):
     tmp.replace(path)
 
 
+# Static request estimates for EV selection (work order §9). Until enough history exists,
+# these are the conservative defaults: bugfix 25, feature 35, test 20, documentation 12,
+# broad/unknown 45. A task that carries its own `request_class` (small/medium/manual) maps
+# to a comparable figure so a planner can say what it expects to cost.
+STATIC_REQUEST_ESTIMATES = {
+    "bugfix": 25,
+    "feature": 35,
+    "test": 20,
+    "documentation": 12,
+    "refactor": 30,
+}
+
+
+def estimate_requests(r):
+    """Estimated request cost of a task, for EV ranking."""
+    cls = str((r or {}).get("request_class") or "").lower()
+    if cls in ("small",):
+        return 15
+    if cls == "medium":
+        return 30
+    if cls == "manual":
+        return 60
+    kind = (r or {}).get("kind") or "feature"
+    if kind in STATIC_REQUEST_ESTIMATES:
+        return STATIC_REQUEST_ESTIMATES[kind]
+    return 45
+
+
 class Queue:
     """File queue shared by daemon threads and separate CLI processes.
 
@@ -793,11 +834,14 @@ class Queue:
             t.update({k: meta[k] for k in META if meta.get(k) is not None})
             if t.get("execution_class", "standard") not in ("standard", "fast"):
                 raise ValueError("execution_class must be standard or fast")
+            if t.get("request_class") not in (None, "small", "medium", "manual"):
+                raise ValueError("request_class must be small, medium or manual")
             if t.get("allow_test_changes"):
                 if t.get("origin") not in TEST_CHANGE_ORIGINS:
                     raise ValueError("only a person can allow a task to change existing tests")
                 t["allow_test_changes"] = True
             criteria(t)
+            validate_scope(t)
             known = {r["id"]: r for r in history}
             dependencies = t.get("depends_on", [])
             if not isinstance(dependencies, list) or any(not isinstance(d, str) or d not in known for d in dependencies):
@@ -873,19 +917,6 @@ class Queue:
                         f.write(json.dumps(r) + "\n")
             return [r["title"] for r in parked]
 
-    def claim(self):
-        with self.locked():
-            rows, now = _read(self.path), time.time()
-            complete = {r["id"] for r in _read(self.done) if r.get("status") == "done"}
-            ready = [r for r in rows if not r.get("claimed") and r.get("not_before", 0) <= now
-                     and set(r.get("depends_on", [])).issubset(complete)]
-            if not ready:
-                return None
-            task = max(ready, key=lambda r: (r.get("priority", 0), -r.get("created", 0)))
-            task["claimed"] = now
-            _write(self.path, rows)
-            return task
-
     def ready(self):
         now = time.time()
         with self.locked():
@@ -895,8 +926,69 @@ class Queue:
 
     MAX_HARNESS_FAILURES = 3
 
+    @staticmethod
+    def selection_score(r, now=None):
+        """Expected value per request for a ready task (work order §9).
+
+        Explicit priority stays dominant; the cost and history terms only break ties and
+        rank within a priority. `must_run_first` (a person or a dependency) floats above
+        cost, and dependencies are resolved before this is called — this never overrides
+        either.
+
+        score = 100 * priority
+              + 25 * has_executable_verification
+              + 15 * has_allowed_paths
+              + 10 * independent_of_failed_root
+              - estimated_requests
+              - 20 * harness_failures
+              - 30 * prior_task_failures
+        """
+        now = now if now is not None else time.time()
+        priority = 0
+        try:
+            priority = int(r.get("priority") or 0)
+        except (TypeError, ValueError):
+            pass
+        score = 100.0 * priority
+        if r.get("verification_commands"):
+            score += 25.0
+        if r.get("allowed_paths"):
+            score += 15.0
+        if not r.get("failed_root"):
+            score += 10.0
+        score -= estimate_requests(r)
+        score -= 20.0 * max(0, int(r.get("harness_failures") or 0))
+        score -= 30.0 * max(0, int(r.get("prior_task_failures") or 0))
+        return score
+
+    def claim(self):
+        with self.locked():
+            rows, now = _read(self.path), time.time()
+            complete = {r["id"] for r in _read(self.done) if r.get("status") == "done"}
+            # Work order §10: a `manual` task is queued for visibility but is never
+            # automatically claimed — a person must pick it up.
+            ready = [r for r in rows if not r.get("claimed") and r.get("not_before", 0) <= now
+                     and r.get("request_class") != "manual"
+                     and set(r.get("depends_on", [])).issubset(complete)]
+            if not ready:
+                return None
+            # Priority is dominant; the EV formula ranks within it (work order §9).
+            # `must_run_first` (a person, or a dependency the operator insists on) floats
+            # to the top of its priority band regardless of cost.
+            def key(r):
+                must = 1 if r.get("must_run_first") else 0
+                return (r.get("priority", 0), must, self.selection_score(r, now), -r.get("created", 0))
+            task = max(ready, key=key)
+            task["claimed"] = now
+            task["selection"] = {"score": round(self.selection_score(task, now), 2),
+                                 "estimated_requests": estimate_requests(task),
+                                 "at": now}
+            _write(self.path, rows)
+            return task
+
     def release(self, tid, ok, note="", defer=0, split_now=False, failure_class="task",
-                park=False):
+                park=False, requests=0, failed_model=None, failed_role=None, ledger=None,
+                turn_seconds=0, role_turns=0):
         """Returns the task with its new status: done, retry, split, parked or held.
 
         `failure_class` decides whether this failure counts against the task at all. A harness
@@ -913,8 +1005,33 @@ class Queue:
                 return None
             rows = [r for r in rows if r["id"] != tid]
             task.pop("claimed", None)
+            task["requests_spent"] = task.get("requests_spent", 0) + max(0, int(requests or 0))
+            # Cumulative cost/time fields survive retry, restart, split and park (work order §1).
+            task["turn_seconds"] = task.get("turn_seconds", 0) + max(0, float(turn_seconds or 0))
+            task["role_turns"] = task.get("role_turns", 0) + max(0, int(role_turns or 0))
+            if failed_model and not ok:
+                failures = task.get("failed_models", [])
+                failures.append({"model": failed_model, "role": failed_role or "implementer",
+                                 "class": failure_class, "requests": max(0, int(requests or 0)),
+                                 "at": time.time(), "note": note[-200:]})
+                task["failed_models"] = failures[-8:]
+                # Global run-level circuit breaker (work order §5): after two such failures by
+                # one model across different tasks in a run, cool that model for the rest of
+                # the run for that role. The per-task exclusion already routes around it;
+                # this keeps a model that fails everywhere from being redrawn task after task.
+                if failure_class not in ("harness", "provider_busy", "review_format"):
+                    key = f"{failed_model}|{failed_role or 'implementer'}"
+                    with _run_lock:
+                        _run.setdefault("model_failures", {})
+                        n = _run["model_failures"].get(key, 0) + 1
+                        _run["model_failures"][key] = n
+                    if n >= 2 and ledger is not None:
+                        ledger.cool(failed_model, f"{n}x {failure_class} failures this run ({failed_role or 'implementer'})")
+            format_error = not ok and not defer and failure_class == "review_format"
             harness = not ok and not defer and failure_class == "harness"
-            park = bool(park) and not ok and not defer
+            park = bool(park or format_error) and not ok and not defer
+            if format_error:
+                task["review_format_failures"] = task.get("review_format_failures", 0) + 1
             task["attempts"] = task.get("attempts", 0) + (0 if defer or harness or park else 1)
             if not harness:
                 task["note"] = note[-800:]
@@ -928,6 +1045,7 @@ class Queue:
                 # A second attempt cannot supply the scope the first one was missing, and a
                 # split would only produce two tasks with the same gap. This needs a person.
                 task["status"] = "parked"
+                task["note"] = note[-800:]
             elif harness:
                 # This says nothing about the task, so it costs the task nothing and teaches the
                 # next attempt nothing. It is still counted: a task that only ever fails this way
@@ -935,8 +1053,23 @@ class Queue:
                 task["harness_failures"] = task.get("harness_failures", 0) + 1
                 task["harness_note"] = note[-400:]
                 if task["harness_failures"] < self.MAX_HARNESS_FAILURES:
+                    # Cost-aware backoff (work order §7): the delay grows with what the
+                    # failure cost, and the worst classes rest the task long enough that a
+                    # higher-priority ready task runs while it cools down.
                     task["status"] = "retry"
-                    task["not_before"] = time.time() + 120
+                    note_l = note.lower()
+                    if "request_budget" in note_l or "model_pool_exhausted" in note_l:
+                        # Held for a person or the next run; already parked via `park`.
+                        delay = defer or 0
+                    elif "provider busy" in note_l or "busy (rate-limited" in note_l:
+                        delay = 0          # cheap handoff before edits; try the next model now
+                    elif "timeout" in note_l or "timed out" in note_l:
+                        delay = 30 * 60    # expensive: 30 minutes + task/model exclusion
+                    elif requests >= 3 or "incomplete" in note_l or "no usable" in note_l:
+                        delay = 15 * 60    # incomplete/no-edit cost real requests
+                    else:
+                        delay = 2 * 60     # transport error <= 2 requests
+                    task["not_before"] = time.time() + max(defer, delay)
                     rows.append(task)
                 else:
                     task["status"] = "parked"
@@ -1007,6 +1140,22 @@ class Queue:
             keep = {r["id"] for r in kept}
             _write(self.path, kept)
             return [r for r in rows if r["id"] not in keep], kept
+
+    def dismiss_finished(self, tid=None):
+        """Hide abandoned tasks, preserving history, patches and dependency outcomes."""
+        with self.locked():
+            rows = _read(self.done)
+            active = {r["id"] for r in _read(self.path)}
+            eligible = [r for r in rows if r.get("status") in ("split", "parked")
+                        and not r.get("dismissed_at") and r["id"] not in active]
+            selected = [r for r in eligible if tid is None or r["id"] == tid]
+            if tid is not None and not selected:
+                raise ValueError("task is not an undismissed split or parked task, or is queued again")
+            at = time.time()
+            for row in selected:
+                row["dismissed_at"] = at
+            _write(self.done, rows)
+            return list(dict.fromkeys(r["id"] for r in selected))
 
     def edit(self, tid, title=None, detail=None, kind=None, priority=None, acceptance=None,
              allow_test_changes=None):
@@ -1081,7 +1230,7 @@ class Queue:
             if len(rows) >= self.max_queue:
                 raise ValueError("the queue is full")
             task = dict(task, attempts=0, harness_failures=0, origin="human")
-            for key in ("status", "finished", "not_before", "claimed", "note", "harness_note"):
+            for key in ("status", "finished", "not_before", "claimed", "note", "harness_note", "dismissed_at"):
                 task.pop(key, None)
             rows.append(task)
             _write(self.path, rows)
@@ -1249,6 +1398,15 @@ def scope_gap(task, c=None):
     text = f"{title}\n{task.get('detail') or ''}"
     declared = task.get("acceptance")
     rows = [r for r in (declared or []) if isinstance(r, str) and r.strip()]
+    # Work order §10: a task marked manual is held before a model request — queued for
+    # visibility but never automatically claimed; a person must pick it up.
+    if (task.get("request_class") == "manual" or task.get("origin") == "manual"):
+        return ("manual task: queued for visibility but not automatically claimed; "
+                "a person must pick it up")
+    # Every task is verified by the configured test_cmd; a per-task verifier is
+    # additive, not required. What is required is that the task name a file, a symbol
+    # or an observable so a finished attempt can be told from an abandoned one — the
+    # existing checks below. Open-ended epics are what this gate holds.
     # A criterion counts only if it says more than the title did and is not itself an
     # open-ended ask. The editor copies a task's detail into its acceptance, so "clean up the
     # whole codebase as needed" would otherwise arrive as its own acceptance criterion and
@@ -1272,7 +1430,8 @@ def scope_gap(task, c=None):
 # Not the model answering badly: the baseline was already broken, trunk moved under the attempt,
 # the supervisor declined it, or the run was stopped.
 HARNESS_STAGES = frozenset({"baseline", "conflict", "refused", "interrupted", "deferred",
-                            "agent_timeout"})
+                            "agent_timeout", "request_budget", "model_pool_exhausted",
+                            "exploration_exhausted"})
 HARNESS_NOTE = re.compile(
     r"step limit|stopped after \d+ rounds|timed out|timeout|exceeded \d+s|sandbox|"
     r"interrupted before completion|deferred|killed|sigkill|provider (?:unavailable|kept failing)|"
@@ -1289,6 +1448,8 @@ def failure_class(stage, note="", edited=None):
     harness  this swarm lost the turn: rounds, wall clock, a restart, a sandbox, a provider.
     """
     note = str(note or "")
+    if stage == "review_format_error":
+        return "review_format"
     if stage in TASK_STAGES:
         return "task"
     if stage in HARNESS_STAGES:
@@ -1361,7 +1522,7 @@ def attempt_lines(task, limit=3, max_chars=1_200):
 
 # Paths a task names in its own words. Anything outside this set is a guess about what matters,
 # and a guess is what filled these prompts with a lecture on parking-garage real options.
-CODE_PATH = re.compile(r"[\w][\w./-]*\.(?:py|js|json|md|html|css)\b")
+CODE_PATH = re.compile(r"[\w][\w./-]*\.(?:py|js|cjs|mjs|jsx|ts|tsx|json|md|html|css)\b")
 GAME_DIR = re.compile(r"\b(games/([\w.-]+))/")
 # Definitions worth an outline when a file is too long to show: Python and JavaScript
 # functions, classes, and the consts a game's module keeps its tables in.
@@ -1394,7 +1555,8 @@ def task_text(task):
 def named_paths(task, also=""):
     """The file paths the task names, in the order it names them, deduplicated."""
     text = task_text(task) + " " + (also or "")
-    return list(dict.fromkeys(m.group(0).rstrip(".") for m in CODE_PATH.finditer(text)))
+    return list(dict.fromkeys([*(task.get("allowed_paths") or []),
+                               *(m.group(0).rstrip(".") for m in CODE_PATH.finditer(text))]))
 
 
 def kin_text(task, q):
@@ -1534,6 +1696,17 @@ def waiting(worker, why):
         _waiting[worker] = why
 
 
+def worker_publish(worker, state):
+    """Publish a structured state code for a worker by name (work order §13).
+
+    `flint()` runs at module level and only knows the worker's name, not the Worker
+    object; the BucketClock registry is how a wall-time bucket gets banked there.
+    A missing clock (a test harness that never built a Worker) is ignored."""
+    clock = _worker_clocks.get(worker)
+    if clock is not None:
+        clock.enter(state)
+
+
 def forget_worker(worker):
     """Drop everything this worker's last task left behind.
 
@@ -1545,7 +1718,7 @@ def forget_worker(worker):
     for book in (_waiting, _ran_on, _active_turns, _turn_logs, _held):
         book.pop(worker, None)
     with _study_lock:
-        for book in (_study_calls, _edit_calls, _charges):
+        for book in (_study_calls, _edit_calls, _request_calls, _charges):
             book.pop(worker, None)
 
 
@@ -1585,6 +1758,19 @@ def count_edits(worker, n=0, reset=False):
         return _edit_calls[worker]
 
 
+def count_requests(worker, n=0, reset=False):
+    """API request starts attributable to this worker's current task."""
+    with _study_lock:
+        if reset:
+            return _request_calls.pop(worker, 0)
+        n = max(0, int(n or 0))
+        _request_calls[worker] = _request_calls.get(worker, 0) + n
+        if n:
+            with _run_lock:
+                _run["requests_started"] = _run.get("requests_started", 0) + n
+        return _request_calls[worker]
+
+
 def mit_arm(c, rng=random):
     """Which side of the MIT-corpus experiment an attempt is on: "on" (excerpts in the prompt
     and the study tool), "off" (neither), or "none" when there is no corpus to test."""
@@ -1619,6 +1805,10 @@ class ModelError(RuntimeError):
     """The model answered badly: malformed, empty or crashed turn."""
 
 
+class ReviewFormatError(ModelError):
+    """An invalid review is not an implementation failure."""
+
+
 FAST_IMPLEMENTER = """Perform this small, fully specified edit.
 YOUR TASK: {title}
 PROJECT GOAL AND RULES
@@ -1645,6 +1835,10 @@ class AgentTimeout(Exception):
         super().__init__(f"agent_timeout: {role} on {model} exceeded {timeout}s; log: {logfile}")
 
 
+class ExplorationExhausted(Exception):
+    """A turn spent 70% of its rounds without editing and was stopped early (work order §2)."""
+
+
 def turn_timeout(c, role):
     return c.get("role_timeouts", {}).get(role, c.get("turn_timeout", 1800))
 
@@ -1667,6 +1861,14 @@ class ProviderBusy(ProviderDown):
 
 class ModelGone(ProviderDown):
     """This API key cannot use the model at all (403/404). Waiting will not bring it back."""
+
+
+class RequestBudget(RuntimeError):
+    """The bounded task or run pilot has spent its allotted requests."""
+
+
+class ModelPoolExhausted(RuntimeError):
+    """Every candidate model is excluded on this task/role; a person must wake or requeue."""
 
 
 def rest(ledger, e):
@@ -1771,6 +1973,7 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
             # The allowance can be hours from resetting; saying so once a quarter hour is enough,
             # and the worker records that it is waiting rather than working.
             waiting(worker, f"waiting for the allowance: {why}")
+            worker_publish(worker, ALLOWANCE_BLOCKED)
             if time.time() - _held.get(worker, 0) > 900:
                 _held[worker] = time.time()
                 log(f"{role}: holding {wait/60:.0f}m — {why}", worker)
@@ -1784,6 +1987,9 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         waiting(worker, None)
 
     env = dict(os.environ)
+    env.pop("FLINT_ALLOWED_PATHS", None)
+    if c.get("_allowed_paths"):
+        env["FLINT_ALLOWED_PATHS"] = json.dumps(c["_allowed_paths"])
     env["FLINT_MAX_STEPS"] = str(max_steps)
     # The suite the model is told to leave passing takes 105s in the studio, and flint's bash
     # tool cut off at 120s — 15 seconds from killing the run it was asked to make.
@@ -1807,6 +2013,12 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     # flint knows what OpenRouter charged; this is how that number gets back here.
     charge_file = LOGS / f"{worker}-{role}-{time.time_ns()}.charges.jsonl"
     env["FLINT_CHARGE_FILE"] = str(charge_file)
+    # flint records every HTTP request attempt (including provider retries) here, before it
+    # is made, so a SIGKILLed turn still leaves an exact count (work order §1). The daemon
+    # reads this after the turn; it never has to parse human log lines for the number.
+    request_file = LOGS / f"{worker}-{role}-{time.time_ns()}.requests.jsonl"
+    env["FLINT_REQUEST_FILE"] = str(request_file)
+    local_count_before = count_requests(worker)
     if spend_cap(c) is not None:
         env["FLINT_SPEND_CAP"] = str(spend_cap(c))
     if spend_reset_day(c) is not None:
@@ -1846,12 +2058,26 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         _turn_logs.pop(worker, None)
     progress = logfile.read_text(errors="replace")
     studied = len(re.findall(r"^tool: study$", progress, re.M))
+    rounds = len(re.findall(r"^round \d+/\d+: requesting ", progress, re.M))
+    provider_retries = len(re.findall(r"provider failed mid-reply — retry \d+/\d+", progress))
+    # The sidecar is the source of truth for request starts; the log-line counts are a
+    # cross-check that must agree. If the sidecar is missing (an older flint, or a swept
+    # log dir) the human-log count is the fallback, and the journal says which was used.
+    sidecar_rows, sidecar_total = RequestLog(request_file).read()
+    requests_started = sidecar_total if sidecar_total else (rounds + provider_retries)
+    count_requests(worker, requests_started)
     count_study(worker, studied)
     count_edits(worker, len(re.findall(r"^tool: (?:edit_file|write_file)$", progress, re.M)))
     usd = read_charges(charge_file, role, worker, model)
     journal("turn", role=role, worker=worker, model=model, rc=p.returncode,
             secs=round(time.time() - t0), chars=len(out), log=str(logfile), study_calls=studied,
-            usd=usd)
+            requests_started=requests_started, tool_rounds=rounds,
+            provider_retries=provider_retries,
+            local_count_before=local_count_before,
+            local_count_after=count_requests(worker),
+            request_sidecar=request_file.name,
+            sidecar_total=sidecar_total, usd=usd)
+    RequestLog(request_file).clear()
     error = progress[-1200:]
     with open(logfile, "a") as f:  # keep the answer beside the progress for later review
         f.write(f"\n--- answer from {model} (exit {p.returncode}) ---\n{out}\n")
@@ -1869,6 +2095,12 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
         raise NoCredits(error)
     if p.returncode == 5:
         raise StepLimit(error)
+    if p.returncode == 11:
+        # The turn spent 70% of its rounds without editing (work order §2). It is not a
+        # model failure in the scoring sense — the harness let it explore — but it is a
+        # strong signal for the task/model circuit breaker: same model, same role, same
+        # no-edit exhaustion should not immediately repeat.
+        raise ExplorationExhausted(error)
     if p.returncode == 7:
         raise ProviderDown(model, error)
     if p.returncode == 8:
@@ -2406,8 +2638,16 @@ def write_now(workers, c=None):
             "model": _ran_on.get(w.name) or model or None,
             "round": rounds and rounds[0], "rounds": rounds and rounds[1],
             "since": since, "seconds": round(time.time() - since),
-            "waiting": _waiting.get(w.name), "doing": getattr(w, "doing", None)})
+            "doing": getattr(w, "doing", None), "waiting": _waiting.get(w.name)})
+        wvars = vars(w)
+        if "state" in wvars:
+            rows[-1]["state"] = wvars["state"]
+        clock = wvars.get("clock")
+        if isinstance(clock, BucketClock):
+            rows[-1]["buckets"] = clock.snapshot()
     note = {"at": time.time(), "workers": rows}
+    if c is not None and _run.get("id"):
+        note["run"] = run_status(rows, c)
     if not rows and c is not None:
         ledger = Ledger(STATE / "learn.json")
         resting = ledger.resting()
@@ -2431,7 +2671,120 @@ def write_now(workers, c=None):
     return note
 
 
+def mark_progress(kind):
+    with _run_lock:
+        _run.update(last_progress_at=time.time(), last_progress=kind)
+
+
+def run_status(workers, c):
+    now = time.time()
+    for name, path in list(_turn_logs.items()):
+        try:
+            count = len(re.findall(r"^tool: ", Path(path).read_text(errors="replace"), re.M))
+        except OSError:
+            continue
+        if count > _progress_seen.get(str(path), 0):
+            _progress_seen[str(path)] = count
+            mark_progress(f"{name}: tool activity")
+    pending = Queue().pending()
+    roots = list((read_roadmap() or {}).get("roots", [])) if c.get("roadmap_file") else []
+    parked = [r for r in _read(STATE / "done.jsonl")
+              if r.get("status") == "parked" and not r.get("dismissed_at")
+              and r.get("finished", 0) >= _run.get("started", now)]
+    parked_ids = {r["id"] for r in parked}
+    roots += [r["id"] for r in parked if not parked_ids.intersection(r.get("depends_on", []))]
+    with _run_lock:
+        state, reason = "Waiting", "No ready assigned work"
+        if _stop.is_set():
+            state, reason = "Stopped", _run.get("stop_reason") or "Stop requested"
+        elif _run.get("state") == "Draining":
+            state, reason = "Draining", _run.get("stop_reason")
+        elif workers:
+            # Work order §13: a worker is Waiting only when its structured state says it
+            # is idle/blocked; the prose `waiting` string is no longer the signal. An
+            # allowance hold banks real blocked seconds instead of reading as a long task.
+            states = [w.get("state") for w in workers]
+            state = "Waiting" if all(s in (None, "idle", "allowance_blocked") for s in states) else "Running"
+            reason = workers[0].get("doing") or workers[0].get("state") or "No ready assigned work"
+        elif roots or (pending and not Queue().ready()):
+            state, reason = "Blocked", "Unmet dependencies or retry cooldown"
+        # Wall-time buckets across live workers, banked by state (work order §13).
+        buckets = {}
+        for w in workers:
+            clk = vars(w).get("clock") if not isinstance(w, dict) else None
+            if not isinstance(clk, BucketClock):
+                continue
+            for k, v in clk.snapshot().items():
+                buckets[k] = buckets.get(k, 0.0) + v
+        if buckets:
+            _run["wall_buckets"] = {k: round(v, 1) for k, v in buckets.items()}
+        _run["wall_total"] = round(sum(buckets.values()), 1) if buckets else _run.get("wall_total")
+        # One human line: how the run's wall time actually split (work order §13). The total
+        # approximately equals wall time; an allowance hold is its own bucket, not "waiting".
+        if buckets:
+            def pretty(secs):
+                secs = int(max(0, secs))
+                h, rem = divmod(secs, 3600)
+                m, s = divmod(rem, 60)
+                if h:
+                    return f"{h}h{m:02d}m"
+                if m:
+                    return f"{m}m"
+                return f"{s}s"
+            total = max(1, int(sum(buckets.values())))
+            model = buckets.get("active_model", 0)
+            hold = buckets.get("allowance_blocked", 0)
+            tests = buckets.get("testing", 0) + buckets.get("reviewing", 0)
+            idle = buckets.get("idle", 0) + buckets.get("dependency_blocked", 0)
+            _run["time_summary"] = (
+                f"{pretty(total)} wall: {pretty(model)} model work, {pretty(hold)} allowance hold, "
+                f"{pretty(tests)} tests/review, {pretty(idle)} idle/blocked")
+        if state == "Blocked":
+            _run.setdefault("blocked_since", now)
+        elif _run.get("blocked_since"):
+            _run["blocked_seconds"] = _run.get("blocked_seconds", 0) + now - _run.pop("blocked_since")
+        _run.update(state=state, reason=reason, heartbeat_at=now,
+                    remaining_seconds=max(0, _run["deadline"] - now) if _run.get("deadline") else None)
+        result = dict(_run)
+        result["progress_age"] = now - _run["last_progress_at"] if _run.get("last_progress_at") else None
+        result["blocked_duration"] = _run.get("blocked_seconds", 0) + (now - _run["blocked_since"] if _run.get("blocked_since") else 0)
+        result["root_blockers"] = roots
+        result["blocked_tasks"] = [{"id": r["id"], "title": r["title"], "reason": r.get("note"),
+                                    "next_action": "Inspect retained attempt; repair scope, verifier or reviewer before requeueing"}
+                                   for r in parked]
+        temp = STATE / "run.tmp"
+        temp.write_text(json.dumps(result, indent=2))
+        temp.replace(STATE / "run.json")
+        return result
+
+
 TRAILER = re.compile(r"^Swarm-([\w-]+):\s*(.*)$", re.M)
+
+
+def promotion_state(c):
+    """The four promotion states of the swarm's work (work order §14).
+
+    1. Accepted — reviewer and gates approved an immutable candidate;
+    2. Landed — commit is reachable from swarm/trunk;
+    3. Merged — commit is reachable from the configured base branch;
+    4. Verified live — a recorded deployment/health command observed that commit in the
+       service. There is no deployment recorder yet, so this is always "none (no
+       deployment recorder)" unless a future packet adds one.
+
+    Never summarize "landed on swarm/trunk" as shipped, merged or deployed.
+    """
+    repo, base, t = c["repo"], c.get("base_branch", "main"), trunk_name(c)
+    rc, _ = git(["rev-parse", "--verify", "--quiet", t], cwd=repo)
+    landed = rc == 0
+    merged = False
+    if landed:
+        rc, _ = git(["merge-base", "--is-ancestor", t, base], cwd=repo)
+        merged = rc == 0
+    return {"accepted": int(landed),
+            "landed": int(landed),
+            "merged": int(merged),
+            "verified_live": 0,
+            "verified_live_note": "no deployment recorder; accepted work sits on swarm/trunk until merged"}
 
 
 def landed_commits(c, limit=20):
@@ -2545,8 +2898,23 @@ class Worker(threading.Thread):
         self.stage = None
         self.task = None
         self.last_model = None
+        self.last_role = None
         self.agent_timed_out = False
         self.failure_class = "task"
+        self.state = None                 # structured state code (work order §13)
+        self.clock = BucketClock()        # wall-time buckets by state
+        _worker_clocks[self.name] = self.clock
+
+    def publish(self, state):
+        """Record a structured state transition, for the wall-time buckets and the panel.
+
+        `self.doing` remains human prose; `state` is the machine-readable bucket the
+        panel and reports accumulate. Every transition banks the previous bucket, so the
+        buckets' total approximates the run's wall time (work order §13)."""
+        if state not in WALL_BUCKETS:
+            raise ValueError(f"unknown worker state {state!r}")
+        self.state = state
+        self.clock.enter(state)
 
     # -- helpers -----------------------------------------------------------
 
@@ -2568,9 +2936,50 @@ class Worker(threading.Thread):
             return None
         return next((p for p in paid_pool(self.c) if p not in set(exclude)), None)
 
+    def select_implementer(self, failed):
+        """An implementer for this attempt, or None when none is usable.
+
+        `failed` is the set of models the task/model circuit breaker already excluded on
+        this task. `pick()` is given those exclusions directly (the ledger only sees the
+        arms it is allowed), so a proven-bad pairing is never redrawn for the same task.
+        """
+        return self.pick(failed, role="implementer")
+
     def no_review(self):
         """Models the owner has barred from reviewing (config `reviewer_exclude`)."""
         return set(self.c.get("reviewer_exclude") or ())
+
+    def excluded_models(self, role=None):
+        """Models the task/model circuit breaker has excluded from `role` on this task.
+
+        One timeout, incomplete response, length termination or no-edit exhaustion on a task
+        excludes that model from that task/role for the rest of the run or 24 hours (work
+        order §5). A provider-busy handoff before any edit stays cheap and does not poison
+        the pairing, so those failures are not recorded as exclusions. A harness timeout is
+        still an exclusion: the pairing demonstrably cannot deliver inside the budget, so the
+        next implementation attempt must use another model.
+        """
+        now = time.time()
+        out = set()
+        for f in (self.task or {}).get("failed_models", []):
+            if not isinstance(f, dict):
+                continue
+            cls = f.get("class") or ""
+            at = f.get("at") or 0
+            if now - at > 24 * 3600:
+                continue
+            if role and f.get("role") not in (None, role):
+                continue
+            note = str(f.get("note") or "")
+            no_edit_exhaustion = ("timeout" in note.lower() or "timed out" in note.lower()
+                                  or "70%" in note or "without editing" in note)
+            if cls in ("provider_busy", "review_format") or (cls == "harness" and not no_edit_exhaustion):
+                # A provider-busy handoff before edits is cheap and the pairing stays usable;
+                # a review-format failure is a fact about the reviewer's JSON; an ordinary
+                # harness loss (restart, sandbox) says nothing about the model.
+                continue
+            out.add(f.get("model"))
+        return out
 
     def call(self, role, prompt, cwd, steps, model, avoid=()):
         """One role turn. If the model is busy or down, the turn goes to another model (never
@@ -2579,6 +2988,26 @@ class Worker(threading.Thread):
         work is never finished by a different author. self.last_model names the model that
         took the turn last, whether or not it succeeded."""
         self.last_model = model
+        self.last_role = role
+        task_cap = max(0, int(self.c.get("task_request_cap") or 0))
+        run_cap = max(0, int(self.c.get("run_request_cap") or 0))
+        prior_task_requests = int((self.task or {}).get("requests_spent") or 0)
+        # Turn size comes from measured latency, not configured hope (work order §2):
+        # `effective_steps` caps the round count so a final edit, tests and a final answer
+        # still fit inside the wall-clock timeout. Fast-execution tasks keep their small
+        # budget on top of the request caps.
+        if getattr(self, "execution_class", "standard") != "fast" and role not in READ_ONLY_ROLES:
+            steps = effective_steps(role, model, turn_timeout(self.c, role), steps, self.ledger)
+        limits = [int(steps)]
+        if task_cap:
+            limits.append(task_cap - prior_task_requests - count_requests(self.name))
+        if run_cap:
+            limits.append(run_cap - int(_run.get("requests_started", 0)))
+        steps = min(limits)
+        if steps <= 0:
+            scope = ("task" if task_cap and
+                     prior_task_requests + count_requests(self.name) >= task_cap else "run")
+            raise RequestBudget(f"{scope} request budget exhausted before {role}")
         if self.evidence:
             if self.role_calls >= self.c.get("max_role_calls", 10):
                 raise ModelError("per-attempt role-call budget exhausted")
@@ -2586,12 +3015,22 @@ class Worker(threading.Thread):
             self.evidence.record(role, role_calls=self.role_calls, active_model=model)
             self.evidence.write(f"prompt-{self.role_calls:02d}-{role}.txt", prompt)
         c = dict(self.c, study=False) if getattr(self, "mit", None) == "off" else self.c
+        if self.task and self.task.get("allowed_paths"):
+            c = dict(c, _allowed_paths=self.task["allowed_paths"])
         if getattr(self, "execution_class", "standard") == "fast":
             c = dict(c, study=False)
             if role in ("implementer", "repair"):
                 steps = min(steps, 4)
                 c["role_timeouts"] = dict(c.get("role_timeouts", {}), **{role: 300})
+        # Tell the model its effective request and time budget (work order §2). A turn
+        # sized from measured latency is only useful if the model knows the round count it
+        # is measured against and the wall clock it must finish inside.
+        budget_line = (f"\n\nTURN BUDGET: this role gets at most {steps} model round(s) and "
+                       f"{turn_timeout(c, role)}s of wall time. Leave time for the final edit, "
+                       f"the tests and your final answer; stop reading early.")
+        prompt = prompt + budget_line
         self.doing = f"{role} with {model}"
+        self.publish(ACTIVE_MODEL)
         editing = role not in READ_ONLY_ROLES and self.wt is not None and Path(cwd) == Path(self.wt)
         before = self.snapshot()[0] if editing else None
         tried = set()
@@ -2687,6 +3126,7 @@ class Worker(threading.Thread):
         self.task, self.stage, self.wt = task, "error", None
         self.doing, self.started = "starting", time.time()
         self.evidence, self.role_calls, self.gate_count = None, 0, 0
+        self.last_model, self.last_role = None, None
         self.mit = None
         self.agent_timed_out = False
         self.failure_class = "task"
@@ -2699,6 +3139,19 @@ class Worker(threading.Thread):
             self.stage, note, info = self._attempt(task, goal, info)
         except AgentTimeout as exc:
             self.stage, note = "agent_timeout", str(exc)
+        except ExplorationExhausted as exc:
+            # The turn spent 70% of its rounds without editing. The swarm's harness let it
+            # explore, so it is not scored against the model as faulty code, but the pairing
+            # is excluded for the rest of the run/24h (work order §5): the failure_class
+            # below stays harness, which parks/holds rather than consuming an attempt.
+            self.last_role = getattr(self, "last_role", None)
+            self.stage, note = "exploration_exhausted", str(exc)
+        except ReviewFormatError as exc:
+            self.stage, note = "review_format_error", str(exc)
+        except RequestBudget as exc:
+            self.stage, note = "request_budget", str(exc)
+        except ModelPoolExhausted as exc:
+            self.stage, note = "model_pool_exhausted", str(exc)
         except (CapReached, ProviderDown, NoCredits):
             self.stage = "deferred"
             raise
@@ -2710,6 +3163,7 @@ class Worker(threading.Thread):
             except Exception as exc:
                 # Preserve the outcome and artifact if shutdown/Git prevents cleanup.
                 log(f"cleanup deferred for {self.branch}: {exc}", self.name)
+        self.attempt_requests = info["requests"] = count_requests(self.name, reset=True)
         self.failure_class = ("task" if self.stage == "accepted" else
                               failure_class(self.stage, note, edited=info.get("edit_calls")))
         if info.get("implementer"):
@@ -2725,6 +3179,7 @@ class Worker(threading.Thread):
                     edit_calls=info.get("edit_calls"),
                     mit=info.get("mit"), injected=info.get("mit_injected", False),
                     study_calls=count_study(self.name, reset=True), role_calls=self.role_calls,
+                    requests=self.attempt_requests, commit=info.get("commit"),
                     implementer=info["implementer"], reviewer=info.get("reviewer"),
                     judge=info.get("judge"), reward=info.get("reward"),
                     scores={k: v for k, v in (info.get("scores") or {}).items()
@@ -2736,7 +3191,11 @@ class Worker(threading.Thread):
         """Run configured commands and retain supervisor-owned evidence."""
         self.gate_count += 1
         self.doing = f"running the tests ({label})"
+        self.publish(TESTING)
         commands = [self.c["test_cmd"], *self.c.get("validation_commands", [])]
+        if label != "baseline":
+            commands += (self.task or {}).get("verification_commands", [])
+        commands = list(dict.fromkeys(commands))
         evidence, passed = [], True
         for i, command in enumerate(commands):
             name = f"gate-{self.gate_count:02d}-{label}-{i}.log"
@@ -2750,6 +3209,7 @@ class Worker(threading.Thread):
             row = {"command": command, "passed": ok, "log": name,
                    "seconds": round(time.monotonic() - started, 3), "tail": output}
             evidence.append(row)
+            mark_progress("verification completed")
             passed = passed and ok
         self.evidence.write(f"gate-{self.gate_count:02d}.json", evidence)
         self.evidence.record("verifying", gate=label, gates=evidence)
@@ -2765,17 +3225,22 @@ class Worker(threading.Thread):
 
     def review(self, tree, diff, tests, model, avoid=(), allow_test_changes=False):
         self.evidence.record("reviewing", reviewed_tree=tree, reviewer=model)
+        self.publish(REVIEWING)
         note = ("\nThe owner authorised test changes for this task; check that the changes to "
                 "existing tests match what was asked, and reject them if they do not.\n"
                 if allow_test_changes else "")
         prompt = REVIEW.format(contract=json.dumps(self.contract, indent=2), tree=tree,
                                tests=tests, diff=diff[:self.c.get("max_diff", 24000)]) + note
+        prompt += getattr(self, "_review_format_hint", "")
         try:
             raw = self.call("adversary", prompt, self.wt, self.c["steps"]["adversary"], model, avoid)
+            after, _ = self.snapshot()
+            if after != tree:
+                raise ModelError("reviewer modified the candidate it was asked to inspect")
             review = parse_review(raw, tree, self.contract["acceptance"])
         except ValueError as exc:
             self.evidence.write(f"review-{self.role_calls:02d}-invalid.txt", raw)
-            raise ModelError(f"invalid review: {exc}") from exc
+            raise ReviewFormatError(f"invalid review: {exc}") from exc
         self.evidence.write(f"review-{self.role_calls:02d}.json", review)
         after, _ = self.snapshot()
         if after != tree:
@@ -2793,8 +3258,9 @@ class Worker(threading.Thread):
         same test output go to another reviewer, and only a run of reviewers that all fail
         ends the attempt. It costs the repair budget nothing — no repair is warranted while
         nothing has yet been said about the code."""
-        tries = max(1, 1 + int(self.c.get("max_review_formats", 2)))
+        tries = max(1, min(3, 1 + int(self.c.get("max_review_formats", 2))))
         tried, err = set(), None
+        self._review_format_hint = ""
         for n in range(tries):
             try:
                 review = self.review(tree, diff, tests, adv, avoid={impl} | tried,
@@ -2810,8 +3276,16 @@ class Worker(threading.Thread):
                 self.evidence.record("review_unreadable", reviewer=ran, tried=n + 1,
                                      reason=str(exc)[:300])
                 nxt = self.pick(tried | {impl} | self.no_review(), role="adversary")
-                if nxt is None or n == tries - 1:
+                if n == tries - 1:
                     return None, ran, exc
+                if nxt is None:
+                    if not isinstance(exc, ReviewFormatError) or ran == impl or ran in self.no_review():
+                        return None, ran, exc
+                    nxt = ran  # Same independent reviewer may correct its own JSON, bounded above.
+                    tried.discard(ran)
+                self._review_format_hint = ("\nFORMAT CORRECTION: " + str(exc)
+                    + "\nReinspect the same immutable tree. Return the exact schema above, "
+                      "one evidenced check per criterion, and verification for every finding.\n")
                 log(f"reviewer {ran} returned no usable verdict ({str(exc)[:90]}); putting the "
                     f"same candidate to {nxt}", self.name)
                 adv = nxt
@@ -2821,6 +3295,10 @@ class Worker(threading.Thread):
         c, w = self.c, self.name
         if task.get("kind") == "harness":
             return "refused", "target a separate harness checkout; live harness editing is disabled", info
+        try:
+            validate_scope(task)
+        except ValueError as exc:
+            return "out_of_scope", str(exc), info
         gap = scope_gap(task, c) if c.get("scope_gate", True) else ""
         if gap:
             # Before the worktree, before the baseline suite, before the first request.
@@ -2874,7 +3352,14 @@ class Worker(threading.Thread):
         lessons, pitfalls = ([], []) if fast else self.ledger.playbook()
         # Lessons shown to this implementer share the attempt's reward (see Ledger.credit).
         info["lessons"] = [l["id"] for l in lessons + pitfalls if l.get("kind") in ("lesson", "pitfall")]
-        impl = self.pick()
+        failed = self.excluded_models(role="implementer")
+        impl = self.select_implementer(failed)
+        if impl is None and failed:
+            # Every candidate implementer has failed this task/role within the exclusion
+            # window. Do not cycle back to an excluded model (work order §5): park with
+            # evidence and let a human wake it or requeue it.
+            raise ModelPoolExhausted("every implementer in the pool is excluded on this task: "
+                                     + ", ".join(sorted(failed)))
         if impl is None:
             raise ProviderDown(None, "every model in the pool is resting after provider failures")
         info["implementer"] = impl
@@ -2930,6 +3415,9 @@ class Worker(threading.Thread):
             if head != self.review_base:
                 return "rejected", "agent changed commit history outside supervisor control", info
             tree, diff = self.snapshot()
+            outside = self.scope_violations()
+            if outside:
+                return "rejected", "outside allowed_paths: " + ", ".join(outside), info
             if not diff.strip():
                 info["edit_calls"] = tried = count_edits(w)
                 stage = "agent_timeout" if self.agent_timed_out else "no_change"
@@ -2951,7 +3439,7 @@ class Worker(threading.Thread):
                 review, adv, exc = self.reviewed(tree, diff, tests, adv, impl, allowed)
                 info["reviewer"] = adv          # the model that answered, or failed to
                 if exc is not None:
-                    return "review_error", str(exc), info
+                    return ("review_format_error" if isinstance(exc, ReviewFormatError) else "review_error"), str(exc), info
                 info["same_model_review"] = adv == impl
                 if review["verdict"] == "approve":
                     info["review"] = review
@@ -2965,13 +3453,33 @@ class Worker(threading.Thread):
                 return stage, f"repair budget/repeated failure; evidence: {self.evidence.path}\n{failure[-2500:]}", info
             seen.add(signature)
             self.evidence.record("repairing")
+            pre_repair_tree, _ = self.snapshot()
             try:
                 handoff = self.call("repair", REPAIR.format(contract=json.dumps(self.contract, indent=2),
                                     failure=failure, test_cmd=c["test_cmd"], context=context), wd,
                                     c["steps"].get("repair", c["steps"]["implementer"]), impl, avoid={adv})
                 self.evidence.write(f"repair-{cycle + 1}.txt", handoff)
             except AgentTimeout:
+                # Work order §6: a repair that times out may have made things worse. Keep the
+                # timed-out patch as evidence, but do not roll back useful repair work blindly:
+                # a repair that stayed inside scope and removed the failing file must still be
+                # verified and can land. Only a repair that escaped the allowed scope (wrote
+                # outside it, or deleted files it had no business touching) is reverted to the
+                # last pre-repair tree before the gates run.
                 self.evidence.record("timeout_recovery", note="verify partial repair through normal gates")
+                after_tree, repair_diff = self.snapshot()
+                if repair_diff and after_tree != pre_repair_tree:
+                    self.evidence.write(f"repair-{cycle + 1}-timed-out.diff", repair_diff)
+                    if self.scope_violations():
+                        git(["read-tree", pre_repair_tree], cwd=wd)
+                        git(["checkout-index", "-a", "-f"], cwd=wd)
+                        git(["clean", "-fd"], cwd=wd)
+                        git(["add", "-A"], cwd=wd)
+                        _, restored = git(["write-tree"], cwd=wd)
+                        if restored != pre_repair_tree:
+                            # The tree could not be restored byte-for-byte; keep the repair
+                            # diff and let the gate decide rather than losing the attempt.
+                            self.evidence.record("repair_restore_failed", tree=restored)
             except StepLimit:
                 pass
             except ModelError as exc:
@@ -2988,16 +3496,22 @@ class Worker(threading.Thread):
         info["role_calls"] = self.role_calls
         # Record integration before optional learning/reporting. Recovery consults Git too.
         self.evidence.record("integrated", commit=info["commit"])
+        with _run_lock:
+            _run.update(last_accepted_commit=info["commit"], last_accepted_at=time.time())
+        mark_progress("accepted commit")
         log(f"{task['id']}: landed on {trunk_name(c)}; evidence: {self.evidence.path}", w)
-        # A third model scores the landed change; its lesson and follow-ups feed the playbook.
-        info["judge"] = self.pick({impl, adv}, role="judge") or adv
-        _, landed_diff = git(["diff", "--unified=3", self.review_base, "HEAD"], cwd=wd)
-        info["scores"] = self.judge(task, goal, landed_diff,
-                                    "APPROVE: " + str((info.get("review") or {}).get("summary", "")),
-                                    info["judge"], avoid={impl, adv})
-        info["judge"] = self.last_model or info["judge"]
-        if info["scores"]:
-            self.evidence.write("judge.json", info["scores"])
+        # A zero judge step budget disables optional post-landing scoring entirely instead of
+        # secretly spending flint's minimum one request.
+        info["judge"], info["scores"] = None, None
+        if int(c["steps"].get("judge", 0)) > 0:
+            info["judge"] = self.pick({impl, adv}, role="judge") or adv
+            _, landed_diff = git(["diff", "--unified=3", self.review_base, "HEAD"], cwd=wd)
+            info["scores"] = self.judge(task, goal, landed_diff,
+                                        "APPROVE: " + str((info.get("review") or {}).get("summary", "")),
+                                        info["judge"], avoid={impl, adv})
+            info["judge"] = self.last_model or info["judge"]
+            if info["scores"]:
+                self.evidence.write("judge.json", info["scores"])
         return "accepted", f"integrated {info['commit']} on {trunk_name(c)}; handoff: {self.evidence.path / 'HANDOFF.md'}", info
 
     def integrate(self):
@@ -3013,12 +3527,17 @@ class Worker(threading.Thread):
                     return False, f"conflicts with newer trunk; work retained on {self.branch}"
                 self.review_base = old
                 tree, diff = self.snapshot()
+                if self.scope_violations():
+                    return False, "rebased candidate changed paths outside allowed_paths"
                 ok, output = self.gate("rebased")
                 after, _ = self.snapshot()
                 if not ok or after != tree or weakened_tests(
                         diff, allow_test_changes=bool(self.task.get("allow_test_changes"))):
                     return False, "rebased candidate failed verification or changed during tests"
-                review = self.review(tree, diff, output, self._review_model, avoid={self._author})
+                review, _, error = self.reviewed(tree, diff, output, self._review_model,
+                                                self._author, bool(self.task.get("allow_test_changes")))
+                if error:
+                    raise error
                 if review["verdict"] != "approve":
                     return False, "rebased candidate needs changes; fresh review saved in artifacts"
             with trunk_locked():
@@ -3047,17 +3566,17 @@ class Worker(threading.Thread):
                 diff=diff[:self.c.get("max_diff", 24000)]),
                 self.wt, self.c["steps"].get("judge", 4), model, avoid)
         except Exception as e:  # the change already landed; never lose it to a judge failure
-            log(f"judge unavailable ({type(e).__name__}); using a neutral score", self.name)
+            log(f"judge unavailable ({type(e).__name__}); accepted work remains unscored", self.name)
             return None
         scores = parse_scores(out)
         if scores is None:
-            log(f"judge {model} returned no usable JSON; using a neutral score", self.name)
+            log(f"judge {model} returned no usable JSON; accepted work remains unscored", self.name)
         return scores
 
     def _reinforce(self, task, stage, info):
         L, impl = self.ledger, info["implementer"]
         if stage != "accepted" and failure_class(stage, info.get("note", ""),
-                                                 edited=info.get("edit_calls")) == "harness":
+                                                 edited=info.get("edit_calls")) in ("harness", "review_format"):
             # The model answered; this swarm lost the turn. Scoring it down at penalty weight
             # teaches the bandit about our step limits, not about the model.
             journal("harness_failure", id=task["id"], title=task["title"], stage=stage,
@@ -3093,7 +3612,10 @@ class Worker(threading.Thread):
             L.record_accepted({"id": task["id"], "title": task["title"], "detail": task.get("detail", ""),
                                "reward": r, "novelty": nov, "scores": scores, "implementer": impl,
                                "reviewer": info.get("reviewer"), "persona": task.get("persona"),
-                               "origin": task.get("origin", "human"), "breakthrough": breakthrough})
+                               "origin": task.get("origin", "human"), "breakthrough": breakthrough,
+                               # Work order §3/§16: malformed or missing judge JSON is missing
+                               # evidence, never a neutral assessment.
+                               "quality_score": "unscored" if not scores else None})
             if scores and scores.get("lesson"):
                 L.add_lesson(scores["lesson"], "lesson", task["id"], r, pinned=breakthrough)
             if breakthrough:
@@ -3252,6 +3774,14 @@ class Worker(threading.Thread):
 
     # -- loop --------------------------------------------------------------
 
+    def scope_violations(self):
+        scope = (self.task or {}).get("allowed_paths")
+        if not scope:
+            return []
+        _, names = git(["diff", "--cached", "--name-only", "--no-renames", "-z", self.review_base],
+                       cwd=self.wt, check=True)
+        return [p for p in names.split("\0") if p and not path_allowed(p, scope)]
+
     def run(self):
         while not self.stop.is_set() and not self.tally.drain.is_set():
             # Between tasks, never inside one: an edited config reaches this run without a
@@ -3259,6 +3789,8 @@ class Worker(threading.Thread):
             watch_config(self.c, self.budget)
             task = self.q.claim()
             if not task:
+                self.doing, self.state = None, IDLE
+                self.clock.enter(IDLE)
                 self.stop.wait(20)
                 continue
             try:
@@ -3268,10 +3800,16 @@ class Worker(threading.Thread):
                 # diff there is nothing to divide, and the timeout is ours, not the task's.
                 final = self.q.release(task["id"], ok, note, failure_class=self.failure_class,
                                        split_now=self.agent_timed_out and self.stage != "agent_timeout",
-                                       park=self.stage == "out_of_scope")
+                                       park=self.stage in ("out_of_scope", "request_budget", "model_pool_exhausted"),
+                                       requests=getattr(self, "attempt_requests", 0),
+                                       failed_model=(self.last_model if not ok and self.failure_class in
+                                                     ("harness", "model") else None),
+                                       failed_role=self.last_role, ledger=self.ledger,
+                                       turn_seconds=round(max(0, time.time() - (getattr(self, "started", 0) or time.time())), 1),
+                                       role_turns=getattr(self, "role_calls", 0) or 0)
                 journal("task", id=task["id"], title=task["title"], ok=ok, stage=self.stage,
                         failure_class=None if ok else self.failure_class,
-                        worker=self.name, note=note[:300])
+                        worker=self.name, requests=getattr(self, "attempt_requests", 0), note=note[:300])
                 if final and final.get("status") == "split":
                     if not self.decompose(final, goal):
                         self.strand(final, "was split into no subtasks")
@@ -3924,7 +4462,8 @@ KNOWN_KEYS = frozenset({
     "sandbox", "sandbox_write", "keep_worktrees", "notify", "baseline_ttl", "personas",
     "restart_on_change", "restart_min_interval", "role_models",
     "scope_gate", "idle_improvement", "idle_improvement_cooldown", "max_review_formats",
-    "keep_attempts", "execution_class", "_comment"})
+    "task_request_cap", "run_request_cap", "max_role_calls",
+    "keep_attempts", "execution_class", "auto_plan", "_comment"})
 # Seconds a round of tool use really takes on these models, from the studio's own turns.
 SECONDS_PER_ROUND = 47
 
@@ -4330,7 +4869,39 @@ def start(c, hours=None, max_tasks=None, awake=False):
             {"pid": os.getpid(), "started": time.time(), "goal": read_goal(c)[:200],
              "repo": str(Path(c["repo"]).expanduser().resolve()), "config": str(CONFIG)}))
         _stop.clear()
-        preflight(c)
+        run_id = os.environ.get("FLINT_RUN_ID") or uuid.uuid4().hex
+        os.environ["FLINT_RUN_ID"] = run_id
+        try:
+            saved_run = json.loads((STATE / "run.json").read_text())
+        except (OSError, ValueError):
+            saved_run = {}
+        with _run_lock:
+            _run.clear()
+            _run.update(saved_run if saved_run.get("id") == run_id else
+                        {"id": run_id, "started": time.time(), "blocked_seconds": 0,
+                         "requests_started": 0})
+            # Reconcile provider vs local at run boundaries (work order §12). The local
+            # count is the sidecar-backed sum; the provider deltas are OpenRouter's own
+            # daily free-request counters, so a restart mid-day still shows the leftover.
+            info = account()
+            q = ((info or {}).get("free_model_daily_requests") or {})
+            provider_now = q.get("used") if isinstance(q.get("used"), int) else None
+            if _run.get("provider_before") is None and provider_now is not None:
+                _run["provider_before"] = provider_now
+            if _run.get("provider_last") is not None and provider_now is not None:
+                _run["provider_delta_since_last"] = max(0, provider_now - _run["provider_last"])
+            _run["provider_last"] = provider_now
+            _run.update(state="Running", stop_reason=None,
+                        deadline=float(os.environ["FLINT_RUN_DEADLINE"]) if os.environ.get("FLINT_RUN_DEADLINE") else None)
+        try:
+            preflight(c)
+        except BaseException as exc:
+            _stop.set()
+            with _run_lock:
+                _run["stop_reason"] = f"Startup failed: {type(exc).__name__}: {exc}"
+            run_status([], c)
+            (STATE / "daemon.pid").unlink(missing_ok=True)
+            raise
         if awake:
             keep_awake()
         timer = None
@@ -4357,6 +4928,29 @@ def start(c, hours=None, max_tasks=None, awake=False):
             if timer:
                 timer.cancel()
             shutdown()
+            with _run_lock:
+                if _run.get("deadline") and time.time() >= _run["deadline"]:
+                    _run["stop_reason"] = "Shift deadline reached"
+                # Bank the run-level reconciliation at the stop boundary (work order §12).
+                # Provider deltas come from OpenRouter's own counters; local attempts come
+                # from the request sidecars. Differences are shown, never assigned.
+                last_provider = _run.get("provider_last")
+                if isinstance(last_provider, int):
+                    _run["provider_at_stop"] = last_provider
+                local_total = int(_run.get("requests_started", 0))
+                paid_total = sum(int(a.get("paid_requests") or 0) for a in
+                                 _read(STATE / "journal.jsonl")
+                                 if a.get("event") == "attempt" and a.get("run_id") == _run.get("id"))
+                _run["reconcile"] = Reconcile.summary(
+                    [],  # local rows are already summed in requests_started
+                    provider_before=_run.get("provider_before"),
+                    provider_after=last_provider,
+                    paid_requests=paid_total)
+                _run["reconcile"]["locally_observed"] = local_total
+                journal("run_stop", stop_reason=_run.get("stop_reason"),
+                        requests_local=local_total,
+                        reconcile=_run.get("reconcile"))
+            run_status([], c)
             (STATE / "daemon.pid").unlink(missing_ok=True)
             (STATE / "now.json").unlink(missing_ok=True)
             log("stopped. `swarm report` summarises the run.")
@@ -4404,8 +4998,9 @@ def run_daemon(c, max_tasks=None, hours=None):
     try:
         while not stop.is_set():
             if tally.drain.is_set():
-                for w in workers:
-                    w.join()
+                while any(w.is_alive() for w in workers) and not stop.is_set():
+                    write_now(workers, c)
+                    stop.wait(1)
                 if restart_for and _drain_reason["stop_requested"]:
                     log(f"not restarting into {', '.join(restart_for)}: this run was asked to "
                         "stop, and a stop means stop")
@@ -4416,6 +5011,7 @@ def run_daemon(c, max_tasks=None, hours=None):
                     restart_into_new_code(restart_for)
                     restart_for = []          # it refused; carry on with the code we have
                     tally.drain.clear()
+                    _run.update(state="Running", stop_reason=None)
                     workers = [Worker(i, c, q, budget, stop, ledger, tally)
                                for i in range(c["workers"])]
                     for w in workers:
@@ -4458,7 +5054,7 @@ def run_daemon(c, max_tasks=None, hours=None):
                     dispatch_roadmap(c, q)
                 except Exception as exc:
                     log(f"roadmap dispatch blocked: {exc}")
-            if (not c.get("roadmap_file") and len(q.ready()) < c["workers"] and time.time() - last_plan > cooldown
+            if (c.get("auto_plan", True) and not c.get("roadmap_file") and len(q.ready()) < c["workers"] and time.time() - last_plan > cooldown
                     and can_take_a_turn(c, budget)):
                 last_plan = time.time()
                 try:
@@ -4505,7 +5101,7 @@ def run_daemon(c, max_tasks=None, hours=None):
                     shutdown()
                 except Exception as e:      # work nobody asked for must never stop a run
                     log(f"idle improvement error: {type(e).__name__}: {e}")
-            stop.wait(c.get("tick", 90) if not max_tasks else 5)
+            stop.wait(min(10, c.get("tick", 90)) if not max_tasks else 5)
     except KeyboardInterrupt:
         log("shutting down")
     finally:
@@ -4532,17 +5128,21 @@ def build_report(c, hours=24):
         if not j.get("ok") and j.get("failure_class"):
             classes[j["failure_class"]] = classes.get(j["failure_class"], 0) + 1
     parked = [d for d in _read(STATE / "done.jsonl")
-              if d.get("status") in ("parked", "split") and d.get("finished", 0) >= since]
+              if d.get("status") in ("parked", "split") and not d.get("dismissed_at")
+              and d.get("finished", 0) >= since]
     # Each task's own last outcome, so the report says what happened rather than guessing.
     last = {j["id"]: j for j in rows if j["event"] == "task"}
     # What the window cost, from OpenRouter's own numbers rather than a local price table.
     spent = round(sum(a.get("usd") or 0.0 for a in attempts), 6)
+    requests = sum(int(a.get("requests") or 0) for a in attempts)
     landed_n = sum(1 for a in attempts if a.get("stage") == "accepted")
     by_model = {}
     for a in attempts:
-        m = by_model.setdefault(a.get("implementer") or "?", {"attempts": 0, "landed": 0, "usd": 0.0})
+        m = by_model.setdefault(a.get("implementer") or "?", {"attempts": 0, "landed": 0,
+                                                                 "requests": 0, "usd": 0.0})
         m["attempts"] += 1
         m["landed"] += a.get("stage") == "accepted"
+        m["requests"] += int(a.get("requests") or 0)
         m["usd"] = round(m["usd"] + (a.get("usd") or 0.0), 6)
     b = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                owner_window=c.get("owner_window", ["00:00", "00:00"])).snapshot()
@@ -4550,7 +5150,16 @@ def build_report(c, hours=24):
     out = [f"# Swarm report — {Path(repo).name}",
            f"_{dt.datetime.now():%Y-%m-%d %H:%M}, last {hours:g}h_", "",
            f"**{t}** is {ahead or 0} commit(s) ahead of **{base}**. Nothing has been merged into your branches.",
-           "", "```sh", f"git -C '{repo}' log --oneline {base}..{t}",
+           "", "## Promotion", "",
+           "Landed on `{t}` but **not** merged or deployed — that is the point of the "
+           "swarm trunk: review and merge when you like it.".format(t=t),
+           "", "```",
+           f"accepted/landed {int((promotion_state(c) or {}).get('landed', 0))}; "
+           f"merged to {base} {int((promotion_state(c) or {}).get('merged', 0))}; "
+           f"verified live {int((promotion_state(c) or {}).get('verified_live', 0))}",
+           (promotion_state(c) or {}).get("verified_live_note", ""),
+           "```", "",
+           "```sh", f"git -C '{repo}' log --oneline {base}..{t}",
            f"git -C '{repo}' diff {base}...{t}",
            f"git -C '{repo}' merge {t}   # from your {base} checkout, when you like it", "```", ""]
     brk = [a for a in accepted if a.get("breakthrough")]
@@ -4571,7 +5180,17 @@ def build_report(c, hours=24):
         out += ["", "Whose failures these were: "
                 + ", ".join(f"{k} {v}" for k, v in sorted(classes.items(), key=lambda kv: -kv[1]))
                 + ". Only `task` failures say the work was wrong."]
-    out += ["", "## Cost", ""]
+    out += ["", "## Efficiency", "",
+            f"{landed_n} accepted / {len(tasks)} completed outcomes / {len(attempts)} model attempts / "
+            f"{requests} observed request starts.",
+            (f"{requests / landed_n:.1f} observed requests per accepted commit."
+             if landed_n else "No accepted commit denominator in this window."),
+            "", "First-pass accepted: "
+            + str(sum(1 for a in attempts if a.get("stage") == "accepted" and not a.get("repairs")))
+            + "; accepted after retry: "
+            + str(sum(1 for a in attempts if a.get("stage") == "accepted" and a.get("repairs")))
+            + ".",
+            "", "## Cost", ""]
     if spent:
         out += [f"${spent:.4f} across {len(attempts)} attempt(s); "
                 + (f"${spent / landed_n:.4f} per landed commit ({landed_n} landed)."
@@ -4690,6 +5309,7 @@ def cmd_status(a):
         "landed": sum(1 for t in done if t.get("status") == "done"),
         "split": sum(1 for t in done if t.get("status") == "split"),
         "parked": sum(1 for t in done if t.get("status") == "parked"),
+        "promotion": promotion_state(c),
         "top_arms": Ledger(STATE / "learn.json").leaderboard()[:8],
         "resting": [{"model": m, "until": dt.datetime.fromtimestamp(u).isoformat(timespec="seconds"),
                      "reason": why} for m, u, why in Ledger(STATE / "learn.json").resting()],

@@ -24,8 +24,14 @@ Every command prints JSON. `ask` streams one JSON object per line as models fini
     bridge.py report   --repo PATH [--hours 24]
     bridge.py vote     --model M --useful 1|0
     bridge.py wallet   [--cap 5] [--reset] [--enable | --disable] [--account]
+    bridge.py local-models   [--probe]
     bridge.py grind-cmd --repo PATH [--goal G] [--test-cmd T] [--hours H]
     bridge.py stop     --repo PATH [--drain] | --all
+
+`local-models` lists every local server's pulled models (GET /models on each local base
+URL) for the editor's provider dropdown; `ask` accepts --provider (ollama, lm-studio, mlx,
+llamacpp, openai, anthropic, openrouter) and --base-url for a custom endpoint, and a local
+ask never touches the OpenRouter key, wallet or request budget.
 
 `ask` runs read-only flint agents (read_file, list_files, search, study; no edits, no shell)
 in the macOS sandbox, several free models in parallel, then one more model merges their
@@ -63,6 +69,9 @@ import sandbox  # noqa: E402
 import swarmd  # noqa: E402
 import wallet  # noqa: E402
 from learn import Ledger  # noqa: E402
+# swarm/ is on sys.path (inserted above), so providers resolves as a plain module here;
+# flint.py imports it as `from swarm import providers` once the repo root is on its path.
+import providers  # noqa: E402
 
 CONSULT = HERE / "state" / "consult" / "learn.json"
 MAX_SELECTION = 12_000
@@ -252,11 +261,15 @@ Credit the model behind each key point in brackets, e.g. [qwen/qwen3.8-27b:free]
 unless code is needed."""
 
 
-def run_flint(prompt, repo, model, steps, study=True, timeout=420, on_progress=None, purse=None):
+def run_flint(prompt, repo, model, steps, study=True, timeout=420, on_progress=None, purse=None,
+              provider=None):
     """One read-only flint turn. on_progress receives its "round …"/"tool: …" lines as they happen.
 
     `purse` is a Wallet, passed only for a paid model: a free turn must never be stopped because
-    the dollar allowance is empty."""
+    the dollar allowance is empty. `provider` names the backend (ollama, lm-studio, …) when the
+    editor picked one; flint's own registry resolves the endpoint and skips the OpenRouter
+    throttle/wallet for local backends.
+    """
     env = dict(os.environ, FLINT_MAX_STEPS=str(steps))
     env.pop("FLINT_SWARM_BUDGET", None)
     env.pop("FLINT_WALLET", None)
@@ -265,6 +278,8 @@ def run_flint(prompt, repo, model, steps, study=True, timeout=420, on_progress=N
     if not study:
         env["FLINT_CORPUS_DB"] = swarmd.NO_CORPUS
     cmd = [sys.executable, str(ROOT / "flint.py"), "-p", prompt, "-C", str(repo), "-m", model, "--read-only"]
+    if provider and provider != "openrouter":
+        cmd += ["--provider", provider]
     if sandbox.available():
         home = os.environ.get("FLINT_HOME", "~/.flint")
         cmd = sandbox.wrap(cmd, sandbox.profile([home]))
@@ -341,9 +356,35 @@ def pick_models(c, n, explicit=None):
 def cmd_ask(a):
     repo = str(Path(a.repo).expanduser().resolve())
     c = config_for(repo)
-    if not os.environ.get("OPENROUTER_API_KEY"):
+    provider = getattr(a, "provider", None)
+    base_url = getattr(a, "base_url", None)
+    local = bool(provider and provider != "openrouter" and providers.PROVIDERS.get(provider, {}).get("local")) or \
+            bool(base_url)
+    if not local and not os.environ.get("OPENROUTER_API_KEY"):
         emit({"event": "error", "error": f"OPENROUTER_API_KEY is not set; add it to {ROOT / '.env'}"})
         return 2
+    if base_url:
+        # A custom endpoint the developer typed once: persist it and point the provider at it.
+        d = providers.load_providers()
+        label = provider or "custom"
+        d["openAIBaseUrl"] = providers.normalize_url(base_url)
+        eps = [e for e in d.get("customEndpoints") or []
+               if (e.get("baseUrl") or "").rstrip("/") != (base_url or "").rstrip("/")]
+        eps.append({"label": label, "baseUrl": providers.normalize_url(base_url)})
+        d["customEndpoints"] = eps[-8:]
+        providers.save_providers(d)
+        os.environ["OLLAMA_BASE_URL"] = providers.normalize_url(base_url) if provider == "ollama" else \
+            os.environ.get(providers.PROVIDERS.get(provider or "", {}).get("env", ""), providers.normalize_url(base_url))
+    if local and not a.model:
+        # The editor picked a provider but no specific model: ask that provider's own (first)
+        # or ask flint for its default for the provider.
+        can = _local_models(providers.base_url_for(provider), timeout=3)
+        if can:
+            a.model = can[0]["id"]
+        else:
+            emit({"event": "error", "error": f"{provider} is not running or has no models; "
+                                                f"start it (e.g. `{providers.PROVIDERS.get(provider, {}).get('command', '')}`) and try again."})
+            return 2
     where, code = selection_context(repo, a.file, a.start, a.end, a.selection_file)
     context = ""
     if where:
@@ -352,26 +393,39 @@ def cmd_ask(a):
     corpus_ok = not a.no_study and Path(c.get("corpus_db") or "~/.flint/corpus.db").expanduser().is_file()
     purse = None if a.paid == "off" else wallet_for(c)
     models, paid_first = [], False
-    if a.paid == "always" and purse and purse.check()[0]:
-        models, paid_first = paid_models(c, max(1, min(a.models, MAX_PAID_PER_ASK))), True
+    if local:
+        # The editor picked a local provider: one model, no wallet, no OpenRouter pool. If a
+        # model was given use it as-is; otherwise keep the first one the server listed (set
+        # above) or clear the pool so the loop below reports the server is quiet.
+        models = [a.model] if a.model else []
+        paid_first = False
+        purse = None
+    else:
+        if a.paid == "always" and purse and purse.check()[0]:
+            models, paid_first = paid_models(c, max(1, min(a.models, MAX_PAID_PER_ASK))), True
+        if not models:
+            models, paid_first = pick_models(c, a.models, a.model.split(",") if a.model else None), False
     if not models:
-        models, paid_first = pick_models(c, a.models, a.model.split(",") if a.model else None), False
-    if not models:
-        emit({"event": "error", "error": "no usable models: every model in the pool is resting or the pool is empty"})
+        emit({"event": "error", "error": f"no usable models: the {provider or 'default'} provider is "
+                                            f"not running or the pool is empty"})
         return 2
     emit({"event": "context", "repo": repo, "where": where, "models": models, "study": corpus_ok,
-          "paid": paid_first, "wallet": purse.snapshot() if purse else None})
+          "paid": paid_first, "wallet": purse.snapshot() if purse else None, "provider": provider})
     prompt = ASK.format(question=a.question.strip(), context=context, study=STUDY_HINT if corpus_ok else "")
     ledger, results = Ledger(CONSULT), []
 
     def run_round(pool, with_purse=None):
         """Ask several models at once. Each thread reports its own result, whatever happens."""
         def one(model):
-            emit({"event": "start", "model": model, "paid": with_purse is not None})
+            emit({"event": "start", "model": model, "paid": with_purse is not None,
+                  "provider": provider})
             try:
+                kw = dict(purse=None if local else with_purse)
+                if provider:
+                    kw["provider"] = provider
                 r = run_flint(prompt, repo, model, a.steps, corpus_ok, a.timeout,
                               lambda s: emit({"event": "progress", "model": model, "text": s}),
-                              purse=with_purse)
+                              **kw)
             except Exception as e:   # a thread must report, not vanish
                 r = {"ok": False, "model": model, "error": f"{type(e).__name__}: {e}"}
             if r["ok"]:
@@ -389,10 +443,11 @@ def cmd_ask(a):
 
     run_round(models, purse if paid_first else None)
     good = [r for r in results if r["ok"]]
-    if not good and not paid_first and a.paid != "off":
+    if not good and not paid_first and a.paid != "off" and not local:
         # Nothing came back: every free model was busy, gated or too slow. This is the case the
         # wallet exists for — one paid model, checked against the allowance first, rather than
-        # handing back an empty panel.
+        # handing back an empty panel. A local ask never falls back to the paid cloud models:
+        # the whole point of picking a local provider is to stay off OpenRouter.
         allowed, why = purse.check() if purse else (False, "no paid allowance is configured")
         rescue = paid_models(c, min(MAX_PAID_PER_ASK, max(1, a.rescue_models))) if allowed else []
         emit({"event": "rescue", "models": rescue, "why": why,
@@ -401,15 +456,18 @@ def cmd_ask(a):
             models += rescue
             run_round(rescue, purse)
             good = [r for r in results if r["ok"]]
-    if len(good) >= 2 and not a.no_synthesis:
+    if len(good) >= 2 and not a.no_synthesis and not local:
         free_good = [r for r in good if not r.get("paid")]
         merger = pick_models(c, 1, None) or [(free_good or good)[0]["model"]]
         answers = "\n\n".join(f"--- {r['model']} ---\n{r['text'][:6000]}" for r in good)
         emit({"event": "start", "model": merger[0], "role": "synthesis"})
+        sint_kw = dict(purse=purse if not merger[0].endswith(":free") else None)
+        if provider:
+            sint_kw["provider"] = provider
         r = run_flint(SYNTH.format(question=a.question.strip(), context=context, answers=answers),
                       repo, merger[0], a.steps, corpus_ok, a.timeout,
                       lambda s: emit({"event": "progress", "model": merger[0], "role": "synthesis", "text": s}),
-                      purse=purse if not merger[0].endswith(":free") else None)
+                      **sint_kw)
         results.append(r)
         emit({"event": "synthesis" if r["ok"] else "error", "role": "synthesis", **r})
     emit({"event": "done", "answered": len(good), "asked": len(models),
@@ -572,7 +630,7 @@ def cmd_parked(a):
             if j["event"] == "task"}
     rows = []
     for d in reversed(swarmd._read(swarmd.STATE / "done.jsonl")):
-        if d.get("status") not in ("parked", "split"):
+        if d.get("status") not in ("parked", "split") or d.get("dismissed_at"):
             continue
         j = last.get(d["id"], {})
         raw = j.get("note") or d.get("note") or ""
@@ -589,9 +647,18 @@ def cmd_parked(a):
             "handoff": next((str(p / "HANDOFF.md") for p in
                              sorted((swarmd.STATE / "attempts").glob(f"{d['id']}-*"), reverse=True)
                              if (p / "HANDOFF.md").is_file()), None)})
-        if len(rows) >= (a.limit or 20):
-            break
-    emit({"ok": True, "repo": c["repo"], "parked": rows})
+    emit({"ok": True, "repo": c["repo"], "total": len(rows), "parked": rows[:a.limit or 20]})
+    return 0
+
+
+def cmd_parked_dismiss(a):
+    _, q = _queue(a.repo)
+    try:
+        ids = q.dismiss_finished(a.id)
+    except ValueError as exc:
+        emit({"ok": False, "error": str(exc)})
+        return 2
+    emit({"ok": True, "dismissed": len(ids), "ids": ids, "evidence_preserved": True})
     return 0
 
 
@@ -655,6 +722,84 @@ def cmd_wallet(a):
     return 0
 
 
+def _local_models(base_url, timeout=2):
+    """Models a local OpenAI-compatible server reports at GET /v1/models.
+
+    Returns a list of (id, name, context, cost_hint) tuples — the fields the picker
+    shows. Never raises: an unreachable server (Ollama not running, wrong port) is a
+    per-provider list that says so instead of killing the whole dropdown.
+    """
+    if not base_url:
+        return []
+    import urllib.error
+    import urllib.request
+    url = base_url.rstrip("/")
+    if not url.endswith("/v1"):
+        base = url if "/v1" in url else url + "/v1"
+        url = base
+    req = urllib.request.Request(url + "/models")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+        rows = data.get("data") if isinstance(data, dict) else data
+        out = []
+        for m in rows or []:
+            mid = m.get("id") or m.get("name") or ""
+            if not mid:
+                continue
+            ctx = m.get("context_length") or (m.get("meta") or {}).get("context_length")
+            out.append({"id": str(mid),
+                        "name": m.get("name") or str(mid),
+                        "context": ctx,
+                        "created": m.get("created"),
+                        "owned_by": m.get("owned_by")})
+        return out
+    except (urllib.error.URLError, OSError, ValueError, TypeError):
+        return []
+
+
+def _custom_endpoints():
+    """User-added OpenAI-compatible endpoints from ~/.flint/providers.json, as
+    {label, baseUrl, models} entries."""
+    d = providers.load_providers()
+    return d.get("customEndpoints") or []
+
+
+def cmd_local_models(a):
+    """List local server models for the editor's provider dropdown.
+
+    Calls each local provider and this user's custom endpoints (all cheap GETs to
+    /v1/models, each with a short timeout) and returns one JSON object with a
+    `providers` array: {id, label, local, baseUrl, running, models:[{id,name,context}]}.
+    The editor turns this into the provider → model QuickPick chain; a custom endpoint
+    the user adds is persisted in ~/.flint/providers.json and listed here too.
+    """
+    out = {"providers": []}
+    probe = getattr(a, "probe", False)
+    for name, info in providers.PROVIDERS.items():
+        if not info.get("local"):
+            continue
+        base = providers.base_url_for(name)
+        models = _local_models(base) if probe else _local_models(base)
+        out["providers"].append({
+            "id": name, "label": info["label"], "local": True,
+            "baseUrl": base, "running": bool(models),
+            "models": [{k: m[k] for k in ("id", "name", "context") if k in m} for m in models],
+        })
+    for ep in _custom_endpoints():
+        base = (ep.get("baseUrl") or "").strip()
+        if not base:
+            continue
+        models = _local_models(base)
+        out["providers"].append({
+            "id": "custom:" + (ep.get("label") or base), "label": ep.get("label") or base,
+            "local": True, "baseUrl": base, "running": bool(models),
+            "models": [{k: m[k] for k in ("id", "name", "context") if k in m} for m in models],
+        })
+    emit(out)
+    return 0
+
+
 def _log_age():
     """Seconds since the daemon last wrote a line, or None if it has not written today.
 
@@ -682,8 +827,13 @@ def cmd_status(a):
     budget = swarmd.Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                            owner_window=c.get("owner_window", ["00:00", "00:00"])).snapshot()
     tuned = swarmd.per_repo_config(c["repo"])
+    try:
+        run = json.loads((swarmd.STATE / "run.json").read_text())
+    except (OSError, ValueError):
+        run = None
     emit({"repo": c["repo"], "is_target": is_target(c["repo"]), "daemon_running": daemon_running(),
           "now": swarmd.read_now(), "health": swarmd.health(24),
+          "run": run,
           "config_path": str(swarmd.CONFIG), "config_kind": swarmd.config_kind(),
           "config_warnings": swarmd.config_warnings(c),
           "config_tuned_available": str(tuned) if tuned.is_file() else None,
@@ -697,7 +847,7 @@ def cmd_status(a):
           "max_queue": c.get("max_queue", 20),
           "kinds": list(swarmd.KINDS),
           "landed": sum(t.get("status") == "done" for t in done),
-          "parked": sum(t.get("status") in ("parked", "split") for t in done),
+          "parked": sum(t.get("status") in ("parked", "split") and not t.get("dismissed_at") for t in done),
           "budget": budget, "experiment": {"verdict": exp["verdict"], "on": exp["on"]["attempts"],
                                            "off": exp["off"]["attempts"]},
           "spend": {"used": round(swarmd.spend_used(c), 6), "cap": swarmd.spend_cap(c),
@@ -794,6 +944,181 @@ def cmd_vote(a):
     Ledger(CONSULT).update("consult", a.model, 1.0 if a.useful else 0.0)
     emit({"ok": True, "model": a.model, "useful": bool(a.useful),
           "leaderboard": [r for r in Ledger(CONSULT).leaderboard() if r["role"] == "consult"][:10]})
+    return 0
+
+
+def cmd_set_key(a):
+    """Write OPENROUTER_API_KEY into the checkout .env (mode 0600).
+
+    The Cursor extension calls this from its fresh-start key prompt; the key is written by
+    the bridge (which already owns the .env contract) rather than by the extension process,
+    so the secret never rides through the webview or the extension's settings pipe.
+    """
+    key = (getattr(a, "key", "") or "").strip()
+    if a.check and not key:
+        emit({"ok": True, "set": bool(os.environ.get("OPENROUTER_API_KEY")),
+              "path": str(ROOT / ".env")})
+        return 0
+    if not key.startswith("sk-or-") and not key.startswith("sk-"):
+        emit({"event": "error", "ok": False,
+              "error": "that does not look like an OpenRouter key (starts with sk-or- or sk-)",
+              "prefix": key[:6]})
+        return 2
+    env_path = ROOT / ".env"
+    try:
+        lines = []
+        if env_path.is_file():
+            lines = env_path.read_text().splitlines()
+        kept = [ln for ln in lines if not ln.lstrip().startswith("OPENROUTER_API_KEY=")]
+        kept.append(f"OPENROUTER_API_KEY={key}")
+        tmp = env_path.with_name(env_path.name + ".tmp")
+        tmp.write_text("\n".join(kept) + "\n")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(env_path)
+        try:
+            os.chmod(env_path, 0o600)
+        except OSError:
+            pass
+        os.environ["OPENROUTER_API_KEY"] = key
+        emit({"ok": True, "set": True, "path": str(env_path)})
+        return 0
+    except OSError as e:
+        emit({"event": "error", "ok": False, "error": f"could not write {env_path}: {e}"})
+        return 1
+
+
+def cmd_extension(a):
+    """Manage the extensions runtime (Phase 3): list, trust, run."""
+    import extensions
+    if a.list:
+        emit({"ok": True, "extensions": extensions._read_manifest(),
+              "trusted": sorted(extensions._trusted()), "root": str(extensions.ext_root())})
+        return 0
+    if a.trust:
+        path = extensions.trust(a.trust)
+        if not path:
+            emit({"event": "error", "ok": False,
+                  "error": f"no extension named '{a.trust}' in {extensions.ext_root()}"})
+            return 2
+        emit({"ok": True, "trusted": a.trust, "path": path})
+        return 0
+    if a.run and a.event:
+        results = extensions.run_extensions([a.event], ROOT, {})
+        emit({"ok": True, "results": results})
+        return 0
+    emit({"event": "error", "ok": False, "error": "extension needs --list, --trust NAME or --run --event EVENT"})
+    return 2
+
+
+def cmd_doctor(a):
+    """Hardware-aware local-model recommendation (albatross `/doctor` parity)."""
+    import hardware
+    emit(hardware.doctor())
+    return 0
+
+
+def cmd_route(a):
+    """Score the configured model pool for a task and say which model to use (Phase 2)."""
+    import routing
+    import providers as _providers
+    c = config_for(a.repo) if getattr(a, "repo", None) else swarmd.load_cfg()
+    models = [m for m in (c.get("models") or []) if isinstance(m, str)]
+    catalog = None
+    if os.environ.get("OPENROUTER_API_KEY"):
+        try:
+            catalog = _catalog()
+        except Exception:
+            catalog = None
+    policy = _providers.load_providers().get("modelSystem", {}).get("policy") or {}
+    policy = {**policy, **({k: v for k, v in (getattr(a, "policy", None) or {}).items() if v is not None})}
+    if getattr(a, "local_only", False):
+        policy["localOnly"] = True
+    if getattr(a, "max_turn", None):
+        policy["maxTurnUsd"] = a.max_turn
+    task = " ".join(a.task or []) or None
+    if getattr(a, "select", False):
+        pick = routing.select(models, catalog=catalog, policy=policy, task=task)
+        emit({"ok": pick is not None, "choice": pick, "policy": policy,
+              "pool_size": len(models)})
+    else:
+        emit({"ok": True, "ranked": routing.rank(models, catalog=catalog, policy=policy, task=task),
+              "policy": policy, "pool_size": len(models)})
+    return 0
+
+
+def cmd_receipts(a):
+    """The lasting cost ledger (~/.albatross/routes.jsonl): totals and recent rows."""
+    import receipts
+    hours = getattr(a, "hours", 24)
+    since = None if not hours else time.time() - hours * 3600
+    out = {"path": str(receipts.routes_path()), "tail": receipts.tail(limit=getattr(a, "limit", 20))}
+    out["summary"] = receipts.summarize(since=since)
+    if getattr(a, "days", None):
+        out["days"] = _receipt_days(getattr(a, "days", 7))
+    emit(out)
+    return 0
+
+
+def _receipt_days(n):
+    """Per-day spend for the last n days, for the panel's cost footer."""
+    import receipts
+    days = []
+    for i in range(n):
+        start = time.time() - (i + 1) * 86400
+        end = time.time() - i * 86400
+        rows = [r for r in receipts._all() if start <= (r.get("at") or 0) < end]
+        days.append({"date": dt.date.fromtimestamp(start).isoformat(),
+                     "usd": round(sum(max(0.0, float(r.get("usd") or 0)) for r in rows), 6),
+                     "requests": len(rows)})
+    return days
+
+
+def cmd_undo(a):
+    """Undo a flint turn's file changes (Phase 2): `bridge.py undo --session <id> [--dry-run]`."""
+    import undo as undo_mod
+    if getattr(a, "list", False):
+        emit({"ok": True, "sessions": undo_mod.list_sessions()})
+        return 0
+    if not a.session:
+        emit({"event": "error", "ok": False, "error": "undo needs --session <id> (use --list to see them)"})
+        return 2
+    restored, skipped = undo_mod.undo(a.session, dry_run=bool(a.dry_run))
+    emit({"ok": True, "dry_run": bool(a.dry_run), "session": a.session,
+          "restored": [{"path": p, "bytes": b} for p, b in restored],
+          "skipped": [{"path": p, "why": w} for p, w in skipped]})
+    return 0
+
+
+def cmd_continue(a):
+    """Resume the last nonstop session's goal for a few more hours: `bridge.py continue [--hours N]`.
+
+    The daemon keeps no transcript to replay — the checkpoint material is a handoff for the
+    next request, not a resumable conversation — so "continue" means: start another nonstop
+    run on the same goal with the same model, which is exactly what the session handoff is
+    designed for. When a goal is given it replaces the previous one.
+    """
+    state_dir = Path(os.environ.get("FLINT_HOME", "~/.flint")).expanduser()
+    sessions = sorted((state_dir / "nonstop").glob("*/status.json"),
+                      key=lambda p: p.stat().st_mtime, reverse=True) if (state_dir / "nonstop").is_dir() else []
+    if not sessions and not a.goal:
+        emit({"event": "error", "ok": False, "error": "no previous nonstop session; give --goal G"})
+        return 1
+    goal = a.goal
+    model = a.model
+    if sessions:
+        state = json.loads(sessions[0].read_text())
+        goal = goal or state.get("goal")
+        model = model or state.get("model")
+    if not goal:
+        emit({"event": "error", "ok": False, "error": "no goal known; give --goal G"})
+        return 1
+    hours = a.hours or 4
+    emit({"ok": True, "goal": goal[:200], "model": model, "hours": hours,
+          "previous": str(sessions[0]) if sessions else None,
+          "style": "resume the previous session's goal with a new run"})
     return 0
 
 
@@ -937,6 +1262,13 @@ def main(argv=None):
             s.add_argument("--question", required=True)
             s.add_argument("--models", type=int, default=3)
             s.add_argument("--model", help="comma-separated model ids instead of sampling")
+            s.add_argument("--provider", default=None,
+                           help="backend for this ask (ollama, lm-studio, mlx, llamacpp, openai, "
+                                "anthropic, openrouter). A local provider skips the wallet and the "
+                                "OpenRouter request budget entirely.")
+            s.add_argument("--base-url", default=None, dest="base_url",
+                           help="endpoint override for the provider; with --provider a custom "
+                                "OpenAI-compatible URL is written to ~/.flint/providers.json")
             s.add_argument("--steps", type=int, default=8)
             s.add_argument("--timeout", type=int, default=420, help="seconds per model (free models can be slow)")
             s.add_argument("--no-synthesis", action="store_true")
@@ -963,6 +1295,12 @@ def main(argv=None):
         s.add_argument("--repo", required=True)
         s.add_argument("--limit", type=int, default=20)
         s.set_defaults(fn=fn)
+    s = sub.add_parser("parked-dismiss", help="dismiss abandoned tasks without deleting evidence")
+    s.add_argument("--repo", required=True)
+    choice = s.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--id")
+    choice.add_argument("--all", action="store_true")
+    s.set_defaults(fn=cmd_parked_dismiss)
     s = sub.add_parser("import-bugs")
     s.add_argument("--repo", required=True)
     s.add_argument("--limit", type=int, default=5, help="at most this many per run (default 5)")
@@ -1003,11 +1341,50 @@ def main(argv=None):
     s.add_argument("--disable", action="store_true")
     s.add_argument("--account", action="store_true", help="also ask OpenRouter about the account's credits")
     s.set_defaults(fn=cmd_wallet)
+    s = sub.add_parser("local-models", help="list local servers' models for the editor's provider dropdown")
+    s.add_argument("--probe", action="store_true",
+                   help="probe every local provider even when it looks quiet (default: probe only)")
+    s.set_defaults(fn=cmd_local_models)
     s = sub.add_parser("study")
     s.add_argument("--query", required=True)
     s.add_argument("-k", type=int, default=6)
     s.add_argument("--chars", type=int, default=1600)
     s.set_defaults(fn=cmd_study)
+    s = sub.add_parser("set-key", help="write OPENROUTER_API_KEY to the checkout .env (0600)")
+    s.add_argument("--key", default="", help="the key to store (sk-or-... or sk-...)")
+    s.add_argument("--check", action="store_true",
+                   help="say whether a key is already set, without writing anything")
+    s.set_defaults(fn=cmd_set_key)
+    s = sub.add_parser("extension", help="manage the extensions runtime (~/.flint/extensions)")
+    s.add_argument("--list", action="store_true", help="list installed extensions and their trust state")
+    s.add_argument("--trust", metavar="NAME", help="trust an extension by name (records its hash)")
+    s.add_argument("--run", action="store_true", help="run the extensions registered for --event")
+    s.add_argument("--event", default="PostToolUse", help="event to fire (default PostToolUse)")
+    s.set_defaults(fn=cmd_extension)
+    s = sub.add_parser("doctor", help="hardware-aware local-model recommendation (albatross /doctor parity)")
+    s.set_defaults(fn=cmd_doctor)
+    s = sub.add_parser("route", help="score the model pool for a task and pick the best (Phase 2)")
+    s.add_argument("--repo", help="repository whose config pool to score (default: default config)")
+    s.add_argument("--task", nargs="*", default=None, help="the task text to score against")
+    s.add_argument("--select", action="store_true", help="emit just the best choice")
+    s.add_argument("--local-only", action="store_true")
+    s.add_argument("--max-turn", type=float, help="refuse candidates costing more than this per turn")
+    s.set_defaults(fn=cmd_route)
+    s = sub.add_parser("receipts", help="the lasting cost ledger (~/.albatross/routes.jsonl)")
+    s.add_argument("--hours", type=float, default=24, help="summary window in hours (0 = all)")
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--days", type=int, default=None, help="also emit per-day spend for this many days")
+    s.set_defaults(fn=cmd_receipts)
+    s = sub.add_parser("undo", help="undo a flint turn's file changes (Phase 2)")
+    s.add_argument("--session", help="the undo session id (a flint turn)")
+    s.add_argument("--list", action="store_true", help="list recent sessions with an undo log")
+    s.add_argument("--dry-run", action="store_true", help="say what would be restored, change nothing")
+    s.set_defaults(fn=cmd_undo)
+    s = sub.add_parser("continue", help="resume the last nonstop session's goal (albatross --continue parity)")
+    s.add_argument("--goal", default="", help="replace the previous goal (default: keep it)")
+    s.add_argument("--model", default="", help="model for the continued run (default: the one it used)")
+    s.add_argument("--hours", type=float, default=4, help="hours to run for (default 4)")
+    s.set_defaults(fn=cmd_continue)
     s = sub.add_parser("report")
     s.add_argument("--repo", required=True)
     s.add_argument("--hours", type=float, default=24)

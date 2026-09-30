@@ -226,9 +226,9 @@ class SourceChangeTests(unittest.TestCase):
 
     def test_an_edited_file_is_named(self):
         before = dict(swarmd.source_fingerprint())
-        key = next(k for k in before if k.endswith("wallet.py"))
+        key = next(k for k in before if k.endswith("workflow.py"))
         before[key] = (0.0, 0)
-        self.assertEqual(swarmd.source_changed(before), ["wallet.py"])
+        self.assertEqual(swarmd.source_changed(before), ["workflow.py"])
 
     def test_the_real_tree_compiles(self):
         self.assertEqual(swarmd.source_compiles(), (True, ""))

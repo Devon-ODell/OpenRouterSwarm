@@ -180,6 +180,7 @@ class BashTimeoutTests(unittest.TestCase):
         c = {"repo": str(root), "test_cmd": "true", "models": ["a:free"], **extra}
         budget = Budget(cap=100, reserve=0, owner_window=["00:00", "00:00"])
         with patch.object(swarmd, "process", process), \
+             patch.object(Budget, "spent_today", return_value=0), \
              patch.object(swarmd, "LOGS", root / "logs"), \
              patch.object(swarmd, "STATE", root), \
              patch.object(swarmd, "sandboxed", side_effect=lambda cmd, *a: cmd):

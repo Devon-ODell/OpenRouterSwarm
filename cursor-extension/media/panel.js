@@ -39,6 +39,9 @@
         : '<span class="dim">○ No swarm is set up for this repository.</span>';
     }
     if (!now) return '<span class="ok">● Running</span> <span class="dim">· waiting for its first status line…</span>';
+    if (now.run && ['Blocked', 'Draining', 'Waiting'].includes(now.run.state)) {
+      return `<span class="warn">${R.esc(now.run.state)}</span> · ${R.esc(now.run.reason || '')}`;
+    }
     const w = (now.workers || [])[0];
     if (!w) {
       if (now.idle && now.back) return `<span class="warn">◐ ${R.esc(now.idle)}</span> · first back ${R.esc(atTime(now.back))}`;
@@ -90,6 +93,13 @@
     if (status) {
       const name = status.repo.split('/').pop();
       bits.push(nowLine());
+      const run = (status.now && status.now.run) || status.run;
+      if (run && run.id) {
+        bits.push(`<span class="dim">Run ${R.esc(run.id.slice(0, 8))} · ${R.esc(run.state || '')}`
+          + (run.deadline ? ` · ${forHuman(Math.max(0, run.deadline - Date.now() / 1000))} remaining` : '') + '</span>');
+        bits.push(`<span class="dim">Last tool/check progress: ${run.last_progress_at ? forHuman(Date.now() / 1000 - run.last_progress_at) + ' ago' : 'not recorded'}`
+          + ` · Last accepted commit: ${run.last_accepted_commit ? R.esc(run.last_accepted_commit.slice(0, 8)) : 'none this run'}</span>`);
+      }
       bits.push(healthLine());
       bits.push(`<b>${R.esc(name)}</b> · ${status.queue.length} queued · ${status.landed} landed`
         + (status.trunk_ahead ? ` · trunk +${status.trunk_ahead}` : ''));
@@ -111,6 +121,16 @@
         always: 'ON from the first request' }[paid] || paid;
       bits.push(`<span class="${paid === 'off' ? 'ok' : 'warn'}">paid requests: <b>${R.esc(paidWord)}</b></span>`
         + ` <button class="icon" id="paidToggle" title="${paid === 'off' ? 'Allow paid models as a rescue' : 'Switch paid requests off'}">${paid === 'off' ? '🔒' : '⏻'}</button>`);
+      // The provider/model the developer's ask will use (local picks stay off OpenRouter).
+      const prov = status.ask_provider || 'openrouter';
+      const provLabel = prov === 'openrouter' ? 'OpenRouter' : prov;
+      bits.push(`<span class="dim">ask with <b>${R.esc(provLabel)}</b>`
+        + (status.ask_model ? ` · ${R.esc(status.ask_model)}` : '') + '</span>');
+      // The key gate from the fresh-start prompt: cloud asks need a key, local ones do not.
+      if (prov === 'openrouter' && info && info.api_key === false) {
+        bits.push(`<span class="err">no OpenRouter API key set</span> `
+          + `<button class="icon" id="setkey" title="Set the OpenRouter API key (stored in the checkout .env, 0600)">🔑</button>`);
+      }
       const w = status.wallet;
       if (w) {
         bits.push(`editor wallet: recorded <b>${money(w.spent)}</b> of ${money(w.cap)} cap` +
@@ -327,7 +347,8 @@
     const head = $('parkedHead'), list = $('parkedList');
     const rows = parked || [];
     head.innerHTML = rows.length
-      ? `<div class="qhead"><span>${rows.length} split or parked — the swarm gave these up</span></div>` : '';
+      ? `<div class="qhead"><span>${status && status.parked != null ? status.parked : rows.length} split or parked</span>`
+        + '<button id="pclear" class="secondary" title="Dismiss all abandoned tasks, including those not shown. Logs and patches stay available.">Clear all abandoned</button></div>' : '';
     list.innerHTML = '';
     for (const t of rows) {
       const row = el('div', 'qrow');
@@ -340,6 +361,7 @@
         `<span class="qtitle">${R.esc(t.title)}</span><span class="qmeta">${bits.join(' · ')}</span>`));
       row.appendChild(el('div', 'qactions',
         `<button class="icon prequeue" title="Put this task back in the queue, attempts cleared">↻</button>`
+        + '<button class="icon pdismiss" title="Dismiss this abandoned task; preserve its logs and patches" aria-label="Dismiss abandoned task">×</button>'
         + (t.handoff ? `<button class="icon pwhy" data-path="${R.esc(t.handoff)}" title="Open the handoff for this attempt">why</button>` : '')));
       list.appendChild(row);
     }
@@ -449,11 +471,18 @@
   document.addEventListener('click', (e) => {
     const tabBtn = e.target.closest('.tab');
     if (tabBtn) { showTab(tabBtn.dataset.tab); return; }
+    if (e.target.closest('#board')) { vscode.postMessage({type:'board'}); return; }
+    if (e.target.closest('#completed')) { vscode.postMessage({type:'completed'}); return; }
     if (e.target.closest('#activity')) { vscode.postMessage({ type: 'activity' }); return; }
     if (e.target.closest('#budget')) { vscode.postMessage({ type: 'budget' }); return; }
+    if (e.target.closest('#setkey')) { vscode.postMessage({ type: 'setApiKey' }); return; }
     if (e.target.closest('#paidToggle')) { vscode.postMessage({ type: 'togglePaid' }); return; }
     if (e.target.closest('#qclear')) {
       vscode.postMessage({ type: 'queueClear', repo: status && status.repo });
+      return;
+    }
+    if (e.target.closest('#pclear')) {
+      vscode.postMessage({ type: 'parkedDismiss', repo: status && status.repo });
       return;
     }
     const landedRowEl = e.target.closest('#landedList .qrow');
@@ -463,6 +492,10 @@
     }
     const parkedRowEl = e.target.closest('#parkedList .qrow');
     if (parkedRowEl) {
+      if (e.target.closest('.pdismiss')) {
+        vscode.postMessage({ type: 'parkedDismiss', id: parkedRowEl.dataset.id, repo: status && status.repo });
+        return;
+      }
       const why = e.target.closest('.pwhy');
       if (why) { vscode.postMessage({ type: 'open', path: why.dataset.path, repo: status && status.repo }); return; }
       if (e.target.closest('.prequeue')) {

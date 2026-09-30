@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
 flint — a tiny terminal coding agent that runs on free OpenRouter models
-(default: inclusionAI Ling 3.0 Flash Fin).
+(default: inclusionAI Ling 3.0 Flash Fin), and on any local server that
+speaks OpenAI-compatible chat completions or Anthropic messages:
+
+    python flint.py -m ollama:qwen2.5-coder:7b     # Ollama (no key needed)
+    python flint.py --provider lm-studio -m ...     # LM Studio / MLX / llama.cpp
+
+A `backend:` prefix or a known vendor slug (`anthropic/...`) picks the provider;
+endpoint overrides live in the environment (OLLAMA_BASE_URL, ...) or in
+~/.flint/providers.json. Local providers skip the OpenRouter request budget.
 
     # Set OPENROUTER_API_KEY=sk-or-... in .env beside this script, or:
     export OPENROUTER_API_KEY=sk-or-...
@@ -39,6 +47,14 @@ except ModuleNotFoundError as e:
              f"  python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt\n"
              f"  .venv/bin/python flint.py")
 
+# The provider registry lives beside flint.py (swarm/providers.py). It is imported at
+# module level only when present; the repo root is on sys.path once main() runs, and the
+# daemon/tests load it directly.
+try:
+    from swarm import providers as _providers
+except (ImportError, ModuleNotFoundError):
+    _providers = None
+
 try:
     import readline  # noqa: F401  (arrow keys + history in input())
 except ImportError:
@@ -67,10 +83,17 @@ IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_c
 NEEDS_APPROVAL = {"write_file", "edit_file", "bash"}
 STATE_DIR = Path(os.environ.get("FLINT_HOME", "~/.flint")).expanduser()
 RPM_LIMIT = int(os.environ.get("FLINT_RPM", "18"))  # OpenRouter caps :free models at 20/min
-OPENROUTER = "https://openrouter.ai/api/v1"
+OPENROUTER = "https://openrouter.ai/api/v1"  # the default provider's base URL (providers.py reads this)
 CORPUS_DB = Path(os.environ.get("FLINT_CORPUS_DB", "~/.flint/corpus.db")).expanduser()
 # Headless shell commands do not inherit credentials from the environment.
 SECRET_ENV = re.compile(r"API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL", re.I)
+
+# Path of the machine-readable request sidecar (work order §1). Every HTTP request
+# attempt — the initial call and every provider retry — appends one JSON line here
+# *before* it is made, so a SIGKILLed turn still leaves an exact count behind and the
+# daemon never has to parse human log lines. The daemon names the file per turn and
+# banks the total after flint exits.
+REQUEST_FILE = os.environ.get("FLINT_REQUEST_FILE", "")
 
 ACCENT = "cyan"
 console = Console(highlight=False)
@@ -126,6 +149,7 @@ def read_files(paths, limit=400):
 
 
 def write_file(path, content):
+    check_write_scope(path)
     p = _p(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     existed = p.exists()
@@ -151,12 +175,28 @@ def _plan_edit(path, old_str, new_str, replace_all=False):
 
 
 def edit_file(path, old_str, new_str, replace_all=False):
+    check_write_scope(path)
     old, new, err = _plan_edit(path, old_str, new_str, replace_all)
     if err:
         return err
     _p(path).write_text(new)
     n = old.count(old_str) if replace_all else 1
     return f"Edited {path} ({n} replacement{'s' if n != 1 else ''})."
+
+
+def check_write_scope(path):
+    raw = os.environ.get("FLINT_ALLOWED_PATHS")
+    if not raw:
+        return
+    scope = json.loads(raw)
+    root = Path.cwd().resolve()
+    target = _p(path).resolve()
+    try:
+        relative = target.relative_to(root).as_posix()
+    except ValueError:
+        raise PermissionError("task writes must remain inside its worktree")
+    if not any(relative == p or (p.endswith("/") and relative.startswith(p)) for p in scope):
+        raise PermissionError(f"{relative} is outside this task's allowed_paths: {scope}")
 
 
 def list_files(pattern="**/*", path="."):
@@ -239,9 +279,44 @@ def study(query, k=5):
     return text or "No matches in the study corpus. Try different or more specific terms."
 
 
+# Max bytes a web_fetch will keep; anything past this is cut with a marker.
+WEB_FETCH_LIMIT = 40_000
+
+
+def web_fetch(url):
+    """Fetch one http(s) URL and return the text, sized for a tool call.
+
+    Phase 3 web_fetch: the model may read a release note, a docs page or an issue
+    thread instead of guessing. HTML is stripped to text; binary or oversized pages
+    are cut off rather than ballooning the turn.
+    """
+    import urllib.error
+    import urllib.request
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return "Error: web_fetch needs an http(s) URL."
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "flint/1.0 (research fetch)"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read(WEB_FETCH_LIMIT + 1024)
+    except urllib.error.HTTPError as e:
+        return f"Error: HTTP {e.code} fetching {url}"
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return f"Error: could not fetch {url}: {e}"
+    text = raw.decode("utf-8", "replace")
+    if b"<" in raw[:512]:
+        text = re.sub(r"(?is)<(script|style|svg)[^>]*>.*?</\1>", " ", text)
+        text = re.sub(r"(?is)<[^>]+>", " ", text)
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        text = re.sub(r"\n\s*\n+", "\n\n", text)
+    if len(text) > WEB_FETCH_LIMIT:
+        text = text[:WEB_FETCH_LIMIT] + f"\n… [{len(raw) - WEB_FETCH_LIMIT} more bytes not shown]"
+    return text.strip() or f"(empty page at {url})"
+
+
 TOOLS = {"read_file": read_file, "read_files": read_files, "write_file": write_file,
          "edit_file": edit_file, "list_files": list_files, "search": search, "bash": bash,
-         "study": study}
+         "study": study, "web_fetch": web_fetch}
 
 
 def _schema(name, desc, props, required):
@@ -285,6 +360,9 @@ TOOL_SCHEMAS = [
                      "their page links for source text. Free: no API quota.",
             {"query": {"type": "string", "description": "specific terms, e.g. 'dynamic programming subproblem memo'"},
              "k": {"type": "integer", "description": "number of excerpts (default 5, max 10)"}}, ["query"]),
+    _schema("web_fetch", "Fetch one http(s) URL and return its text (release notes, docs, an issue "
+                         "thread). Size-capped; surfaces HTTP errors instead of guessing.",
+            {"url": {"type": "string", "description": "the http(s) URL to fetch"}}, ["url"]),
 ]
 
 
@@ -352,6 +430,10 @@ class OutOfCredits(Exception):
 
 class StepLimitReached(Exception):
     pass
+
+
+class ExplorationExhausted(Exception):
+    """A turn spent 70% of its round budget without editing; stopped before the full timeout."""
 
 
 # Some providers pass a model's native tool-call markup through as reply text instead of
@@ -614,14 +696,20 @@ class Throttle:
             tmp.replace(self.path)
             return out
 
-    def acquire(self, on_wait=None, paid=False):
+    def acquire(self, on_wait=None, paid=False, local=False):
         """Wait for a slot in the rolling per-minute window.
 
         A paid request is the point of the fallback, so it is not held back by the free
         allowance and does not count against it: the daily-cap block and the swarm's
         request budget both describe free capacity only. It still takes a slot in the
         per-minute window, which keeps a swarm that has switched to paid models spending
-        at the same deliberate pace rather than as fast as the network allows."""
+        at the same deliberate pace rather than as fast as the network allows.
+
+        A local request is none of OpenRouter's business: no RPM window, no daily cap, no
+        swarm budget. Local servers are the user's own machine, so they return at once.
+        """
+        if local:
+            return
         while True:
             def step(d):
                 now = time.time()
@@ -741,6 +829,74 @@ def fetch_key_info(api_key):
 
 
 # ─── agent ───────────────────────────────────────────────────────────────────
+def _bracket_braces(args):
+    """Close unbalanced braces on a streamed tool-arguments fragment.
+
+    Anthropic servers stream tool arguments as partial JSON which is usually complete
+    by content_block_stop, but some terminate on an open brace. Try to close it, then
+    fall back to an escaped null rather than raising on the call dict.
+    """
+    s = args or ""
+    for _ in range(4):
+        try:
+            json.loads(s)
+            return s
+        except ValueError:
+            s += "}"
+    return "null"
+
+
+class _AnthropicUsage:
+    """Adapter from Anthropic's message_delta usage to the shape `_charge` reads.
+
+    The OpenAI stream hands back a pydantic usage object with `.cost` (an OpenRouter
+    extension field) and `.prompt_tokens`. Anthropic's usage has input_tokens /
+    output_tokens and no cost. `.cost` reads 0 so a local or Anthropic-direct request
+    never charges a ledger that only OpenRouter's number is trusted into; the token
+    counts satisfy the context-size warning in turn(). model_extra is the raw dict so
+    any `.cost` the endpoint does report still surfaces.
+    """
+    def __init__(self, usage):
+        self.usage = usage or {}
+        self.prompt_tokens = self.usage.get("input_tokens", 0)
+        self.output_tokens = self.usage.get("output_tokens", 0)
+        self.model_extra = self.usage
+
+    @property
+    def cost(self):
+        c = self.usage.get("cost")
+        return c if isinstance(c, (int, float)) else 0.0
+
+
+def _resolve_provider(model, provider="openrouter"):
+    """Transport facts for a model string, via the provider registry.
+
+    A model may name a backend explicitly (`ollama:qwen2.5-coder:7b` or
+    `anthropic:claude-sonnet-4.5`), or the caller may have picked a provider for the
+    whole ask (the editor's picker). The registry maps a well-known model prefix
+    (`anthropic/…`, `openai/…`) and leaves everything else on the default provider, so
+    `-m anthropic/claude-sonnet-4.5` alone talks to Anthropic without configuration.
+
+    Local providers need no key, and their requests must not consume the OpenRouter
+    free-request counters or RPM window (they are OpenRouter-only accounting), so the
+    result carries `local` for the throttle and wallet to check.
+    """
+    p = _providers
+    if p is None:
+        return {"model": model, "backend": "openrouter", "provider": provider or "openrouter",
+                "base_url": OPENROUTER, "api_type": "openai", "api_key": "",
+                "local": False, "default": True, "custom": False}
+    try:
+        r = p.resolve(model, default=provider or "openrouter")
+        if not r.get("api_key") and not r.get("local"):
+            r["api_key"] = os.environ.get("OPENROUTER_API_KEY", "")
+        return r
+    except Exception:
+        return {"model": model, "backend": provider or "openrouter", "provider": provider or "openrouter",
+                "base_url": OPENROUTER, "api_type": "openai", "api_key": "",
+                "local": False, "default": True, "custom": False}
+
+
 class Agent:
     # An agent spends nothing unless a parent handed it a wallet or a spend ledger, so these are
     # the defaults for every agent, however it was built. `Spend(path="")` is a null ledger: it
@@ -756,18 +912,33 @@ class Agent:
     only_tools = None
     final_edit = False
 
-    def __init__(self, model, yolo=False, headless=False, read_only=False):
-        key = os.environ.get("OPENROUTER_API_KEY")
-        if not key:
-            print("OPENROUTER_API_KEY is not set. Add it to .env beside flint.py "
-                  "or export it in your shell.", file=sys.stderr)
+    def __init__(self, model, yolo=False, headless=False, read_only=False, provider=None):
+        self.provider = provider or os.environ.get("FLINT_PROVIDER", "openrouter")
+        resolved = _resolve_provider(model, self.provider)
+        self.model = resolved["model"]
+        self.backend = resolved["backend"]
+        self.provider = resolved["provider"]
+        self.base_url = resolved["base_url"]
+        self.api_type = resolved["api_type"]
+        self.local = bool(resolved["local"])
+        key = resolved.get("api_key") or os.environ.get("OPENROUTER_API_KEY")
+        if not key and not self.local:
+            print("No API key set. Add OPENROUTER_API_KEY to .env beside flint.py "
+                  "or export it in your shell (local providers need no key).", file=sys.stderr)
             sys.exit(1)
-        self.api_key = key
-        self.client = OpenAI(base_url=OPENROUTER, api_key=key, max_retries=0,
+        # Undo log identity: one per process, so a whole turn is one restorable unit.
+        import uuid as _uuid
+        self.undo_session = os.environ.get("FLINT_UNDO_SESSION") or _uuid.uuid4().hex[:12]
+        self.api_key = "" if self.local else (key or "")
+        # The OpenAI client refuses an empty api_key; local servers (Ollama, LM Studio,
+        # llama.cpp, custom endpoints) accept and ignore any value, so a placeholder
+        # satisfies the constructor without ever being sent as a credential the server
+        # would trust.
+        client_key = self.api_key or "local-unused"
+        self.client = OpenAI(base_url=self.base_url, api_key=client_key, max_retries=0,
                              timeout=float(os.environ.get("FLINT_TIMEOUT", "90")),
                              default_headers={"X-Title": "flint"})
         self.throttle = Throttle()
-        self.model = model
         self.yolo = yolo
         self.headless = headless
         self.read_only = read_only or (headless and not yolo)
@@ -797,7 +968,13 @@ class Agent:
     # ── model call ──
     @property
     def paid(self):
-        """Free model ids end in `:free`; everything else is charged to the account."""
+        """Free model ids end in `:free`; everything else is charged to the account.
+
+        Local providers never charge and therefore are never paid, whatever the model
+        name looks like (an Ollama model "qwen2.5-coder:7b" would otherwise read as
+        paid and get gated on a spend ledger that does not exist for local turns)."""
+        if getattr(self, "local", False):
+            return False
         return not str(self.model).endswith(":free")
 
     def _request_kwargs(self):
@@ -810,12 +987,13 @@ class Agent:
                   stream=True, stream_options={"include_usage": True})
         if getattr(self, "final_answer", False):
             kw["tool_choice"] = "none"
-        if FALLBACKS:
-            kw["extra_body"] = {"models": [self.model] + [m for m in FALLBACKS if m != self.model]}
-        if self.wallet is not None or self.spend.path:
-            # Bill from the provider's own number rather than a local price table. Both
-            # ledgers need it: the editor's wallet and a swarm's daily spend budget.
-            kw.setdefault("extra_body", {})["usage"] = {"include": True}
+        if not getattr(self, "local", False):
+            if FALLBACKS:
+                kw["extra_body"] = {"models": [self.model] + [m for m in FALLBACKS if m != self.model]}
+            if self.wallet is not None or self.spend.path:
+                # Bill from the provider's own number rather than a local price table. Both
+                # ledgers need it: the editor's wallet and a swarm's daily spend budget.
+                kw.setdefault("extra_body", {})["usage"] = {"include": True}
         return kw
 
     def _charge(self, usage):
@@ -845,6 +1023,16 @@ class Agent:
         if usd:
             self.spend.add(usd, self.model)
             self._record_charge(usd)
+        # The lasting receipt ledger (~/.albatross/routes.jsonl by default) gets
+        # one row per request — local rows at $0.00 so the OpenRouter spend number
+        # is never diluted by free or local turns (change request §6).
+        if not getattr(self, "local", False):
+            try:
+                from swarm.receipts import record
+                record({"model": self.model, "backend": getattr(self, "backend", "openrouter"),
+                        "usd": usd, "local": False})
+            except Exception:
+                pass  # a receipt is banked, never fatal
         if self.wallet is not None:
             self.spend_usd = round(self.spend_usd + usd, 6)
             snap = self.wallet.record(usd, self.model)
@@ -871,9 +1059,28 @@ class Agent:
         (console.print if not self.headless else
          (lambda m: print(re.sub(r"\[/?[^\]]*\]", "", m), file=sys.stderr)))(msg)
 
+    def _note_request(self, attempt=1, retry_of=None, error_class=None):
+        """Record one HTTP request attempt to the sidecar, before it is made.
+
+        The daily quota counts attempts, not successes, so a retry that will be eaten by
+        a provider error still needs its row. Writing before the call means a SIGKILL
+        between the write and the response still leaves the count."""
+        if not REQUEST_FILE:
+            return
+        try:
+            with open(REQUEST_FILE, "a") as f:
+                f.write(json.dumps({"t": time.time(), "model": self.model,
+                                    "provider": getattr(self, "backend", "openrouter"),
+                                    "attempt": int(attempt),
+                                    "retry_of": retry_of, "error_class": error_class,
+                                    "paid": bool(self.paid), "local": bool(getattr(self, "local", False))}) + "\n")
+        except OSError:                # a count line must never kill a turn
+            pass
+
     def complete(self):
         # Failed attempts can still count toward the daily quota, so retries are few and deliberate.
         provider_retries = 0
+        transport_attempt = 0
         for attempt in range(8):
             if self.wallet:
                 allowed, why = self.wallet.check()
@@ -881,8 +1088,11 @@ class Agent:
                     raise WalletEmpty(why)
             if self.paid:
                 self.spend.check()
-            self.throttle.acquire(paid=self.paid, on_wait=lambda s: self._note(
+            self.throttle.acquire(paid=self.paid, local=getattr(self, "local", False),
+                                  on_wait=lambda s: self._note(
                 f"[dim]pacing: {RPM_LIMIT}/min budget used, waiting {s:.0f}s[/]"))
+            transport_attempt += 1
+            self._note_request(attempt=transport_attempt)
             try:
                 return self._stream_once()
             except IncompleteResponse as e:
@@ -942,6 +1152,17 @@ class Agent:
         raise ProviderUnavailable("Gave up after repeated errors.")
 
     def _stream_once(self):
+        """One request to whatever backend this agent is pointed at.
+
+        OpenAI-compatible endpoints (OpenRouter, Ollama, LM Studio, MLX, llama.cpp,
+        custom URLs) go through the OpenAI client's streaming chat completions, whose
+        chunk layout the loop below knows well. The Anthropic Messages API is a
+        different wire format, so it gets its own streamer that produces the same
+        (content, reasoning, calls, finish_reason, billed) shape before the shared
+        tail — which then does not care which transport produced the reply.
+        """
+        if getattr(self, "api_type", "openai") == "anthropic":
+            return self._stream_anthropic()
         stream = self.client.chat.completions.create(**self._request_kwargs())
         content, reasoning, calls = "", "", {}
         finish_reason, billed = None, None
@@ -994,6 +1215,191 @@ class Agent:
                 status.stop()
             if live:
                 live.stop()
+        return self._finish_stream(content, reasoning, calls, finish_reason)
+
+    # ── Anthropic Messages API ────────────────────────────────────────────────
+    def _stream_anthropic(self):
+        """Stream one request over /v1/messages (Anthropic native, or a local server
+        that only speaks it). Yields the same tuple as the OpenAI path.
+
+        SSE wire events: `message_start`, `content_block_start`, `content_block_delta`
+        with `text_delta`/`input_json_delta`/`signature_delta`, `content_block_stop`,
+        `message_delta` (carries stop_reason and per-message usage), `message_stop`.
+        Tool use arrives as a block with `{}`-formed JSON arguments streamed in
+        input_json_delta pieces; arguments are closed with literal `{`/`}` when a
+        server forgets them.
+        """
+        base = (self.base_url or "").rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        url = base + "/v1/messages"
+        headers = {"content-type": "application/json", "accept": "text/event-stream"}
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+            headers["anthropic-version"] = "2023-06-01"
+        body = self._anthropic_body()
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(), headers=headers, method="POST")
+        content, reasoning, calls = "", "", {}
+        finish_reason, billed = None, None
+        pending = []          # tool-use blocks being streamed in, by index
+        tool_order = []       # indices in arrival order, for stable ids at the end
+        live = None
+        status = None if self.headless else console.status("[dim]thinking…[/]", spinner="dots")
+        if status:
+            status.start()
+        try:
+            with urllib.request.urlopen(req, timeout=float(os.environ.get("FLINT_TIMEOUT", "90")),
+                                        context=_ssl_context()) as resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        ev = json.loads(data)
+                    except ValueError:
+                        continue
+                    etype = ev.get("type")
+                    if etype == "message_start":
+                        msg = ev.get("message") or {}
+                        usage = msg.get("usage") or {}
+                        tokens = usage.get("input_tokens")
+                        if tokens:
+                            self.last_prompt_tokens = tokens
+                    elif etype == "content_block_start":
+                        idx = ev.get("index", len(pending))
+                        cb = ev.get("content_block") or {}
+                        if cb.get("type") == "tool_use":
+                            pending.append({"id": cb.get("id", ""), "name": cb.get("name", ""),
+                                            "args": "", "json_started": False})
+                            tool_order.append(idx)
+                        elif cb.get("type") == "thinking" and status:
+                            status.update("[dim]thinking…[/]")
+                    elif etype == "content_block_delta":
+                        d = ev.get("delta") or {}
+                        if d.get("type") == "text_delta":
+                            content += d.get("text", "")
+                            if not self.headless:
+                                if live is None:
+                                    if status:
+                                        status.stop()
+                                    live = Live(Markdown(content), console=console,
+                                                refresh_per_second=12, vertical_overflow="visible")
+                                    live.start()
+                                live.update(Markdown(content))
+                        elif d.get("type") == "thinking_delta":
+                            reasoning += d.get("thinking", "")
+                            if status:
+                                status.update(f"[dim]thinking… ({len(reasoning) // 4} tokens)[/]")
+                        elif d.get("type") == "input_json_delta":
+                            idx = ev.get("index")
+                            slot = pending[idx] if idx is not None and idx < len(pending) else None
+                            if slot is not None:
+                                piece = d.get("partial_json", "")
+                                if piece and not slot["json_started"] and not piece.lstrip().startswith("{"):
+                                    slot["args"] += "{"
+                                    slot["json_started"] = True
+                                slot["args"] += piece
+                    elif etype == "content_block_stop":
+                        idx = ev.get("index")
+                        if idx is not None and idx < len(pending):
+                            slot = pending[idx]
+                            if not slot["json_started"] and slot["args"].strip() == "":
+                                slot["args"] = "{}"
+                            elif slot["args"] and not slot["args"].rstrip().endswith("}"):
+                                slot["args"] += "}"
+                    elif etype == "message_delta":
+                        d = ev.get("delta") or {}
+                        sr = d.get("stop_reason")
+                        if sr:
+                            finish_reason = {"end_turn": "stop", "tool_use": "tool_calls",
+                                             "max_tokens": "length"}.get(sr, sr)
+                        usage = ev.get("usage") or {}
+                        if usage.get("output_tokens"):
+                            billed = _AnthropicUsage(usage)
+                    elif etype == "error" or etype == "stream_error":
+                        err = ev.get("error") or {}
+                        raise APIError(
+                            f"{err.get('type', 'error')}: {err.get('message', '')}",
+                            body={"error": {"message": err.get("message", ""),
+                                            "code": 500 if etype == "stream_error" else None}},
+                            response=resp, request=req)
+        finally:
+            if status:
+                status.stop()
+            if live:
+                live.stop()
+        # Tool blocks arrive in event order but carry server indices; rebuild the calls
+        # dict in arrival order so ids stay stable for the tool loop in turn().
+        for i, idx in enumerate(tool_order):
+            slot = pending[idx] if idx < len(pending) else None
+            if slot is None:
+                continue
+            args = slot["args"] or "{}"
+            try:
+                json.loads(args)
+            except ValueError:
+                args = _bracket_braces(args)
+            calls[i] = {"id": slot["id"] or f"call_{len(self.messages)}_{i}",
+                        "name": slot["name"], "args": args}
+        self._charge(billed)
+        return self._finish_stream(content, reasoning, calls, finish_reason)
+
+    def _anthropic_body(self):
+        """The /v1/messages request body built from the same messages list and tool
+        schemas the OpenAI path uses, so an agent's history is transport-agnostic."""
+        system = "\n\n".join(m["content"] for m in self.messages if m["role"] == "system")
+        msgs = [m for m in self.messages if m["role"] != "system"]
+        out = []
+        for m in msgs:
+            if m["role"] == "user":
+                out.append({"role": "user", "content": str(m.get("content") or "")})
+            elif m["role"] == "assistant":
+                blocks = []
+                if m.get("content"):
+                    blocks.append({"type": "text", "text": str(m["content"])})
+                for c in m.get("tool_calls") or []:
+                    fn = c.get("function") or {}
+                    blocks.append({"type": "tool_use", "id": c.get("id") or "",
+                                   "name": fn.get("name", ""),
+                                   "input": json.loads(fn.get("arguments") or "{}")})
+                if not blocks:                     # a bare tool-only assistant turn
+                    continue
+                out.append({"role": "assistant", "content": blocks})
+            elif m["role"] == "tool":
+                # Anthropic pairs tool results with the assistant's tool_use block,
+                # matched by tool_call_id.
+                out.append({"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": m.get("tool_call_id") or "",
+                    "content": str(m.get("content") or "")}]})
+        body = {"model": self.model, "max_tokens": 64_000, "stream": True,
+                "messages": out, "tools": self._anthropic_tools()}
+        if system:
+            body["system"] = system
+        if getattr(self, "final_answer", False):
+            body["tool_choice"] = {"type": "none"}
+        return body
+
+    def _anthropic_tools(self):
+        """Tool schemas in Anthropic's shape: a `description` is required and
+        `additionalProperties` must be absent (Anthropic rejects it)."""
+        tools = []
+        for t in self._request_kwargs()["tools"]:
+            f = t["function"]
+            params = dict(f.get("parameters") or {})
+            params.pop("additionalProperties", None)
+            tools.append({"name": f["name"],
+                          "description": f.get("description", "")[:3000],
+                          "input_schema": params})
+        return tools
+
+    def _finish_stream(self, content, reasoning, calls, finish_reason):
+        """The tail shared by every transport: recover text-form tool calls, validate
+        the finish, and return the (content, calls) the turn loop expects."""
         self.last_reasoning = reasoning
         if not calls and content:
             recovered, rest = recover_text_calls(content, self._request_kwargs()["tools"])
@@ -1054,6 +1460,49 @@ class Agent:
         s = str(args.get(key, "")).replace("\n", " ")
         return s if len(s) < 80 else s[:77] + "…"
 
+    def _snapshot_for_undo(self, name, args):
+        """Record the before-state of every file a mutating tool is about to touch.
+
+        A write_file or edit_file changes one known path; a bash command can change
+        anything, so the known paths are snapshotted defensively (the model names the
+        files it means in the command). Snapshotting only when the file exists keeps
+        newly-created files out of the ledger — nothing to restore for them.
+        """
+        if getattr(self, "read_only", False) or not getattr(self, "undo_session", None):
+            return
+        try:
+            from swarm.undo import snapshot
+            paths = []
+            if name in ("write_file", "edit_file") and args.get("path"):
+                paths = [args["path"]]
+            elif name == "bash" and args.get("command"):
+                # Likely file names in a shell command: `pytest tests/test_x.py`,
+                # `git add src/foo.py`, `head -5 pyproject.toml`. Best effort only.
+                import re as _re
+                for tok in _re.findall(r"[\w./-]+\.(?:py|js|ts|go|rs|c|h|json|toml|md|txt|sh|css|html)[\w./-]*",
+                                       args["command"]):
+                    if tok.startswith(("./", "../")) or "/" in tok:
+                        paths.append(tok)
+            for p in dict.fromkeys(paths):
+                snapshot(self.undo_session, p, command=name)
+        except Exception:
+            pass  # undo is opportunistic; a turn must never fail because of it
+
+    def _run_hooks(self, name, args, out):
+        """Run PostToolUse hooks after a tool call (agent.config.json `hooks:` block).
+
+        The hook gets the tool name, its arguments and a truncated result on stdin.
+        A hook that fails or times out is swallowed — the tool result is already
+        produced and must not be lost to a slow external command.
+        """
+        try:
+            from swarm.hooks import run_hooks
+            payload = {"tool": name, "arguments": args,
+                       "result": str(out)[:2000], "model": getattr(self, "model", "")}
+            run_hooks(["PostToolUse"], os.getcwd(), payload)
+        except Exception:
+            pass  # a hook is a side effect, never a failure of the turn
+
     def run_tool(self, call):
         name = call["function"]["name"]
         try:
@@ -1079,6 +1528,7 @@ class Agent:
                 if not self.headless:
                     console.print("  [red]└─ denied[/]")
                 return reason
+        self._snapshot_for_undo(name, args)
         try:
             out = fn(**args)
         except TypeError as e:
@@ -1088,6 +1538,7 @@ class Agent:
 
         if name in ("write_file", "edit_file") and out.startswith(("Created", "Overwrote", "Edited")):
             self.edits += 1
+        self._run_hooks(name, args, out)
         if not self.headless:
             lines = out.splitlines() or [""]
             shown = "\n     ".join(l[:160] for l in lines[:4])
@@ -1106,6 +1557,15 @@ class Agent:
     NO_EDIT_YET = ("Three rounds left and no file has changed. Stop reading. Make the edit now "
                    "with edit_file or write_file, then run the single test module that covers it.")
 
+    EXPLORE_LIMIT_MSG = ("You have spent most of this turn's rounds reading and still have not "
+                         "edited a file. Budget is a real constraint: stop exploring now and "
+                         "implement the smallest verified slice with edit_file or write_file, "
+                         "run the narrowest test that covers it, and give your final answer.")
+
+    EDIT_ONLY_MSG = ("Most of this turn's budget is gone. Only edit_file and write_file are "
+                     "available from here on; run the narrowest test that covers your change "
+                     "and finish. No more reading or searching.")
+
     def _assistant_msg(self, content, calls):
         """The assistant message for a reply, with stable ids for the calls it made."""
         msg = {"role": "assistant", "content": content or ""}
@@ -1119,6 +1579,13 @@ class Agent:
     def turn(self, user_text):
         self.messages.append({"role": "user", "content": user_text})
         self.edits, content = 0, ""
+        # Work order §2 70% rule: a turn that has not edited by 70% of its round budget is
+        # stopped early as exploration_exhausted. It only means something for turns long
+        # enough to have a real exploration phase (implementer/repair budgets, 10+ rounds);
+        # a 1-8 round turn that stops at 70% would leave almost nothing to show.
+        explore_floor = max(1, int(MAX_STEPS * 0.7)) if MAX_STEPS >= 10 else None
+        explore_nudged = False
+        edit_only = False
         for step in range(MAX_STEPS):
             if self.headless:
                 print(f"round {step + 1}/{MAX_STEPS}: requesting {self.model}", file=sys.stderr, flush=True)
@@ -1137,8 +1604,27 @@ class Agent:
                     result += f"\n\n[round {step + 1} of {MAX_STEPS}; {left} left]"
                 self.messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
                 self.save_checkpoint()
-            if self.headless and left == 3 and not self.edits:
-                self.messages.append({"role": "user", "content": self.NO_EDIT_YET})
+            if self.headless and not self.edits:
+                if left == 3:
+                    self.messages.append({"role": "user", "content": self.NO_EDIT_YET})
+                elif explore_floor is not None:
+                    # Work order §2 (long budgets only): at 60% of the role budget stop
+                    # exploring and implement the smallest slice; at 80% drop read/search
+                    # tools so only edit tools remain; a turn with no edit by 70% is stopped
+                    # early as exploration_exhausted.
+                    if not explore_nudged and left <= max(1, int(MAX_STEPS * 0.4)):
+                        explore_nudged = True
+                        self.messages.append({"role": "user", "content": self.EXPLORE_LIMIT_MSG})
+                    if not edit_only and left <= max(1, int(MAX_STEPS * 0.2)):
+                        edit_only = True
+                        self.only_tools = set(self.EDIT_TOOLS)
+                        self.messages.append({"role": "user", "content": self.EDIT_ONLY_MSG})
+                    if step + 1 >= explore_floor:
+                        # Keep whatever the model already wrote; the turn is over because
+                        # reading exhausted it, not because it failed.
+                        raise ExplorationExhausted(
+                            f"Stopped after {step + 1} rounds with no edit; the turn spent 70% of its "
+                            "budget exploring. Leave partial work to the normal gates.")
         else:
             content = self._final_answer()
         if self.last_prompt_tokens > CONTEXT_WARN_TOKENS:
@@ -1377,7 +1863,9 @@ def main():
     ap.add_argument("--prompt-file", metavar="PATH",
                     help="read that task from a file instead. A swarm prompt is 10-25 KB, and in "
                          "argv it lands in `ps` and in every exception's message.")
-    ap.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"model slug (default {DEFAULT_MODEL})")
+    ap.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"model slug (default {DEFAULT_MODEL}); a `backend:` prefix or a known vendor slug (`anthropic/claude-…`) picks the provider")
+    ap.add_argument("--provider", default=None,
+                    help="provider backend (openrouter, ollama, lm-studio, mlx, llamacpp, openai, anthropic); env FLINT_PROVIDER, default openrouter")
     ap.add_argument("--yolo", action="store_true", help="auto-approve edits and shell commands")
     ap.add_argument("--read-only", action="store_true", help="allow only file reading, listing and searching")
     ap.add_argument("--nonstop", action="store_true", help="unattended work cycles; enables edits and shell commands")
@@ -1385,6 +1873,8 @@ def main():
     ap.add_argument("--test-command", help="shell verification command to run after each nonstop work cycle")
     ap.add_argument("--checkpoint", help=argparse.SUPPRESS)
     ap.add_argument("-C", "--cwd", help="project directory to work in")
+    ap.add_argument("--continue", dest="resume", action="store_true",
+                    help="resume the most recent nonstop run in ~/.flint/nonstop: same goal, same model, another N hours")
     ap.add_argument("--reset-cap", action="store_true",
                     help="clear a remembered daily-cap block (e.g. after buying credits)")
     a = ap.parse_args()
@@ -1392,6 +1882,23 @@ def main():
         os.chdir(Path(a.cwd).expanduser())
     if a.reset_cap:
         Throttle().clear_block()
+    if a.resume:
+        # `flint --continue`: pick up the most recent nonstop session's goal and model
+        # and run it for `--hours` more (default 4). The handoff artifacts are designed
+        # for exactly this — the next cycle reads the previous one's evidence.
+        ns_root = STATE_DIR / "nonstop"
+        sessions = sorted(ns_root.glob("*/status.json"),
+                          key=lambda p: p.stat().st_mtime, reverse=True) if ns_root.is_dir() else []
+        if not sessions:
+            ap.error("--continue: no previous nonstop run in " + str(ns_root))
+        state = json.loads(sessions[0].read_text())
+        goal = state.get("goal") or ""
+        model = state.get("model") or a.model
+        hours = a.hours or state.get("hours") or 8
+        if not goal:
+            ap.error("--continue: the previous run has no goal recorded")
+        print(f"flint: resuming the run from {sessions[0].parent.name}", file=sys.stderr)
+        sys.exit(run_unattended(goal, model, hours, None))
 
     if a.prompt_file:
         if a.prompt is not None:
@@ -1416,7 +1923,7 @@ def main():
         ap.error("--hours and --test-command require --nonstop or a 'run this nonstop' prompt")
 
     if a.prompt is not None:
-        agent = Agent(a.model, yolo=a.yolo, headless=True, read_only=a.read_only)
+        agent = Agent(a.model, yolo=a.yolo, headless=True, read_only=a.read_only, provider=a.provider)
         agent.checkpoint_path = a.checkpoint
         if agent.read_only:
             print("flint: read-only mode; use --yolo to allow edits and shell commands.", file=sys.stderr)
@@ -1428,6 +1935,9 @@ def main():
         except StepLimitReached as e:
             print(f"flint: {e}", file=sys.stderr)
             sys.exit(5)
+        except ExplorationExhausted as e:
+            print(f"flint: {e}", file=sys.stderr)
+            sys.exit(11)
         except BudgetPaused as e:
             print(f"flint: budget paused: {e}", file=sys.stderr)
             sys.exit(6)
@@ -1464,7 +1974,7 @@ def main():
                       f"${agent.wallet.spent():.4f} of ${agent.wallet.cap:.2f} allowance",
                       file=sys.stderr)
     else:
-        repl(Agent(a.model, yolo=a.yolo, read_only=a.read_only))
+        repl(Agent(a.model, yolo=a.yolo, read_only=a.read_only, provider=a.provider))
 
 
 if __name__ == "__main__":

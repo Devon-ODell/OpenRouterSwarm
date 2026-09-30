@@ -272,6 +272,69 @@ class LenientParsingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             workflow.parse_review("APPROVE: looks fine", self.TREE, self.ACC)
 
+    def test_approval_cannot_call_a_missing_acceptance_criterion_minor(self):
+        bad = self.body(findings=[{
+            "severity": "minor", "path": "a.py", "line": 3,
+            "issue": "Acceptance criterion C1 is not covered by a test",
+            "verification": "Add a regression test",
+        }])
+        with self.assertRaisesRegex(ValueError, "contradicts"):
+            workflow.parse_review(json.dumps(bad), self.TREE, self.ACC)
+
+    def test_a_mis_closed_tail_is_salvaged_rather_than_discarded(self):
+        """The 2026-09-27 failure: "acceptance": [...] closed with } instead of ].
+
+        The reviewer had delivered a real verdict, a check and a finding, and all of it was
+        thrown away with the candidate it was about — whose full suite had just passed."""
+        good = self.body(verdict="request_changes", summary="pause reasons are independent",
+                         checks=[{"criterion": "C1", "passed": False, "evidence": "arcade.js:250"}],
+                         findings=[{"severity": "blocker", "path": "site/arcade.js", "line": 250,
+                                    "issue": "two independent pause flags",
+                                    "verification": "open Report then Rules"}])
+        text = json.dumps(good)[:-1] + ', "acceptance": ["a", "b"}]}]'
+        with self.assertRaises(ValueError):
+            json.loads(text)
+        review = workflow.parse_review(text, self.TREE, self.ACC)
+        self.assertEqual(review["verdict"], "request_changes")
+        self.assertTrue(review["salvaged"])
+        self.assertEqual(review["summary"], "pause reasons are independent")
+        self.assertEqual(review["findings"][0]["severity"], "blocker")
+        self.assertFalse(review["checks"][0]["passed"])
+
+    def test_a_reply_cut_off_mid_value_is_salvaged(self):
+        whole = self.body(verdict="request_changes", summary="stops here",
+                          checks=[{"criterion": "C1", "passed": False, "evidence": "e"}],
+                          findings=[{"severity": "minor", "path": "a.py", "line": 1,
+                                     "issue": "i", "verification": "v"}])
+        text = json.dumps(whole)[:-1] + ', "lesson": "the reply was cut off ri'
+        review = workflow.parse_review(text, self.TREE, self.ACC)
+        self.assertEqual(review["verdict"], "request_changes")
+        self.assertTrue(review["salvaged"])
+        self.assertNotIn("lesson", review)
+
+    def test_a_salvaged_reply_may_not_approve(self):
+        """Salvage drops the tail, and the dropped tail could have held the blocker."""
+        # Cut mid-string, so no decoder can read it and only salvage recovers the approval.
+        text = json.dumps(self.body())[:-1] + ', "lesson": "the reply stopped ri'
+        with self.assertRaises(ValueError):
+            json.loads(text)
+        with self.assertRaisesRegex(ValueError, "may not carry an approval"):
+            workflow.parse_review(text, self.TREE, self.ACC)
+
+    def test_salvage_neither_invents_a_verdict_nor_relaxes_the_other_checks(self):
+        with self.assertRaises(ValueError):
+            workflow.parse_review('{"summary": "no verdict here", "checks": [}]', self.TREE, self.ACC)
+        with self.assertRaises(ValueError):
+            workflow.parse_review("not json at all {{{", self.TREE, self.ACC)
+        text = json.dumps(self.body(verdict="request_changes", checks=[]))[:-1] + ', "x": [}]'
+        with self.assertRaisesRegex(ValueError, "every acceptance criterion"):
+            workflow.parse_review(text, self.TREE, self.ACC)
+
+    def test_an_intact_review_is_not_marked_salvaged(self):
+        review = workflow.parse_review(json.dumps(self.body()), self.TREE, self.ACC)
+        self.assertEqual(review["verdict"], "approve")
+        self.assertNotIn("salvaged", review)
+
     def test_json_array_survives_brackets_in_prose(self):
         self.assertEqual(learn.json_array('See [docs](x).\n```json\n[{"title": "a"}]\n```\n[done]'), [{"title": "a"}])
         self.assertEqual(learn.json_array("Nothing to split: []"), [])

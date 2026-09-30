@@ -2,12 +2,27 @@
 
 Point the flint swarm at the code you are working on without leaving the editor.
 
+In the Queue tab, use **×** to dismiss one split/parked task or **Clear all abandoned**
+to dismiss the whole collection, including rows beyond the first 20 displayed.
+Logs and patches are preserved; active tasks and accepted work are untouched.
+Dismissal does not satisfy dependencies. Restore a dismissed task with
+`python swarm/bridge.py queue-requeue --repo /path/to/repo --id TASK_ID`.
+After updating the extension, run **Developer: Reload Window** to load the controls.
+
 - **Ask the swarm** (`Ctrl+Alt+A`, or right-click → *Ask the Swarm About This Code*). Several
   free OpenRouter models answer in parallel as read-only agents. Each can open the surrounding
   files and search the MIT OpenCourseWare notes. One more model then checks their claims
   against your code and writes a merged answer, credited per model. With nothing selected, the
   function or class under the cursor is used. 👍/👎 on an answer makes that model more or less
   likely to be picked next time.
+
+  **Picking a provider/model.** Ask now opens with a provider dropdown: the local servers
+  (Ollama, LM Studio, MLX, llama.cpp, or any custom OpenAI-compatible URL) come first, then
+  OpenRouter. A local choice lists the models that server actually has pulled (fetched from
+  its `/v1/models`), so you can answer a question entirely from your own machine with no
+  OpenRouter key and no request budget consumed. Custom endpoints are remembered in
+  `~/.flint/providers.json` and reappear next session; the panel header shows which backend
+  the next ask will use.
 - **Queue a swarm task** for the selection. The task carries the file, the lines and your
   acceptance criterion; the swarm implements it on `swarm/trunk`, tests it, has another model
   review it, and lands it only if everything passes.
@@ -70,6 +85,36 @@ the checkout it was installed from. To use another checkout, set **Flint Swarm: 
 | `flintSwarm.paidFallback` | auto | `off`, `auto` (only when no free model answered) or `always` |
 | `flintSwarm.flintPath` | install folder | the flint checkout |
 | `flintSwarm.python` | `.venv/bin/python` | interpreter for the bridge |
+
+## The OpenRouter API key
+
+On a fresh Cursor start, if no key is configured and the last-chosen backend is the cloud
+one, the extension asks for your OpenRouter key once (`sk-or-…`) and stores it in the flint
+checkout's `.env` (mode 0600) via `bridge.py set-key`. You can also set it any time with the
+**Flint Swarm: Set the OpenRouter API Key…** command or the 🔑 button in the sidebar header.
+Local-only setups (Ollama, LM Studio, …) never need a key, so the prompt stays silent for
+them. The palette command re-prompts on demand even after a fresh-start skip.
+
+## Phase 2/3 additions (cost, doctor, routing, undo, extensions)
+
+The bridge gained Phase 2/3 subcommands:
+
+- `bridge.py receipts [--hours N] [--days N]` — the lasting cost ledger
+  (`~/.albatross/routes.jsonl`, same file the real albatross harness writes; flint records
+  every charged request there and reads albatross's own rows too).
+- `bridge.py doctor` — hardware-aware local-model recommendation for this machine
+  (albatross `/doctor` parity).
+- `bridge.py route [--select] [--task ...]` — scores the configured model pool by cost and
+  policy and says which model to use.
+- `bridge.py undo [--list] [--session ID] [--dry-run]` — restores the file states a flint
+  turn snapshot before editing (guards against clobbering edits you made since).
+- `bridge.py extension [--list] [--trust NAME] [--run --event E]` — the trust-first
+  extensions runtime under `~/.flint/extensions/`.
+- `flint --continue` (and `bridge.py continue`) — resumes the most recent nonstop run's
+  goal for more hours.
+- `flint.py` gained a `web_fetch` tool and PostToolUse hooks from `agent.config.json`
+  (`hooks.PostToolUse[].hooks[].command`, run with the event as `$1` and a JSON payload on
+  stdin, 10s cap).
 
 ## Cost and speed
 

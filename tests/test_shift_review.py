@@ -220,7 +220,7 @@ class ReviewFormatTests(Base):
         with patch.object(swarmd, "flint", side_effect=self.implementation(prose)):
             ok, note = w.do_task(self.task(), "goal")
         self.assertFalse(ok)
-        self.assertEqual(w.stage, "review_error")
+        self.assertEqual(w.stage, "review_format_error")
         self.assertEqual(prose, [])          # all three reviewers were asked
 
     def test_the_repair_budget_is_untouched_by_a_reviewer_that_cannot_answer(self):

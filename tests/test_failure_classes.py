@@ -44,6 +44,16 @@ class HarnessReleaseTests(unittest.TestCase):
         out = self.fail(task)
         self.assertAlmostEqual(out["not_before"] - swarmd.time.time(), 120, delta=5)
 
+    def test_an_expensive_harness_failure_backs_off_and_records_the_model(self):
+        task = self.q.add("Shard Stack M1")
+        self.q.claim()
+        out = self.q.release(task["id"], False, "agent timeout after 900s",
+                             failure_class="harness", requests=16,
+                             failed_model="dots:free", failed_role="implementer")
+        self.assertAlmostEqual(out["not_before"] - swarmd.time.time(), 1800, delta=5)
+        self.assertEqual(out["requests_spent"], 16)
+        self.assertEqual(out["failed_models"][0]["model"], "dots:free")
+
     def test_three_of_them_park_it_for_a_person(self):
         task = self.q.add("Shard Stack M1")
         for i in range(2):
@@ -181,6 +191,71 @@ class EditCallCountTests(unittest.TestCase):
         progress = "tool: read_file\ntool: edit_file\ntool: write_file\ntool: edit_file\n"
         import re
         self.assertEqual(len(re.findall(r"^tool: (?:edit_file|write_file)$", progress, re.M)), 3)
+
+    def test_request_counts_are_attempt_scoped_and_update_the_run(self):
+        swarmd._run.clear()
+        swarmd.count_requests("w9", reset=True)
+        self.assertEqual(swarmd.count_requests("w9", 7), 7)
+        self.assertEqual(swarmd._run["requests_started"], 7)
+        self.assertEqual(swarmd.count_requests("w9", reset=True), 7)
+        self.assertEqual(swarmd.count_requests("w9"), 0)
+
+
+class RequestBudgetTests(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.root = Path(d.name)
+        (self.root / "state").mkdir()
+        (self.root / "logs").mkdir()
+        for attr, value in (("STATE", self.root / "state"), ("LOGS", self.root / "logs")):
+            p = patch.object(swarmd, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        swarmd._run.clear()
+        swarmd.count_requests("w0", reset=True)
+
+    def worker(self, **extra):
+        cfg = {"repo": str(self.root), "base_branch": "main", "test_cmd": "true",
+               "models": ["a:free"], "steps": {"implementer": 10, "adversary": 2}, **extra}
+        worker = swarmd.Worker(0, cfg, swarmd.Queue(), Mock(), threading.Event())
+        worker.name = "w0"
+        worker.task = {"id": "task"}
+        worker.evidence = None
+        return worker
+
+    def test_remaining_task_budget_clamps_the_role_rounds(self):
+        worker = self.worker(task_request_cap=5)
+        swarmd.count_requests("w0", 4)
+        seen = []
+
+        def fake(_prompt, _cwd, _cfg, _role, _worker, _budget, steps, _model):
+            seen.append(steps)
+            return "done"
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            worker.call("implementer", "prompt", self.root, 10, "a:free")
+        self.assertEqual(seen, [1])
+
+    def test_spent_task_budget_stops_before_calling_a_model(self):
+        worker = self.worker(task_request_cap=5)
+        swarmd.count_requests("w0", 5)
+        with patch.object(swarmd, "flint") as model, self.assertRaises(swarmd.RequestBudget):
+            worker.call("implementer", "prompt", self.root, 10, "a:free")
+        model.assert_not_called()
+
+    def test_task_budget_includes_requests_spent_on_prior_attempts(self):
+        worker = self.worker(task_request_cap=5)
+        worker.task["requests_spent"] = 4
+        seen = []
+
+        def fake(_prompt, _cwd, _cfg, _role, _worker, _budget, steps, _model):
+            seen.append(steps)
+            return "done"
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            worker.call("implementer", "prompt", self.root, 10, "a:free")
+        self.assertEqual(seen, [1])
 
 
 class EmptySplitTests(unittest.TestCase):

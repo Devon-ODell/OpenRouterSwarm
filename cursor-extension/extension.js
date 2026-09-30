@@ -162,16 +162,120 @@ function where(ctx) {
 
 // ---------------------------------------------------------------- actions
 
+/** The provider the user last picked for asks, remembered per workspace. */
+function provState() { return vscode.workspace.getConfiguration('flintSwarm').get('providerState') || {}; }
+
+/** Persist the provider/model pick across restarts, so a local setup does not need re-picking. */
+function saveProvState(backend, model) {
+  const c = cfg();
+  const prev = provState();
+  return c.update('providerState', { ...prev, backend, model }, vscode.ConfigurationTarget.Global);
+}
+
+/** The last chosen backend, or 'openrouter' when nothing was picked. */
+function chosenBackend() { return (provState().backend || 'openrouter'); }
+
+/** All backends the picker offers, locals first, all sourced from the bridge registry. */
+function providerChoices() {
+  return [
+    { id: 'openrouter', label: '$(cloud) OpenRouter (free models)', detail: 'the swarm\'s normal cloud models', local: false },
+    { id: 'ollama', label: '$(server) Ollama', detail: 'local · http://localhost:11434', local: true },
+    { id: 'lm-studio', label: '$(server) LM Studio', detail: 'local · http://localhost:1234', local: true },
+    { id: 'mlx', label: '$(server) MLX', detail: 'local · http://localhost:8080 (Apple Silicon)', local: true },
+    { id: 'llamacpp', label: '$(server) llama.cpp', detail: 'local · http://localhost:8080', local: true },
+    { id: '__custom__', label: '$(edit) Custom endpoint…', detail: 'any OpenAI-compatible URL (e.g. LM Studio on a remote box)', local: true },
+  ];
+}
+
+/** Pick a backend, then (for locals) fetch its /models list and pick a model. Never raises. */
+async function pickProviderModel() {
+  const current = chosenBackend();
+  let backend = await vscode.window.showQuickPick(providerChoices().map((p) => ({
+    ...p, description: p.id === current ? '$(check) selected' : '', sortText: p.local ? '0' : '1',
+  })), {
+    placeHolder: 'Which backend should answer?',
+    title: 'Flint Swarm · choose a provider',
+  });
+  if (!backend) return null;
+  if (backend.id === '__custom__') {
+    const url = await vscode.window.showInputBox({
+      prompt: 'Custom OpenAI-compatible endpoint http(s)://host:port',
+      placeHolder: 'http://localhost:1234/v1',
+      validateInput: (v) => (v && /^https?:\/\//.test(v)) ? null : 'needs to start with http:// or https://',
+    });
+    if (!url) return null;
+    backend = { id: 'custom:' + url, label: url, local: true, baseUrl: url };
+  }
+  let baseUrl = backend.baseUrl;
+  if (backend.local && !baseUrl) {
+    // Probe this provider's /models — the bridge lists them without needing ollama etc.
+    try {
+      const info = await bridgeJson(['local-models']);
+      const prov = (info.providers || []).find((p) => p.id === backend.id);
+      if (prov && prov.running) {
+        baseUrl = prov.baseUrl;
+      } else {
+        const pick = await vscode.window.showQuickPick(
+          [{ label: 'Retry', description: prov ? prov.label : '' }, { label: 'Back' }],
+          { placeHolder: `${prov ? prov.label : backend.label} is not running. Make sure the server is up, then retry.` });
+        if (!pick || pick.label !== 'Retry') return null;
+        return pickProviderModel();
+      }
+    } catch (e) {
+      vscode.window.showWarningMessage(`Could not reach ${backend.label}: ${e.message}`);
+      return null;
+    }
+  }
+  return { backend: backend.id, label: backend.label, local: backend.local, baseUrl };
+}
+
+/** For a chosen local backend, fetch its model list from the bridge and pick one. */
+async function pickLocalModel(backend) {
+  let list;
+  try {
+    const info = await bridgeJson(['local-models']);
+    const prov = (info.providers || []).find((p) => p.id === backend.backend);
+    list = prov ? prov.models : [];
+  } catch (e) { list = []; }
+  if (!list.length) {
+    vscode.window.showWarningMessage(`${backend.label}: no models reported. Is the server running?`);
+    return null;
+  }
+  const chosen = await vscode.window.showQuickPick(list.map((m) => ({
+    label: m.name || m.id, description: m.context ? `${m.context.toLocaleString()} ctx` : '',
+  })), { placeHolder: `${backend.label}: which model?` });
+  return chosen ? list.find((m) => (m.name || m.id) === chosen.label) : null;
+}
+
 async function ask(question, ctx) {
   const repo = (ctx && ctx.repo) || repoFor(currentEditor() && currentEditor().document.uri);
   if (!repo) { vscode.window.showWarningMessage('Open a folder or file first; the swarm answers about a repository.'); return; }
+  // The provider/model picker is the Phase 1 headline: a backend dropdown (local servers
+  // first), then — for a local backend — the server's own model list from /models, then a
+  // custom endpoint prompt. The pick is persisted so a local setup stays put between sessions.
+  const prov = await pickProviderModel();
+  if (!prov) return;
+  let model = null;
+  if (prov.local) {
+    const picked = await pickLocalModel(prov);
+    if (!picked) return;
+    model = picked.id || picked.name;
+  } else {
+    model = (provState().model || null);   // the last cloud model asked with, if any
+  }
+  await saveProvState(prov.backend, model);
   const id = crypto.randomBytes(6).toString('hex');
-  panel.post({ type: 'askStart', id, question, where: where(ctx), repo });
+  panel.post({ type: 'askStart', id, question, where: where(ctx), repo, provider: prov.label });
   await panel.reveal();
   const c = cfg();
   const args = ['ask', '--repo', repo, '--question', question, '--models', String(c.get('models')),
     '--steps', String(c.get('stepsPerModel')), '--timeout', String(c.get('timeoutSeconds') || 300),
     '--paid', String(c.get('paidFallback') || 'auto')];
+  const backendId = prov.backend.startsWith('custom:') ? null : prov.backend;
+  const baseUrl = prov.local && (prov.backend.startsWith('custom:')) ? prov.backend.slice(7) : null;
+  if (backendId && backendId !== 'openrouter') args.push('--provider', backendId);
+  if (baseUrl) args.push('--base-url', baseUrl);
+  if (model) args.push('--model', model);
   if (!c.get('synthesize')) args.push('--no-synthesis');
   if (!c.get('useStudy')) args.push('--no-study');
   const go = (selectionFile) => vscode.window.withProgress(
@@ -597,6 +701,50 @@ async function restartGrind(repo) {
   }
 }
 
+// One read-only board tab per repository; never changes task or daemon state.
+const boards = new Map();
+async function showBoard(completedOnly = false) {
+  const repo = repoFor(currentEditor() && currentEditor().document.uri);
+  const root = flintRoot();
+  if (!repo || !root) return;
+  if (boards.has(repo)) {
+    const current = boards.get(repo);
+    current.completedOnly = completedOnly;
+    current.view.reveal();
+    await current.refresh();
+    return;
+  }
+  const view = vscode.window.createWebviewPanel('flintSwarm.board', 'Swarm scrum board',
+    vscode.ViewColumn.One, { enableScripts: true, localResourceRoots: [] });
+  const state = { view, completedOnly, busy: false, closed: false };
+  state.refresh = async () => {
+    if (state.busy || state.closed) return;
+    state.busy = true;
+    try {
+      const data = await new Promise((resolve, reject) => {
+        cp.execFile(pythonFor(root), [path.join(root, 'swarm', 'board.py'), '--repo', repo],
+          { timeout: 60000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => {
+            if (error) return reject(error);
+            try { resolve(JSON.parse(stdout)); } catch (e) { reject(e); }
+          });
+      });
+      if (!state.closed) {
+        view.title = state.completedOnly ? 'Verified completed' : 'Swarm scrum board';
+        view.webview.html = require('./board-view').html(data, state.completedOnly);
+      }
+    } catch (e) {
+      if (!state.closed) vscode.window.showErrorMessage(`Swarm board could not refresh: ${e.message}. Any displayed snapshot is stale.`);
+    } finally { state.busy = false; }
+  };
+  boards.set(repo, state);
+  view.onDidDispose(() => { state.closed = true; boards.delete(repo); });
+  view.webview.onDidReceiveMessage(async (m) => {
+    if (m.type === 'toggle') state.completedOnly = !state.completedOnly;
+    if (m.type === 'refresh' || m.type === 'toggle') await state.refresh();
+  });
+  await state.refresh();
+}
+
 async function showLanded(repo) {
   repo = repo || repoFor(currentEditor() && currentEditor().document.uri);
   if (!repo) return;
@@ -637,6 +785,19 @@ async function queueRequeue(m) {
     const res = await bridgeJson(['queue-requeue', '--repo', m.repo, '--id', m.id]);
     if (res.ok === false) vscode.window.showErrorMessage(`Flint swarm: ${res.error}`);
     else vscode.window.showInformationMessage(`Back in the queue: ${res.task.title}`);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
+  }
+  await refreshStatus();
+}
+
+async function dismissParked(m) {
+  try {
+    const args = ['parked-dismiss', '--repo', m.repo];
+    args.push(...(m.id ? ['--id', m.id] : ['--all']));
+    const res = await bridgeJson(args);
+    if (res.ok === false) vscode.window.showErrorMessage(`Flint swarm: ${res.error}`);
+    else vscode.window.showInformationMessage(`Dismissed ${res.dismissed} abandoned task(s). Logs and patches are preserved.`);
   } catch (e) {
     vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
   }
@@ -742,6 +903,47 @@ async function showActivity(repo, fetch) {
 
 // ---------------------------------------------------------------- status
 
+// The final-touch gate: on a fresh Cursor start, if no OpenRouter key is configured and
+// the last-chosen backend is the cloud one, ask for the key once per session instead of
+// letting the first ask die at the bridge with a cryptic "OPENROUTER_API_KEY is not set".
+// A local-only setup (Ollama, LM Studio, …) never triggers this: local asks need no key.
+let keyPrompted = false;
+
+/** Ask for an OpenRouter API key and store it via the bridge (writes checkout .env, 0600). */
+async function promptForApiKey(message) {
+  if (keyPrompted || !flintRoot()) return false;
+  keyPrompted = true;
+  const key = await vscode.window.showInputBox({
+    prompt: message || 'OpenRouter API key (sk-or-...) — required for cloud asks and the swarm',
+    password: true,
+    placeHolder: 'sk-or-…',
+    ignoreFocusOut: true,
+    validateInput: (v) => (v && /^sk-(or-)?[A-Za-z0-9_-]+$/.test(v.trim())) ? null : 'an OpenRouter key starts with sk-or-',
+  });
+  if (!key) return false;
+  try {
+    const res = await bridgeJson(['set-key', '--key', key.trim()]);
+    if (res && res.ok) {
+      vscode.window.showInformationMessage('OpenRouter API key saved to ' + (res.path || 'the flint .env'));
+      return true;
+    }
+    vscode.window.showErrorMessage((res && res.error) || 'could not save the key');
+  } catch (e) {
+    vscode.window.showErrorMessage('Flint Swarm: ' + e.message);
+  }
+  return false;
+}
+
+async function maybePromptForApiKey() {
+  if (keyPrompted) return;
+  // Only cloud asks need the key; a local-only pick (ollama, lm-studio, …) is fine without it.
+  if (chosenBackend() !== 'openrouter') return;
+  let info = null;
+  try { info = await bridgeJson(['info']); } catch { /* no bridge, no prompt */ return; }
+  if (info && info.api_key) return;               // already configured
+  await promptForApiKey();
+}
+
 let refreshing = null;
 function refreshStatus() {
   if (refreshing) return refreshing;
@@ -753,6 +955,10 @@ function refreshStatus() {
         // A $0 wallet and "paid requests are switched off" look identical in a meter, and
         // only one of them is a decision somebody made. The panel shows the setting itself.
         s.paid_fallback = cfg().get('paidFallback') || 'off';
+        // The provider/model the user last picked for asks rides along with status so the
+        // panel header can show it ("asking with Ollama · qwen2.5-coder:7b").
+        s.ask_provider = provState().backend || 'openrouter';
+        s.ask_model = provState().model || null;
         panel.post({ type: 'status', data: s });
         daemonRunning = !!s.daemon_running;
         try {
@@ -768,6 +974,10 @@ function refreshStatus() {
         lastInfo = Date.now();
         panel.post({ type: 'info', data: await bridgeJson(['info', '--quota']) });
       }
+      // Fresh-start gate: ask for an OpenRouter key once, when none is set and the
+      // last-chosen backend needs one. Runs after the first status/info round so the
+      // prompt appears on its own, not in the middle of the panel's first paint.
+      await maybePromptForApiKey();
     } catch (e) {
       panel.post({ type: 'notice', text: e.message, level: 'error' });
     } finally {
@@ -833,7 +1043,8 @@ class SwarmPanel {
 <section id="pane-queue" role="tabpanel" hidden>
   <div id="queueHead"></div>
   <div id="queueList"></div>
-  <div id="parkedHead"></div>
+  <div class="row"><button id="board" class="secondary">Scrum board ↗</button><button id="completed" class="secondary">Verified completed ↗</button></div>
+<div id="parkedHead"></div>
   <div id="parkedList"></div>
 </section>
 <section id="pane-landed" role="tabpanel" hidden>
@@ -878,6 +1089,10 @@ class SwarmPanel {
       await queueRetry(m);
     } else if (m.type === 'queueRequeue') {
       await queueRequeue(m);
+    } else if (m.type === 'board' || m.type === 'completed') {
+      await showBoard(m.type === 'completed');
+    } else if (m.type === 'parkedDismiss') {
+      await dismissParked(m);
     } else if (m.type === 'showCommit') {
       await showCommit(m);
     } else if (m.type === 'report') {
@@ -898,6 +1113,11 @@ class SwarmPanel {
       await showActivity();
     } else if (m.type === 'budget') {
       await setBudget();
+    } else if (m.type === 'setApiKey') {
+      keyPrompted = false;
+      await promptForApiKey('OpenRouter API key (sk-or-...) — stored in the flint checkout .env, mode 0600');
+      lastInfo = 0;
+      await refreshStatus();
     } else if (m.type === 'refresh') {
       await refreshStatus();
     }
@@ -952,6 +1172,12 @@ function activate(context) {
   reg('flintSwarm.clearQueue', () => clearQueue());
   reg('flintSwarm.setBudget', setBudget);
   reg('flintSwarm.refresh', () => { lastInfo = 0; return refreshStatus(); });
+  reg('flintSwarm.setApiKey', async () => {
+    keyPrompted = false;   // the palette command may re-prompt even after a fresh-start skip
+    await promptForApiKey('OpenRouter API key (sk-or-...) — stored in the flint checkout .env (mode 0600)');
+    lastInfo = 0;
+    return refreshStatus();
+  });
   // While a daemon runs there is something new to show every few seconds — the round it is on,
   // the model, how long the turn has taken. When nothing runs, once a minute is plenty.
   let timer = null;
@@ -979,4 +1205,5 @@ function deactivate() {
 
 module.exports = { activate, deactivate,
   _test: { parseLines, innermost, flintRoot, where, bridgeJson, bridgeLast, PRESETS,
-    idleFor, supportsSecondarySidebar, showActivity } };
+    idleFor, supportsSecondarySidebar, showActivity, providerChoices, provState, chosenBackend,
+    promptForApiKey, maybePromptForApiKey } };

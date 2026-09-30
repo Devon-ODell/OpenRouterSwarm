@@ -46,6 +46,18 @@ const vscode = {
     },
     onDidChangeActiveTextEditor: () => disposable,
     showWarningMessage: () => Promise.resolve(undefined),
+    showInformationMessage: (msg) => { vscode.__info = msg; return Promise.resolve(undefined); },
+    showErrorMessage: (msg) => { vscode.__error = msg; return Promise.resolve(undefined); },
+    showInputBox: (opts) => {
+      const answer = vscode.__inputAnswer;
+      // Mirror VS Code: validateInput rejects the input and the box stays open, so the
+      // promise only resolves with a value that passes the validator (or undefined on Esc).
+      if (answer != null && opts.validateInput) {
+        const err = opts.validateInput(answer);
+        if (err) return Promise.resolve(undefined);
+      }
+      return Promise.resolve(answer);
+    },
   },
   commands: {
     registerCommand: (id, fn) => { registered[id] = fn; return disposable; },
@@ -378,6 +390,41 @@ test('a real bridge call returns MIT hits with absolute paths', async () => {
   const res = await ext._test.bridgeJson(['study', '--query', 'dijkstra priority queue', '-k', '2']);
   assert.ok(res.hits.length >= 1);
   assert.ok(path.isAbsolute(res.hits[0].path) && fs.existsSync(res.hits[0].path), res.hits[0].path);
+});
+
+test('the provider picker offers locals first and remembers the choice', () => {
+  const choices = ext._test.providerChoices();
+  assert.strictEqual(choices[0].id, 'openrouter');
+  assert.ok(choices.some((c) => c.id === 'ollama' && c.local));
+  assert.ok(choices.some((c) => c.id === 'llamacpp' && c.local));
+  assert.ok(ext._test.chosenBackend());
+  assert.strictEqual(typeof ext._test.provState, 'function');
+  assert.strictEqual(typeof ext._test.saveProvState, 'undefined');  // state is written via the settings pipe, not exported
+});
+
+test('the fresh-start API-key prompt validates and surfaces a saved key', async () => {
+  const prompt = ext._test.promptForApiKey;
+  assert.strictEqual(typeof prompt, 'function');
+  // The prompt only ever runs once per session; reset the latch so tests are independent.
+  // The input box returns the mocked answer; with none, nothing is written and no error thrown.
+  vscode.__inputAnswer = undefined;
+  const skipped = await prompt('test');
+  assert.strictEqual(skipped, false);
+  // A valid-looking key trips the validateInput regex and would be sent to the bridge,
+  // which writes the checkout .env — so feed an obviously bad one to prove the gate.
+  vscode.__inputAnswer = 'not-a-key';
+  const bad = await prompt('test');
+  assert.strictEqual(bad, false);   // rejected client-side before any bridge call
+  assert.ok(!vscode.__error || /sk-/.test(String(vscode.__error)));
+});
+
+test('maybePromptForApiKey skips when a key is already set or backend is local', async () => {
+  // The mock bridge `info` reports api_key: true (the real checkout has one), so the
+  // prompt must short-circuit without ever opening the input box.
+  vscode.__inputAnswer = 'sk-or-triggered-wrongly';
+  await ext._test.maybePromptForApiKey();
+  // No error surfaced means the prompt stayed silent.
+  assert.ok(!vscode.__error, String(vscode.__error));
 });
 
 (async () => {

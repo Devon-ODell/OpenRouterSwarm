@@ -2,7 +2,7 @@
   "name": "flint-swarm",
   "displayName": "Flint Swarm",
   "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers with a merged verdict, a queue you can edit, and MIT OpenCourseWare lookups.",
-  "version": "0.4.0",
+  "version": "0.4.2",
   "publisher": "devon-odell",
   "license": "UNLICENSED",
   "private": true,
@@ -131,6 +131,11 @@
         "command": "flintSwarm.showEvidence",
         "title": "Show What Happened on a Swarm Task",
         "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.setApiKey",
+        "title": "Set the OpenRouter API Key…",
+        "category": "Flint Swarm"
       }
     ],
     "menus": {
@@ -232,6 +237,12 @@
           ],
           "default": "off",
           "description": "Whether a question may fall back to a paid model, spending from the budget set with \"Flint Swarm: Set the Paid Model Budget\" (default $5 in total). Free-only by default: turn it on deliberately, from the panel or with \"Flint Swarm: Turn Paid Requests On or Off\"."
+        },
+        "flintSwarm.providerState": {
+          "type": "object",
+          "default": {},
+          "scope": "window",
+          "description": "The backend and model the last ask used (openrouter, ollama, lm-studio, mlx, llamacpp, or a custom endpoint URL). Set automatically by the picker; edit only to reset it."
         }
       }
     }

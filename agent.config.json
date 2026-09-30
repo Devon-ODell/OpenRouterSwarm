@@ -1,0 +1,65 @@
+{
+  "approvalPolicy": "never",
+  "backend": "openrouter",
+  "context": {
+    "autoCompact": null,
+    "compactThreshold": 0.85,
+    "maxBytes": 262144,
+    "maxMessages": 40,
+    "modelContextTokens": null,
+    "reserveRatio": 0.25
+  },
+  "display": {
+    "ascii": false,
+    "color": "auto",
+    "eventLog": {
+      "enabled": true
+    },
+    "inputStyle": "bordered",
+    "loaderStyle": "spinner",
+    "loaderText": "Thinking",
+    "reasoning": false,
+    "showBanner": true,
+    "theme": "cyan",
+    "toolDisplay": "grouped"
+  },
+  "history": {
+    "enabled": true,
+    "maxEntries": 200,
+    "path": null
+  },
+  "maxSteps": 2000,
+  "mode": "edit",
+  "modelOverride": "~deepseek/deepseek-v4-flash-latest",
+  "modelSystem": {
+    "enabled": true,
+    "policy": {
+      "maxTurnUsd": null,
+      "localOnly": false,
+      "unknownCost": "warn"
+    }
+  },
+  "outsideWorkspace": "allow",
+  "projectMemory": {
+    "allowCloudContext": false,
+    "autoIndex": false,
+    "autoInject": true,
+    "enabled": true,
+    "maxFileBytes": 524288,
+    "maxInjectedBytes": 8192
+  },
+  "sessionDir": ".sessions",
+  "slashCommands": true,
+  "toolSelection": "auto",
+  "tools": [
+    "file_read",
+    "grep",
+    "list_dir",
+    "file_edit",
+    "file_write",
+    "shell",
+    "update_plan",
+    "task"
+  ],
+  "workspaceRoot": "/Users/devonodell/Desktop/OpenRouterSwarm"
+}

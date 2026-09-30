@@ -30,20 +30,25 @@
     ]
   },
   "workers": 1,
-  "daily_cap": 1000,
-  "reserve": 100,
+  "daily_cap": 800,
+  "reserve": 200,
+  "task_request_cap": 45,
+  "run_request_cap": 300,
+  "max_role_calls": 5,
   "owner_window": [
     "00:00",
     "00:00"
   ],
   "steps": {
-    "planner": 10,
+    "planner": 8,
     "architect": 0,
-    "implementer": 25,
-    "adversary": 12,
-    "judge": 4,
-    "decomposer": 6
+    "implementer": 10,
+    "adversary": 5,
+    "judge": 0,
+    "decomposer": 5,
+    "repair": 8
   },
+  "max_repairs": 1,
   "max_depth": 1,
   "max_queue": 20,
   "sandbox": true,

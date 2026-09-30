@@ -3,7 +3,6 @@
 Model observations are recorded as claims. Test exits and Git tree/commit IDs
 are recorded by the supervisor. Neither a review nor a reward proves correctness.
 """
-import datetime as dt
 import hashlib
 import json
 from pathlib import Path
@@ -20,8 +19,10 @@ STRATEGIES = {
 
 def criteria(task):
     rows = task.get("acceptance") or [task.get("detail") or task["title"]]
-    if not isinstance(rows, list) or not 1 <= len(rows) <= 12:
-        raise ValueError("acceptance must contain 1–12 concrete criteria")
+    # Work order §10: at most five acceptance criteria — one observable outcome, five
+    # checks at the outside — so a packet stays a single bounded attempt.
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 5:
+        raise ValueError("acceptance must contain 1–5 concrete criteria")
     if any(not isinstance(row, str) or not row.strip() or len(row) > 2000 for row in rows):
         raise ValueError("each acceptance criterion must be nonempty text under 2000 characters")
     return [{"id": f"C{i + 1}", "text": row.strip()} for i, row in enumerate(rows)]
@@ -31,24 +32,100 @@ def contract(task, goal, base, strategy):
     return {"task": task["id"], "title": task["title"], "goal": goal,
             "base_commit": base, "acceptance": criteria(task), "strategy": strategy,
             "parent": task.get("parent"), "root": task.get("root", task["id"]),
-            "depth": task.get("depth", 0), "depends_on": task.get("depends_on", [])}
+            "depth": task.get("depth", 0), "depends_on": task.get("depends_on", []),
+            "allowed_paths": task.get("allowed_paths", []),
+            "verification_commands": task.get("verification_commands", [])}
 
 
-def review_object(text):
-    """The review in a reply: bare JSON, a ```json fence, or the object amid prose."""
-    text = (text or "").strip()
-    try:
-        return json.loads(text)
-    except ValueError:
-        pass
-    decoder = json.JSONDecoder()
-    for match in re.finditer(r"\{", text):
+def validate_scope(task):
+    """Explicit files, or directories ending in '/', relative to the worktree."""
+    scope = task.get("allowed_paths")
+    if scope is not None:
+        if not isinstance(scope, list) or not scope:
+            raise ValueError("allowed_paths must be a nonempty list")
+        for name in scope:
+            if (not isinstance(name, str) or not name or Path(name).is_absolute()
+                    or any(p in ("..", ".git") for p in Path(name).parts)
+                    or str(Path(name)) == "." or any(c in name for c in "*?[]\\\x00")):
+                raise ValueError("allowed_paths must name repository files or directory/ prefixes")
+    commands = task.get("verification_commands", [])
+    if not isinstance(commands, list) or any(not isinstance(c, str) or not c.strip() for c in commands):
+        raise ValueError("verification_commands must be a list of nonempty commands")
+
+
+def path_allowed(path, scope):
+    return any(path == p or (p.endswith("/") and path.startswith(p)) for p in scope)
+
+
+def salvaged_object(text, start):
+    """The longest prefix of the object at `start` that parses once its containers are closed.
+
+    A reviewer that closes `"acceptance": [...` with `}` instead of `]`, or simply stops mid
+    reply, produces a review no decoder will read — and the whole verdict is lost along with the
+    candidate it was about. That is a fact about the reviewer, not about the code, and on
+    2026-09-27 it threw away an implementation whose full suite had just passed, because the
+    reviewer pool held one eligible model and no second reviewer could be asked.
+
+    So the reply is cut back to each point where a value had just ended, longest first, the
+    containers still open at that point are closed, and the first candidate that parses into an
+    object with a verdict wins. Cutting can only ever drop trailing content, never invent it, and
+    `parse_review` refuses to let a reply repaired this way carry an approval."""
+    stack, cuts, in_string, escaped = [], [], False, False
+    for i, ch in enumerate(text[start:], start):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+                cuts.append((i + 1, tuple(stack)))
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or stack[-1] != ch:
+                break              # the reply contradicts its own structure; keep what precedes
+            stack.pop()
+            cuts.append((i + 1, tuple(stack)))
+            if not stack:
+                break
+        elif ch == ",":
+            cuts.append((i, tuple(stack)))   # before the comma, so a bare literal ends cleanly
+    for cut, open_containers in reversed(cuts):
+        if not open_containers:
+            continue               # a complete object here would have decoded already
         try:
-            value, _ = decoder.raw_decode(text, match.start())
+            value = json.loads(text[start:cut] + "".join(reversed(open_containers)))
         except ValueError:
             continue
         if isinstance(value, dict) and "verdict" in value:
             return value
+    return None
+
+
+def review_object(text):
+    """(review, repaired) — bare JSON, a ```json fence, the object amid prose, or a salvage."""
+    text = (text or "").strip()
+    try:
+        return json.loads(text), False
+    except ValueError:
+        pass
+    decoder = json.JSONDecoder()
+    starts = [match.start() for match in re.finditer(r"\{", text)]
+    for start in starts:
+        try:
+            value, _ = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and "verdict" in value:
+            return value, False
+    for start in starts:
+        value = salvaged_object(text, start)
+        if value is not None:
+            return value, True
     raise ValueError("no JSON object with a verdict")
 
 
@@ -59,11 +136,17 @@ def parse_review(text, tree, acceptance):
     number as a string, an abbreviated or omitted tree): the supervisor names the tree it asked
     about and verifies afterwards that the reviewer did not change it. A different tree is not."""
     try:
-        review = review_object(text)
+        review, repaired = review_object(text)
     except (ValueError, TypeError) as exc:
         raise ValueError("review must be a JSON object with a verdict") from exc
     if isinstance(review, dict) and isinstance(review.get("verdict"), str):
         review["verdict"] = review["verdict"].strip().lower()
+    if repaired and isinstance(review, dict):
+        # Salvage drops trailing content, and the dropped tail could have held the blocker that
+        # made the verdict wrong. Every other check below still has to pass on what survived.
+        if review.get("verdict") == "approve":
+            raise ValueError("a reply damaged this badly may not carry an approval")
+        review["salvaged"] = True
     if not isinstance(review, dict) or review.get("verdict") not in ("approve", "request_changes"):
         raise ValueError("review verdict must be approve or request_changes")
     echoed = review.get("tree")
@@ -106,7 +189,13 @@ def parse_review(text, tree, acceptance):
         if type(finding.get("line")) is not int or finding["line"] < 1:
             raise ValueError("finding line must be a positive integer")
     blockers = any(f["severity"] in ("blocker", "major") for f in findings)
-    if review["verdict"] == "approve" and (blockers or any(not row["passed"] for row in checks)):
+    acceptance_gap = any(
+        "acceptance criter" in f["issue"].lower()
+        and any(word in f["issue"].lower()
+                for word in ("missing", "unmet", "not ", "no ", "doesn't", "does not"))
+        for f in findings
+    )
+    if review["verdict"] == "approve" and (blockers or acceptance_gap or any(not row["passed"] for row in checks)):
         raise ValueError("approval contradicts its findings or acceptance checks")
     if review["verdict"] == "request_changes" and not findings and all(row["passed"] for row in checks):
         raise ValueError("request_changes must identify a finding or failed criterion")

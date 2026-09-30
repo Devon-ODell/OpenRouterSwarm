@@ -411,7 +411,7 @@ class ReinforcementTests(SwarmBase):
         # unrelated diff in every prompt was 4.1 KB of the 16.6 KB that crowded out the code.
         self.assertNotIn("+page = items[offset:offset + size - 1]", prompts[1])
 
-    def test_a_reviewer_that_cannot_deliver_a_verdict_is_penalised(self):
+    def test_review_format_failure_does_not_penalise_the_implementer(self):
         repo, _ = self.repo()
         used = {}
 
@@ -425,9 +425,8 @@ class ReinforcementTests(SwarmBase):
         with patch.object(swarmd, "flint", side_effect=fake):
             ok, _ = w.do_task({"id": "t1", "title": "x", "detail": ""}, "goal")
         self.assertFalse(ok)
-        self.assertEqual(w.stage, "review_error")
-        arms = w.ledger.snapshot()["arms"]["implementer"]
-        self.assertEqual(arms[used["adversary"]]["b"], 1 + learn.PENALTY_WEIGHT["model_error"])
+        self.assertEqual(w.stage, "review_format_error")
+        arms = w.ledger.snapshot()["arms"].get("implementer", {})
         self.assertNotIn(used["implementer"], arms)  # the implementer is not blamed
 
     def test_provider_outage_rests_the_model_without_penalty(self):
