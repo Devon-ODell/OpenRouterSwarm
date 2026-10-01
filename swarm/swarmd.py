@@ -1522,7 +1522,7 @@ def attempt_lines(task, limit=3, max_chars=1_200):
 
 # Paths a task names in its own words. Anything outside this set is a guess about what matters,
 # and a guess is what filled these prompts with a lecture on parking-garage real options.
-CODE_PATH = re.compile(r"[\w][\w./-]*\.(?:py|js|cjs|mjs|jsx|ts|tsx|json|md|html|css)\b")
+CODE_PATH = re.compile(r"[\w][\w./-]*\.(?:py|js|cjs|mjs|jsx|ts|tsx|json|md|html|css|rs|toml)\b")
 GAME_DIR = re.compile(r"\b(games/([\w.-]+))/")
 # Definitions worth an outline when a file is too long to show: Python and JavaScript
 # functions, classes, and the consts a game's module keeps its tables in.
