@@ -3793,6 +3793,14 @@ class Worker(threading.Thread):
                 self.clock.enter(IDLE)
                 self.stop.wait(20)
                 continue
+            # A4 handoff 2026-10-02: an attempt without a persona skips the role
+            # shaping that makes prompts accurate, and ~half the audit's effort ran
+            # that way. Planner tasks always carry one; human-origin tasks default
+            # to "builder" so no attempt burns unshaped, and the journal records it.
+            if not task.get("persona"):
+                task["persona"] = "builder"
+                journal("persona_default", id=task["id"],
+                        from_origin=task.get("origin", "human"))
             try:
                 goal = read_goal(self.c)
                 ok, note = self.do_task(task, goal)
@@ -5237,6 +5245,8 @@ def build_report(c, hours=24):
 # ------------------------------------------------------------------ commands
 
 def _setup(a=None):
+    if a is not None and getattr(a, "repo", None):
+        use_config(a.repo)
     c = cfg()
     use_repo(c)
     warn_config_mismatch(c["repo"], record=True)
@@ -5277,7 +5287,7 @@ def cmd_run(a):
 
 
 def cmd_status(a):
-    c = _setup()
+    c = _setup(a)
     b = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                owner_window=c.get("owner_window", ["00:00", "00:00"]))
     snap = b.snapshot()
@@ -5320,11 +5330,11 @@ def cmd_status(a):
 
 
 def cmd_report(a):
-    print(build_report(_setup(), a.hours))
+    print(build_report(_setup(a), a.hours))
 
 
 def cmd_add(a):
-    c = _setup()
+    c = _setup(a)
     q = Queue(c.get("max_depth", 1), c.get("max_queue", 20))
     try:
         depends = q.resolve(a.depends_on) if a.depends_on else None
@@ -5344,7 +5354,7 @@ def cmd_add(a):
 
 
 def cmd_plan(a):
-    c = _setup()
+    c = _setup(a)
     b = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                owner_window=c.get("owner_window", ["00:00", "00:00"]))
     plan(c, Queue(c.get("max_depth", 1)), b, a.n)
@@ -5564,15 +5574,20 @@ def main():
     g.add_argument("--max-tasks", type=int, help="stop after finishing this many tasks")
     g.set_defaults(fn=cmd_grind)
     run = sub.add_parser("run", help="bounded run")
+    run.add_argument("--repo", help="target Git repository (default: configured one)")
     run.add_argument("--hours", type=float, default=24, help="stop after this many hours (default 24)")
     run.add_argument("--workers", type=int)
     run.add_argument("--max-tasks", type=int)
     run.set_defaults(fn=cmd_run)
-    sub.add_parser("status").set_defaults(fn=cmd_status)
+    st = sub.add_parser("status", help="what is running and where")
+    st.add_argument("--repo", help="target Git repository (default: configured one)")
+    st.set_defaults(fn=cmd_status)
     r = sub.add_parser("report", help="what landed, breakthroughs, leaderboard, playbook")
+    r.add_argument("--repo", help="target Git repository (default: configured one)")
     r.add_argument("--hours", type=float, default=24)
     r.set_defaults(fn=cmd_report)
     p = sub.add_parser("add")
+    p.add_argument("--repo", help="target Git repository (default: configured one)")
     p.add_argument("title")
     p.add_argument("--detail", default="")
     p.add_argument("--kind", default="feature")
@@ -5588,6 +5603,7 @@ def main():
                         "and its tests). Only you can set this; the adversary is told.")
     p.set_defaults(fn=cmd_add)
     p2 = sub.add_parser("plan")
+    p2.add_argument("--repo", help="target Git repository (default: configured one)")
     p2.add_argument("-n", type=int, default=5)
     p2.set_defaults(fn=cmd_plan)
     sv = sub.add_parser("service", help="a launchd agent that restarts this repository's swarm")

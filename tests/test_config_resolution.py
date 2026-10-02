@@ -191,6 +191,47 @@ class ConfigResolutionTests(unittest.TestCase):
         self.assertEqual(out[0]["config_path"], str(self.default))
         self.assertEqual(out[0]["config_tuned_available"], str(tuned))
 
+    def test_setup_with_a_repo_uses_the_tuned_file(self):
+        """`add/plan/report/status --repo` must be ground on the repository's own
+        config, not whatever swarm/config.json happens to name (TODO 2026-10-01 #2)."""
+        tuned = self.tuned(test_cmd="tuned-tests", max_queue=3)
+        from types import SimpleNamespace as NS
+        c = swarmd._setup(NS(repo=str(self.repo)))
+        self.assertEqual(str(swarmd.CONFIG), str(tuned))
+        self.assertEqual(c["test_cmd"], "tuned-tests")
+        self.assertEqual(c["max_queue"], 3)
+
+    def test_setup_without_a_repo_stays_on_the_default(self):
+        self.tuned(test_cmd="tuned-tests", max_queue=3)
+        from types import SimpleNamespace as NS
+        c = swarmd._setup(NS())
+        self.assertEqual(str(swarmd.CONFIG), str(self.default))
+        self.assertEqual(c["test_cmd"], "default-tests")
+
+    def test_cmd_add_with_a_repo_uses_the_tuned_max_queue(self):
+        """The TODO's acceptance: `add --repo <studio>` obeys the tuned max_queue,
+        not the default one. A tuned max_queue of 1 accepts exactly one task."""
+        tuned = self.tuned(max_queue=1)
+        from types import SimpleNamespace as NS
+
+        def args(title):
+            return NS(repo=str(self.repo), title=title, detail="d", kind="feature",
+                      priority=1, acceptance=None, depends_on=None,
+                      execution_class="standard", allow_test_changes=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            swarmd.cmd_add(args("First"))
+        q = swarmd.Queue(max_queue=1)
+        self.assertEqual(len(q.pending()), 1)
+        # After _setup(a) the queue uses the tuned max_queue=1, so the second add
+        # must be refused rather than silently append.
+        with contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(SystemExit) as caught:
+            swarmd.cmd_add(args("Second"))
+        self.assertIn("not queued", str(caught.exception))
+        # And it did not touch the real queue: only the first task is present.
+        self.assertEqual(len(q.pending()), 1)
+        self.assertEqual([t["title"] for t in q.pending()], ["First"])
+
 
 if __name__ == "__main__":
     unittest.main()

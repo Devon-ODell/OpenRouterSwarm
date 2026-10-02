@@ -50,7 +50,26 @@ Prefer `--drain`: it lets the task in flight finish instead of throwing away a
 turn that has already been paid for.
 
 
-## 2. `swarm add` has no `--repo`, so it trusts whatever config.json points at
+## 2. ~~`swarm add` has no `--repo`, so it trusts whatever config.json points at~~ — FIXED 2026-10-02
+
+Fixed: `swarmd.py` now accepts `--repo` on `add`, `plan`, `report`, `status` and
+`run`, and `_setup(a)` calls `use_config(a.repo)` before loading, exactly as
+`cmd_grind` already did. `swarm add --repo <studio> ...` is now ground on the
+repository's own tuned file (`swarm/configs/<slug>.json`), so its `max_queue`,
+`max_depth`, validation limits and paid fallback are the tuned ones, and the
+`config_mismatch` warning no longer fires. Three tests in
+`tests/test_config_resolution.py` cover it: `_setup --repo` uses the tuned file,
+`_setup` without stays on the default, and `add --repo` enforces the tuned
+`max_queue`. Gate: 780 passed + 26 subtests.
+
+Still works, and still the documented equivalent for other entry points:
+
+```sh
+FLINT_SWARM_CONFIG=/Users/devonodell/Desktop/OpenRouterSwarm/swarm/configs/openRouter-Studio-ab0a4a.json \
+  ./.venv/bin/python swarm/swarmd.py add "<title>" --detail "..." --priority 2
+```
+
+### What it was
 
 `swarm add` resolves its config through `cfg()` with no repository argument, so it
 writes to whichever repo `swarm/config.json` names and uses that file's settings —

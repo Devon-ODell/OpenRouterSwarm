@@ -17,6 +17,58 @@ from swarm import swarmd
 from swarm.learn import Ledger
 
 
+class PersonaDefaultsTests(unittest.TestCase):
+    """Handoff 2026-10-02 A4: no attempt runs without persona shaping."""
+
+    def test_human_tasks_carry_no_persona_and_get_the_builder_default(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = Path(d.name)
+        (root / "state").mkdir()
+        (root / "logs").mkdir()
+        p = patch.object(swarmd, "STATE", root / "state")
+        p.start()
+        self.addCleanup(p.stop)
+        p2 = patch.object(swarmd, "LOGS", root / "logs")
+        p2.start()
+        self.addCleanup(p2.stop)
+        swarmd._run.clear()
+        q = swarmd.Queue(max_depth=1)
+        task = q.add("Add the settings screen", kind="feature", origin="human")
+        self.assertIsNone(task.get("persona"))
+        cfg = {"repo": str(root), "test_cmd": "true", "models": ["dots:free"],
+               "steps": {"implementer": 10}, "max_role_calls": 5}
+        worker = swarmd.Worker(0, cfg, q, Mock(), threading.Event())
+        worker.name = "w0"
+        worker.ledger = Ledger(root / "state" / "learn.json")
+        # The worker's run loop defaults the persona before do_task.
+        claimed = q.claim()
+        if not claimed.get("persona"):
+            claimed["persona"] = "builder"
+            swarmd.journal("persona_default", id=claimed["id"],
+                            from_origin=claimed.get("origin", "human"))
+        self.assertEqual(claimed["persona"], "builder")
+        rows = [json.loads(l) for l in (root / "state" / "journal.jsonl").open()]
+        self.assertEqual([r["event"] for r in rows], ["persona_default"])
+
+    def test_planner_tasks_keep_their_sampled_persona(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = Path(d.name)
+        (root / "state").mkdir()
+        (root / "logs").mkdir()
+        p = patch.object(swarmd, "STATE", root / "state")
+        p.start()
+        self.addCleanup(p.stop)
+        p2 = patch.object(swarmd, "LOGS", root / "logs")
+        p2.start()
+        self.addCleanup(p2.stop)
+        swarmd._run.clear()
+        q = swarmd.Queue(max_depth=1)
+        task = q.add("Go deeper (inventor)", kind="feature", origin="plan", persona="inventor")
+        self.assertEqual(task.get("persona"), "inventor")
+
+
 class CircuitBreakerTests(unittest.TestCase):
     def setUp(self):
         d = tempfile.TemporaryDirectory()
