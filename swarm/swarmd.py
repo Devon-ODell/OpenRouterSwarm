@@ -1253,6 +1253,14 @@ class Queue:
             _write(self.path, [r for r in rows if r["id"] not in accepted])
 
 
+def queue_for(c):
+    """A Queue sized from this repo's config, so max_children/max_descendants are no longer
+    dead config keys: every real call site built its Queue from max_depth alone and silently
+    fell back to the class defaults (3, 12) for the other two."""
+    return Queue(c.get("max_depth", 1), c.get("max_queue", 20),
+                 c.get("max_children", 3), c.get("max_descendants", 12))
+
+
 # ------------------------------------------------------------------ corpus
 
 # ------------------------------------------------------------------ resuming interrupted work
@@ -4968,7 +4976,7 @@ def run_daemon(c, max_tasks=None, hours=None):
     repo = Path(c["repo"])
     budget = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                     owner_window=c.get("owner_window", ["00:00", "00:00"]))
-    q, stop, tally = Queue(c.get("max_depth", 1)), _stop, Tally(max_tasks)
+    q, stop, tally = queue_for(c), _stop, Tally(max_tasks)
     ledger = Ledger(STATE / "learn.json")
     q.recover()
     note_interrupted(c, q)
@@ -5335,7 +5343,7 @@ def cmd_report(a):
 
 def cmd_add(a):
     c = _setup(a)
-    q = Queue(c.get("max_depth", 1), c.get("max_queue", 20))
+    q = queue_for(c)
     try:
         depends = q.resolve(a.depends_on) if a.depends_on else None
         t = q.add(a.title, a.detail or "", a.kind, priority=a.priority, origin="human",
@@ -5357,7 +5365,7 @@ def cmd_plan(a):
     c = _setup(a)
     b = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                owner_window=c.get("owner_window", ["00:00", "00:00"]))
-    plan(c, Queue(c.get("max_depth", 1)), b, a.n)
+    plan(c, queue_for(c), b, a.n)
 
 
 # ------------------------------------------------------------------ player bug reports
