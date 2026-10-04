@@ -644,6 +644,51 @@ class SwarmTests(unittest.TestCase):
             self.assertEqual(worker.decompose(parent, "goal"), 0)
         self.assertNotIn("dependent shell", [t["title"] for t in q.pending()])
 
+    def test_repeated_exploration_exhausted_reaches_decompose(self):
+        """The fix: two different models both finding no entry point must still split."""
+        q = swarmd.Queue(max_depth=1)
+        task = q.add("fan-sim persona-preservation + review gate + identity invariants")
+        q.claim()
+        q.release(task["id"], False, "stopped after 7 rounds without editing",
+                  failure_class="harness", stage="exploration_exhausted", failed_model="a:free")
+        rows = swarmd._read(q.path)
+        rows[0]["not_before"] = 0
+        swarmd._write(q.path, rows)
+        q.claim()
+        final = q.release(task["id"], False, "stopped after 8 rounds without editing",
+                          failure_class="harness", stage="exploration_exhausted",
+                          failed_model="b:free")
+        self.assertEqual(final["status"], "split")
+        worker = swarmd.Worker(0, {"test_cmd": "true", "steps": {"decomposer": 3}}, q, Mock(), threading.Event())
+        worker.call = Mock(return_value=json.dumps([
+            {"title": "persona preservation", "detail": "..."},
+            {"title": "review gate", "detail": "..."},
+            {"title": "identity invariants", "detail": "..."}]))
+        with patch.object(swarmd, "refresh_view", return_value=self.root):
+            self.assertEqual(worker.decompose(final, "goal"), 3)
+        self.assertEqual(len(q.pending()), 3)
+
+    def test_decompose_prompt_falls_back_to_the_harness_note_when_nothing_else_is_recorded(self):
+        """A harness-triggered split must not hand the decomposer an empty failure reason."""
+        q = swarmd.Queue(max_depth=1)
+        task = q.add("fan-sim persona-preservation + review gate + identity invariants")
+        q.claim()
+        q.release(task["id"], False, "stopped after 7 rounds without editing: HARNESS NOTE SENTINEL",
+                  failure_class="harness", stage="exploration_exhausted", failed_model="a:free")
+        rows = swarmd._read(q.path)
+        rows[0]["not_before"] = 0
+        swarmd._write(q.path, rows)
+        q.claim()
+        final = q.release(task["id"], False, "stopped after 8 rounds: HARNESS NOTE SENTINEL",
+                          failure_class="harness", stage="exploration_exhausted", failed_model="b:free")
+        self.assertEqual(final.get("notes"), None, "a harness failure records no task-level note")
+        worker = swarmd.Worker(0, {"test_cmd": "true", "steps": {"decomposer": 3}}, q, Mock(), threading.Event())
+        worker.call = Mock(return_value=json.dumps([{"title": "x", "detail": "y"}]))
+        with patch.object(swarmd, "refresh_view", return_value=self.root):
+            worker.decompose(final, "goal")
+        prompt = worker.call.call_args.args[1]
+        self.assertIn("HARNESS NOTE SENTINEL", prompt)
+
     def test_timeout_reaps_child_process(self):
         with self.assertRaises(subprocess.TimeoutExpired):
             swarmd.sh([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.05)

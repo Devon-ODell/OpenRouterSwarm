@@ -925,6 +925,12 @@ class Queue:
                     and set(r.get("depends_on", [])).issubset(complete)]
 
     MAX_HARNESS_FAILURES = 3
+    # Unlike generic harness noise, exploration_exhausted says something about the TASK: the
+    # model spent most of its rounds looking for a starting point and never found one. The
+    # model/task circuit breaker excludes whichever model just failed this way, so a second
+    # occurrence on the same task is guaranteed to be a different model — two different models
+    # agreeing there is no obvious entry point is decisive, well short of MAX_HARNESS_FAILURES.
+    MAX_EXPLORATION_FAILURES = 2
 
     @staticmethod
     def selection_score(r, now=None):
@@ -988,7 +994,7 @@ class Queue:
 
     def release(self, tid, ok, note="", defer=0, split_now=False, failure_class="task",
                 park=False, requests=0, failed_model=None, failed_role=None, ledger=None,
-                turn_seconds=0, role_turns=0):
+                turn_seconds=0, role_turns=0, stage=None):
         """Returns the task with its new status: done, retry, split, parked or held.
 
         `failure_class` decides whether this failure counts against the task at all. A harness
@@ -1042,17 +1048,29 @@ class Queue:
             elif ok:
                 task["status"] = "done"
             elif park:
-                # A second attempt cannot supply the scope the first one was missing, and a
-                # split would only produce two tasks with the same gap. This needs a person.
-                task["status"] = "parked"
-                task["note"] = note[-800:]
+                if stage == "model_pool_exhausted" and task.get("depth", 0) < self.max_depth:
+                    # Every model in the pool is already excluded here (work order §5) — there
+                    # is no second model left to ask, unlike exploration_exhausted below, so
+                    # there is nothing to gain by waiting for a repeat. Splitting hands each
+                    # half a fresh exclusion set instead of parking the whole task for a person.
+                    task["status"] = "split"
+                else:
+                    # A second attempt cannot supply the scope the first one was missing, and a
+                    # split would only produce two tasks with the same gap. This needs a person.
+                    task["status"] = "parked"
+                    task["note"] = note[-800:]
             elif harness:
                 # This says nothing about the task, so it costs the task nothing and teaches the
                 # next attempt nothing. It is still counted: a task that only ever fails this way
                 # needs a person, not another turn.
                 task["harness_failures"] = task.get("harness_failures", 0) + 1
                 task["harness_note"] = note[-400:]
-                if task["harness_failures"] < self.MAX_HARNESS_FAILURES:
+                if stage == "exploration_exhausted":
+                    task["exploration_failures"] = task.get("exploration_failures", 0) + 1
+                if (task.get("exploration_failures", 0) >= self.MAX_EXPLORATION_FAILURES
+                        and task.get("depth", 0) < self.max_depth):
+                    task["status"] = "split"
+                elif task["harness_failures"] < self.MAX_HARNESS_FAILURES:
                     # Cost-aware backoff (work order §7): the delay grows with what the
                     # failure cost, and the worst classes rest the task long enough that a
                     # higher-priority ready task runs while it cools down.
@@ -2321,6 +2339,10 @@ tool calls), compare it with the goal, then propose the next {n} tasks.
 Rules:
 - Each task must be completable in one focused sitting (well under 25 tool
   calls) and verifiable by running `{test_cmd}`.
+- One concern per task: a title or detail joined by "+" or "and" across distinct
+  checks or features is several tasks wearing one title. If describing the work
+  honestly needs "and"/"+" to join unrelated concerns, propose them as separate
+  tasks instead.
 - Put concrete acceptance criteria in the detail: inputs, expected behavior and
   the tests that prove it.
 - Tasks run one after another on top of accepted work, but each must be
@@ -3736,7 +3758,8 @@ class Worker(threading.Thread):
             try:
                 out = self.call("decomposer", DECOMPOSER.format(
                     goal=goal, title=task["title"], detail=task["detail"], test_cmd=c["test_cmd"],
-                    notes="\n---\n".join(task.get("notes", [])) or task.get("note", "")),
+                    notes="\n---\n".join(task.get("notes", [])) or task.get("note", "")
+                    or task.get("harness_note", "")),
                     view, c["steps"].get("decomposer", 6), model)
             except (StepLimit, ModelError, AgentTimeout) as e:
                 self.ledger.update("planner", model, 0.0)
@@ -3822,9 +3845,11 @@ class Worker(threading.Thread):
                                                      ("harness", "model") else None),
                                        failed_role=self.last_role, ledger=self.ledger,
                                        turn_seconds=round(max(0, time.time() - (getattr(self, "started", 0) or time.time())), 1),
-                                       role_turns=getattr(self, "role_calls", 0) or 0)
+                                       role_turns=getattr(self, "role_calls", 0) or 0, stage=self.stage)
                 journal("task", id=task["id"], title=task["title"], ok=ok, stage=self.stage,
                         failure_class=None if ok else self.failure_class,
+                        status=final.get("status") if final else None,
+                        exploration_failures=final.get("exploration_failures") if final else None,
                         worker=self.name, requests=getattr(self, "attempt_requests", 0), note=note[:300])
                 if final and final.get("status") == "split":
                     if not self.decompose(final, goal):

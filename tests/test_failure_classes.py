@@ -121,6 +121,65 @@ class HarnessReleaseTests(unittest.TestCase):
         self.q.claim()
         self.assertEqual(self.q.release(task["id"], False, "something")["attempts"], 1)
 
+    def test_a_single_exploration_exhausted_still_just_retries(self):
+        task = self.q.add("Shard Stack M1")
+        self.q.claim()
+        out = self.q.release(task["id"], False, "stopped after 7 rounds without editing",
+                             failure_class="harness", stage="exploration_exhausted",
+                             failed_model="a:free")
+        self.assertEqual((out["status"], out["exploration_failures"]), ("retry", 1))
+
+    def test_two_exploration_exhausted_failures_from_different_models_split_the_task(self):
+        """Two different models independently finding no entry point is decisive."""
+        task = self.q.add("Shard Stack M1")
+        self.q.claim()
+        first = self.q.release(task["id"], False, "stopped after 7 rounds without editing",
+                               failure_class="harness", stage="exploration_exhausted",
+                               failed_model="a:free")
+        self.assertEqual((first["status"], first["exploration_failures"]), ("retry", 1))
+        rows = swarmd._read(self.q.path)
+        rows[0]["not_before"] = 0
+        swarmd._write(self.q.path, rows)
+        self.q.claim()
+        second = self.q.release(task["id"], False, "stopped after 8 rounds without editing",
+                                failure_class="harness", stage="exploration_exhausted",
+                                failed_model="b:free")
+        self.assertEqual((second["status"], second["exploration_failures"],
+                         second["harness_failures"]), ("split", 2, 2))
+
+    def test_exploration_exhausted_does_not_split_past_max_depth(self):
+        parent = self.q.add("Shard Stack M1")
+        self.q.release(parent["id"], False, "timeout", split_now=True)
+        child = self.q.add("Shard Stack M1 part 1", parent=parent["id"])
+        self.q.claim()
+        first = self.q.release(child["id"], False, "stopped after 7 rounds without editing",
+                               failure_class="harness", stage="exploration_exhausted",
+                               failed_model="a:free")
+        rows = swarmd._read(self.q.path)
+        rows[0]["not_before"] = 0
+        swarmd._write(self.q.path, rows)
+        self.q.claim()
+        second = self.q.release(child["id"], False, "stopped after 8 rounds without editing",
+                                failure_class="harness", stage="exploration_exhausted",
+                                failed_model="b:free")
+        self.assertEqual((first["status"], second["status"]), ("retry", "retry"),
+                         "already at max_depth=1, so a second occurrence must not split it")
+
+    def test_model_pool_exhausted_splits_within_depth_and_parks_at_the_ceiling(self):
+        task = self.q.add("Shard Stack M1")
+        self.q.claim()
+        out = self.q.release(task["id"], False, "no model left to try", park=True,
+                             stage="model_pool_exhausted")
+        self.assertEqual(out["status"], "split")
+
+        parent = self.q.add("Shard Stack M2")
+        self.q.release(parent["id"], False, "timeout", split_now=True)
+        child = self.q.add("Shard Stack M2 part 1", parent=parent["id"])
+        self.q.claim()
+        out = self.q.release(child["id"], False, "no model left to try", park=True,
+                             stage="model_pool_exhausted")
+        self.assertEqual(out["status"], "parked")
+
 
 class NotScoredAgainstTheModelTests(unittest.TestCase):
     """The bandit learns which models do the work. A step limit is not about the model."""
