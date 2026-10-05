@@ -45,6 +45,7 @@ sys.path.insert(0, str(ROOT))          # flint.py lives at the repo root
 sys.path.insert(0, str(ROOT / "swarm"))
 import bench_swarm  # noqa: E402  (task battery + verifiers)
 import flint  # noqa: E402  (reuse _ssl_context + OPENROUTER default)
+from translation_tasks import TRANSLATION_TASKS  # noqa: E402
 
 OPENROUTER = getattr(flint, "OPENROUTER", "https://openrouter.ai/api/v1")
 RUNS_DIR = ROOT / "consensus" / "runs"
@@ -207,6 +208,8 @@ def log_run(rec, runs_dir=RUNS_DIR):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks", default=None, help="comma-separated 1-based task indices")
+    ap.add_argument("--suite", choices=("code", "translation"), default="code",
+                    help="task battery: code (bench_swarm) or translation (translation_tasks)")
     ap.add_argument("--rounds", type=int, default=12)
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--frontier-raw", dest="raw_frontier", action="store_true",
@@ -219,8 +222,9 @@ def main():
     a = ap.parse_args()
 
     load_dotenv(ROOT / ".env")
-    tasks = bench_swarm.TASKS if not a.tasks else [
-        bench_swarm.TASKS[int(i) - 1] for i in a.tasks.split(",")]
+    tasks = TRANSLATION_TASKS if a.suite == "translation" else bench_swarm.TASKS
+    if a.tasks:
+        tasks = [tasks[int(i) - 1] for i in a.tasks.split(",")]
     panel = [m.strip() for m in a.models.split(",") if m.strip()]
     if a.dry:
         print("panel:", panel)
@@ -235,11 +239,13 @@ def main():
         if a.frontier_only:
             rec = {"task": task["name"], "models": panel, "agents": [],
                    "majority_ok": None, "majority": 0, "n": len(panel),
+                   "suite": a.suite,
                    "raw_frontier": _run_frontier(task, FRONTIER, rounds=a.rounds,
                                                    timeout=a.timeout)}
         else:
             rec = run_consensus(task, panel=panel, rounds=a.rounds,
                                 timeout=a.timeout, raw_frontier=a.raw_frontier)
+            rec["suite"] = a.suite
         rec["ts"] = time.time()
         rec["rounds"] = a.rounds
         path = log_run(rec)

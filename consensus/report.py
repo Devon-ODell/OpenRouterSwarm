@@ -41,19 +41,21 @@ def aggregate(recs):
     """Return dict of per-task and overall stats from raw records.
 
     If a task appears more than once (re-runs), the LAST record for that task
-    wins, so the aggregate never double-counts a task."""
-    # collapse to one record per task (last wins)
+    wins, so the aggregate never double-counts a task. Records carry a `suite`
+    tag (code | translation); dedup is per (suite, task)."""
+    # collapse to one record per (suite, task) (last wins)
     latest = {}
     for rec in recs:
-        latest[rec["task"]] = rec
+        latest[(rec.get("suite", "code"), rec["task"])] = rec
     recs = list(latest.values())
-    tasks = defaultdict(lambda: {"panel_ok": 0, "n": 0, "panel_secs": [],
+    tasks = defaultdict(lambda: {"suite": "code", "panel_ok": 0, "n": 0, "panel_secs": [],
                                  "panel_cost": [], "agents": [],
                                  "frontier": None, "frontier_cost": 0.0,
                                  "frontier_ok": None, "frontier_secs": None})
     for rec in recs:
         t = rec["task"]
         d = tasks[t]
+        d["suite"] = rec.get("suite", "code")
         d["n"] = rec.get("n", len(rec.get("models", [])))
         d["panel_ok"] += int(rec.get("majority_ok", False))
         d["panel_secs"].append(sum(a.get("secs") or 0 for a in rec.get("agents", [])))
@@ -85,16 +87,16 @@ def aggregate(recs):
 def render_markdown(recs):
     tasks, ov = aggregate(recs)
     lines = []
-    lines.append("| task | panel | frontier | panel $ | panel s | frontier $ |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| task | suite | panel | frontier | panel $ | panel s | frontier $ |")
+    lines.append("|---|---|---|---|---|---|---|")
     for name, d in sorted(tasks.items()):
         panel_r = "pass" if d["panel_ok"] else "fail"
         fr_ok = "pass" if d["frontier_ok"] else ("fail" if d["frontier_ok"] is False else "—")
         lines.append(
-            f"| {name} | {panel_r} | {fr_ok} | "
+            f"| {name} | {d['suite']} | {panel_r} | {fr_ok} | "
             f"${sum(d['panel_cost']):.4f} | {sum(d['panel_secs']):.0f}s | "
             f"${d['frontier_cost']:.4f} |")
-    lines.append(f"| **overall** | **{ov['panel_pass']}/{ov['panel_n']}** | "
+    lines.append(f"| **overall** | — | **{ov['panel_pass']}/{ov['panel_n']}** | "
                  f"**{ov['frontier_ok']}/{ov['frontier_total']}** | "
                  f"**${ov['panel_cost_mean']:.4f}/task** | "
                  f"**{ov['panel_secs_mean']:.0f}s/task** | "

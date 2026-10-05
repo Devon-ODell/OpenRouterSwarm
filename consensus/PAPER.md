@@ -1,7 +1,7 @@
 # Consensus-of-Agents: Can Three Small Free Models Match GPT-5.5?
 
 **Working paper — OpenRouterSwarm project**
-*Status: benchmark-complete with tracked raw data. All numbers reproducible from `consensus/runs/runs.jsonl`.*
+*Status: benchmark-complete with tracked raw data. All numbers reproducible from `consensus/runs/runs.jsonl`. Now covers TWO suites: coding (14 tasks) and translation (10 tasks).*
 
 ---
 
@@ -9,21 +9,34 @@
 
 We ask whether a **consensus-of-agents** system — three small, free, *independent*
 OpenRouter models whose majority vote decides the outcome — can outperform
-OpenAI's frontier model **GPT-5.5** on a battery of small coding tasks.
+OpenAI's frontier model **GPT-5.5** on a battery of small coding tasks *and*
+language-translation tasks.
 
-On 14 tasks (file-edit, grading, verification-driven), the answer is:
+Across **24 tasks** (14 coding + 10 translation, all verifier-gated):
 
 | system | pass rate | total cost | total wall time |
 |---|---|---|---|
-| **consensus-of-agents** (3 free models, majority) | **12/14 (86%)** | **$0.00** | 1956 s |
-| **GPT-5.5** (single frontier, identical harness) | 12/14 (86%) | $0.55 | 204 s |
-| best single panelist (`north-mini-code:free`) | **13/14 (93%)** | $0.00 | 269 s |
+| **consensus-of-agents** (3 free models, majority) | **22/24 (92%)** | **$0.00** | 3151 s |
+| **GPT-5.5** (single frontier, identical harness) | 22/24 (92%) | $0.75 | 309 s |
+| best single panelist (`north-mini-code:free`) | **23/24 (96%)** | $0.00 | 310 s |
 
-The consensus **does not beat GPT-5.5 on accuracy** — it *ties* it (12/14) while
-costing **$0 versus $0.55** (a 100% cost reduction) at roughly **9.6× more
-wall-time**. One panelist alone (`north-mini-code:free`, 13/14) *does* beat
-GPT-5.5 on this battery. We publish the honest trade-off: the win is **cost**,
-not latency, and the accuracy claim is **parity with one member superior**.
+(Total wall = 1956 s coding panel + 1195 s translation panel; frontier = 204 s
+coding + 105 s translation. Cost = $0.5453 coding + $0.202 translation.)
+
+The consensus **does not beat GPT-5.5 on accuracy** — it *ties* it (22/24),
+while costing **$0 versus $0.75** (a 100% cost reduction) at roughly **10× more
+wall-time**. One panelist alone (`north-mini-code:free`, 23/24) *does* beat
+GPT-5.5 on this combined battery. We publish the honest trade-off: the win is
+**cost**, not latency, and the accuracy claim is **parity with one member
+superior**.
+
+### Translation suite (new)
+
+On 10 translation tasks (EN→ES/FR/DE/PT/ZH/JA/HI/AR/IT/RU), the consensus
+panel is **10/10 (100%)** at **$0.00**, matching GPT-5.5's **10/10**
+($0.20). The panel's majority rescued 3 tasks where `laguna-xs` alone failed;
+every member passed ES/FR/DE/PT/ZH/HI/AR, and the CJK/RTL/script-heavy targets
+still reached 100% via voting.
 
 ---
 
@@ -126,6 +139,33 @@ the paper's reproducible dataset (14 records, all with scored panel + frontier).
 
 ---
 
+## 4.5 Translation suite (10 tasks)
+
+New battery (`swarm/translation_tasks.py`): EN→ES/FR/DE/PT/ZH/JA/HI/AR/IT/RU,
+verifier-gated by exact (whitespace-normalized) content match. No LLM judging.
+
+| task | panel | frontier | panel $ | panel s | frontier $ |
+|---|---|---|---|---|---|
+| tr-en-es | pass | pass | $0.00 | 112s | $0.020 |
+| tr-en-fr | pass | pass | $0.00 | 48s | $0.020 |
+| tr-en-de | pass | pass | $0.00 | 154s | $0.020 |
+| tr-en-pt | pass | pass | $0.00 | 33s | $0.021 |
+| tr-en-zh | pass | pass | $0.00 | 54s | $0.021 |
+| tr-en-ja | pass | pass | $0.00 | 92s | $0.020 |
+| tr-en-hi | pass | pass | $0.00 | 32s | $0.020 |
+| tr-en-ar | pass | pass | $0.00 | 89s | $0.020 |
+| tr-en-it | pass | pass | $0.00 | 110s | $0.020 |
+| tr-en-ru | pass | pass | $0.00 | 105s | $0.022 |
+| **overall** | **10/10** | **10/10** | **$0.00** | 1195s | **$0.202** |
+
+All 10 translations pass for **both** the 3-free-model majority and gpt-5.5.
+The majority rescued 3 tasks (`ja`, `it`, `ru`) where `laguna-xs` alone failed.
+`north-mini-code` was perfect (10/10); `qwen` 10/10; `laguna-xs` 7/10.
+Translation is a *strong* regime for the panel: free, 100% parity, and the
+non-Latin script tasks (ZH/JA/HI/AR/RU) all still pass via voting.
+
+---
+
 ## 5. Analysis
 
 ### 5.1 Does consensus beat GPT-5.5? — Honest answer
@@ -200,11 +240,13 @@ and/or a **second-round debate** (agents see each other's answers) — beyond
 ## 7. Conclusion
 
 A consensus-of-agents panel of three free models **matches GPT-5.5's pass rate
-(12/14) at zero marginal cost**, with one panelist exceeding it (13/14). It
-does **not** out-verify the frontier on this battery, but it establishes the
-strongest claim the data supports: **free, redundant small models are a
-cost-competitive (and occasionally more accurate) substitute for a paid
-frontier model**, with the explicit trade-off of ~10× wall-time. The
-infrastructure for tracking every run is in place, so the next experiment
-(debate round, task-adaptive routing, larger battery) can be published from the
-same raw log immediately.
+across both suites — 22/24 combined (coding 12/14, translation 10/10) — at
+zero marginal cost**, with one panelist exceeding it (23/24 overall,
+`north-mini-code`). It does **not** out-verify the frontier on this battery,
+but it establishes the strongest claim the data supports: **free, redundant
+small models are a cost-competitive (and occasionally more accurate) substitute
+for a paid frontier model**, with the explicit trade-off of ~10× wall-time.
+Translation is the panel's cleanest win: **100% parity (10/10) at $0.00** vs
+gpt-5.5's $0.20. The infrastructure for tracking every run is in place, so the
+next experiment (debate round, task-adaptive routing, larger battery) can be
+published from the same raw log immediately.

@@ -4,13 +4,18 @@ Append-only log of what the benchmarks measure and what to try next.
 Raw data lives in `consensus/runs/runs.jsonl`; tables regenerate via
 `.venv/bin/python consensus/report.py`.
 
-## Measured (2026 — 14-task battery, free panel vs openai/gpt-5.5)
+## Measured (2026 — 24-task combined battery)
 
-| system | pass | cost | wall |
-|---|---|---|---|
-| consensus (3 free, majority) | 12/14 (86%) | $0.00 | 1956 s |
-| gpt-5.5 (frontier, openrouter backend) | 12/14 (86%) | $0.55 | 204 s |
-| north-mini-code:free (best panelist) | **13/14 (93%)** | $0.00 | 269 s |
+| system | coding (14) | translation (10) | combined | cost | wall |
+|---|---|---|---|---|---|
+| consensus (3 free, majority) | 12/14 | **10/10** | **22/24 (92%)** | $0.00 | 3151 s |
+| gpt-5.5 (frontier, openrouter backend) | 12/14 | 10/10 | 22/24 (92%) | $0.75 | 309 s |
+| north-mini-code:free (best panelist) | 13/14 | 10/10 | **23/24 (96%)** | $0.00 | 310 s |
+| qwen3.8-27b:free | 12/14 | 10/10 | 22/24 | $0.00 | 394 s |
+| laguna-xs-2.1:free | 10/14 | 7/10 | 17/24 | $0.00 | 2,083 s |
+
+Translation total cost: consensus $0.00 vs gpt-5.5 $0.202. Panel wall vs
+frontier: 1195s vs 105s (~11×).
 
 ## Efficiency notes (actionable)
 
@@ -43,6 +48,10 @@ Raw data lives in `consensus/runs/runs.jsonl`; tables regenerate via
    passes; panel only on contested ones.
 7. **Bigger battery (50+ tasks)** to make 12/14 vs 12/14 statistically
    distinguishable and to surface tasks where the panel diverges favorably.
+8. **Translation is the panel's cleanest regime** — 10/10 (100%) parity at
+   $0.00. The majority rescued 3 script-heavy tasks (ja/it/ru) where one
+   member failed. Voting clearly *helps* translation; add more languages and
+   longer texts (paragraphs, technical docs) to find the failure ceiling.
 
 ## Infrastructure
 

@@ -7,10 +7,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "consensus"))
 import report
 
 
-def _rec(task, agents, frontier_ok=None):
+def _rec(task, agents, frontier_ok=None, suite="code"):
     return {
         "task": task, "n": 3, "majority": sum(1 for a in agents if a["ok"]),
         "majority_ok": sum(1 for a in agents if a["ok"]) >= 2,
+        "suites": suite and [suite],
+        "suite": suite,
         "models": [a["model"] for a in agents],
         "agents": agents,
         "raw_frontier": {"ok": frontier_ok, "secs": 5, "charges": 0.04}
