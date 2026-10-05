@@ -20,6 +20,9 @@ already generated** — you just splice scenes and add visuals.
   + `S8b` ("Thank You, China." — 2.1s) + `S8c` (thanks + subscribe)
 - **The 3-second black + silent beat goes in the EDIT between S8 and S8b** —
   the schema and script both mark it. No audio in that gap (that's the joke).
+- **The audio lives locally in `video/audio/` and is git-ignored** — GitHub
+  rejects the mp3 binaries on push (RPC 400). It's fully regenerable with
+  `tts_make.py`, so nothing is lost by keeping it out of the repo.
 
 ## Regenerate audio (if you change the script)
 
