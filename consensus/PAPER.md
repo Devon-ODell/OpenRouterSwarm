@@ -1,5 +1,9 @@
 # Consensus-of-Agents: Can Three Small Free Models Match GPT-5.5?
 
+> "An old Army saying goes, 'How many watches do you need to tell the time
+> anywhere in the world? Three watches — because one is probably wrong, but
+> without the third you won't know which is right.'"
+
 **Working paper — OpenRouterSwarm project**
 *Status: benchmark-complete with tracked raw data. All numbers reproducible from `consensus/runs/runs.jsonl`. Now covers TWO suites: coding (14 tasks) and translation (10 tasks).*
 

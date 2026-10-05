@@ -1,5 +1,9 @@
 # Consensus-of-Agents — Findings & Improvement Log
 
+> "An old Army saying goes, 'How many watches do you need to tell the time
+> anywhere in the world? Three watches — because one is probably wrong, but
+> without the third you won't know which is right.'"
+
 Append-only log of what the benchmarks measure and what to try next.
 Raw data lives in `consensus/runs/runs.jsonl`; tables regenerate via
 `.venv/bin/python consensus/report.py`.
