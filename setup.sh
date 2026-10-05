@@ -57,7 +57,9 @@ fi
 # ---------------------------------------------------------------- 3b. commands
 mkdir -p "$HOME/.local/bin"
 printf '#!/bin/sh\nexec "%s" "%s/flint.py" "$@"\n' "$PY" "$ROOT" > "$HOME/.local/bin/flint"
-printf '#!/bin/sh\nexec "%s" "%s/swarm/swarmd.py" "$@"\n' "$PY" "$ROOT" > "$HOME/.local/bin/swarm"
+printf '#!/bin/sh\ncase "$1" in\n  vector) shift; exec "%s" "%s/swarm/vector_runner.py" "$@" ;;
+  *) exec "%s" "%s/swarm/swarmd.py" "$@" ;;
+esac\n' "$PY" "$ROOT" "$PY" "$ROOT" "$PY" "$ROOT" > "$HOME/.local/bin/swarm"
 chmod +x "$HOME/.local/bin/flint" "$HOME/.local/bin/swarm"
 if ! echo ":$PATH:" | grep -q ":$HOME/.local/bin:"; then
   for rc in "$HOME/.zshrc" "$HOME/.bash_profile"; do
@@ -87,6 +89,7 @@ cat <<EOF
 Done. Next:
   .venv/bin/python flint.py                     # or just: flint
   swarm grind ~/path/to/game --goal "..."        # start the swarm on a project
+  swarm vector run --task 2 --model dots-studio/dots-3-note-preview:free   # recursive bench
 In Cursor: 'Developer: Reload Window'. If you ever set 'Flint Swarm: Flint Path'
 to the old LingAI-Trader folder, clear it (or set it to $ROOT).
 EOF

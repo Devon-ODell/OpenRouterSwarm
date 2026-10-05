@@ -15,7 +15,7 @@
     "eventLog": {
       "enabled": true
     },
-    "inputStyle": "bordered",
+    "inputStyle": "plain",
     "loaderStyle": "spinner",
     "loaderText": "Thinking",
     "reasoning": false,

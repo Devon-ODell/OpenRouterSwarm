@@ -15,4 +15,6 @@ cursor-extension/*.vsix
 swarm/config.json
 swarm/configs/
 swarm/saber_history.sqlite
+# vector benchmark state (recursive decomposition ledger + loop artifacts)
+swarm/vector_state/
 *.command
