@@ -271,7 +271,7 @@ def split_prompt(task, goal, model, rounds, timeout, parent_results=None, node=N
     recursion measures the split's actual focus gain instead of trusting it.
     """
     hint = split_hint(task, parent_results or {}, node or {}) if node is not None else ""
-    prompt = ("You are the DECOMPOSER in a benchmark-driven engineering swarm. "
+    prompt = ("You are the DECOMPOSER in a benchmark-driven agent swarm. "
               "This task failed. Split it into 2 or 3 SMALLER subtasks that together achieve "
               "it. EVERY subtask must be a clear, fully-specified unit of work: it must state "
               "the exact file to touch, the exact behavior to implement, the inputs and "

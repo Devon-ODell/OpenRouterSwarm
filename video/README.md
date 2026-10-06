@@ -10,12 +10,12 @@ already generated** — you just splice scenes and add visuals.
 | `SCRIPT.md` | Full narration script (S1–S8), with tone + pacing + the 3s-blank ending |
 | `animation_schema.md` | Scene-by-scene visual directives (shot / text / motion / audio) |
 | `tts_make.py` | Text-to-speech generator (edge-tts, free, no key) |
-| `audio/scene_S*.mp3` | Per-scene narration clips (already rendered, `en-US-GuyNeural`) |
-| `audio/full.mp3` | The full concatenated track — **263.7s (4m24s)** |
+| `audio/scene_S*.mp3` | Per-scene narration clips (already rendered, `en-GB-RyanNeural`) |
+| `audio/full.mp3` | The full concatenated track (rendered, `en-GB-RyanNeural`) |
 
 ## The audio
 
-- Voice: `en-US-GuyNeural` (warm male storyteller, edge-tts neural)
+- Voice: `en-GB-RyanNeural` (deep British, dry documentary storyteller, edge-tts neural)
 - `full.mp3` = S1→S7 + S8 (ends "...which one's right. **Final Thoughts.**")
   + `S8b` ("Thank You, China." — 2.1s) + `S8c` (thanks + subscribe)
 - **The 3-second black + silent beat goes in the EDIT between S8 and S8b** —
@@ -32,7 +32,7 @@ already generated** — you just splice scenes and add visuals.
 # all scenes + full track
 .venv/bin/python video/tts_make.py
 # different voice
-.venv/bin/python video/tts_make.py --voice en-US-AriaNeural
+.venv/bin/python video/tts_make.py --voice en-GB-SoniaNeural
 ```
 
 Notes:

@@ -6,7 +6,7 @@ narration to audio/scene_S<n>.mp3 and a concatenated audio/full.mp3.
 Usage:
     .venv/bin/python video/tts_make.py            # render all scenes
     .venv/bin/python video/tts_make.py --scene S3 # one scene
-    .venv/bin/python video/tts_make.py --voice en-US-AriaNeural
+    .venv/bin/python video/tts_make.py --voice en-GB-SoniaNeural
 
 The narration text is defined inline below (mirrors video/SCRIPT.md). Per-scene
 duration is printed so the editor can sync the animation schema shot-by-shot.
@@ -24,7 +24,7 @@ import edge_tts
 ROOT = Path(__file__).resolve().parent
 AUDIO = ROOT / "audio"
 
-VOICE = "en-US-GuyNeural"   # warm, conversational storyteller
+VOICE = "en-GB-RyanNeural"  # deep British, dry-documentary storyteller
 RATE = "+0%"                # edge-tts rate; "+8%" feels a touch livelier
 VOLUME = "+0%"
 
@@ -65,24 +65,32 @@ SCENES = {
         "No expensive frontier model required."
     ),
     "S5": (
-        "And it's not just a theory — I benchmarked it against GPT-5.5. "
-        "On 24 real tasks — 14 coding, 10 translations into Spanish, French, Japanese, Arabic, you name it — "
-        "the three-model consensus scored 22 out of 24. "
-        "GPT-5.5? Also 22 out of 24. Same score. But here's the kicker: "
-        "the free panel cost me zero dollars. GPT-5.5: seventy-five cents — for the same result. "
-        "Translation was even cleaner: 10 out of 10, free. My best single free model actually beat GPT-5.5. "
-        "The only trade-off? It's slower — about ten times. "
+        "And it's not just theory — I benchmarked it against GPT-5.5, head to head. "
+        "Twenty-four real tasks: fourteen coding challenges, ten translations — "
+        "Japanese, Arabic, Hindi, Russian, you name it. "
+        "And every one is checked by a deterministic verifier, not an AI judge. "
+        "The code has to compile and pass real tests. "
+        "The translations have to match the ground truth, character for character. "
+        "The panel tied GPT-5.5 at twenty-two out of twenty-four — and cost me exactly zero dollars, "
+        "against roughly seventy-five cents for the same score from the frontier. "
+        "But the individual performances are the interesting part. "
+        "North-mini, the smallest model on the panel, went thirteen for fourteen on the coding suite — "
+        "one up on GPT-5.5, which missed two. My favourite moment: a task that read a JSON file of users "
+        "and had to return the active adults, sorted. North-mini nailed it in seven seconds — returned Alice. "
+        "GPT-5.5 failed that same task entirely, spending four cents trying. "
+        "Translations were the cleanest sweep: ten for ten, free. And not trivial ones. "
+        "A Japanese see you tomorrow. An Arabic peace be upon you. A Russian good luck with your exam. "
+        "On three of those — Japanese, Italian, Russian — one of the three free models actually failed. "
+        "Two agreed, the majority won, and the answer shipped. "
+        "The vote rescued exactly the tasks where a single free model stumbled. "
+        "That's the Army saying, working live. "
+        "The only trade-off is speed — about ten times slower than GPT-5.5. "
         "But you're not paying for speed, you're paying for answers. And these answers are free."
     ),
     "S6": (
-        "Ready to run it yourself? Here's the deploy, start to finish. "
-        "Step one — clone the repo and set up Python: git clone, then python -m venv dot-venv. "
-        "Step two — get a free OpenRouter API key and drop it in dot-env: OPENROUTER_API_KEY, sk-or-dot-dot-dot. "
-        "Step three — run the consensus benchmark: python consensus slash consensus_runner dot py, "
-        "dash-dash suite translation, dash-dash frontier-raw. "
-        "That fires three free models at every task, votes, and logs everything to runs dot jsonl — "
-        "your own reproducible receipts. "
-        "Step four — see the scoreboard: python consensus slash report dot py. "
+        "Everything I ran is open source, sitting in the repo. "
+        "Clone it, drop in a free API key, and one command reproduces every number you just saw. "
+        "Full setup and the exact commands are in the description below. "
         "Free. Local. Yours. No subscription."
     ),
     "S7": (

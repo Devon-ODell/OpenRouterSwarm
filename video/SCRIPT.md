@@ -1,13 +1,13 @@
 # YouTube Script — "We Built a Free ChatGPT Killer (3 Open-Source Models, Majority Vote)"
 
 **Format:** ~4–5 min explainer / build video
-**Voice:** edge-tts `en-US-GuyNeural` (warm, conversational, slight storyteller energy)
-**Pacing:** hook < 15s, lesson ~2min, deploy ~1.5min, ending ~20s
+**Voice:** edge-tts `en-GB-RyanNeural` (deep British, dry documentary storyteller)
+**Pacing:** hook < 30s, lesson ~1.5min, results ~2min, deploy ~25s, ending ~30s
 **Scenes:** S1…S8 — each maps to one animation shot in `animation_schema.md`.
 
 ---
 
-## S1 — HOOK (0:00–0:18)  [THE PRICE-HIKE BOMBSHELL]
+## S1 — HOOK (0:00–0:28)  [THE PRICE-HIKE BOMBSHELL]
 
 *Narration (energetic, a little indignant):*
 
@@ -23,7 +23,7 @@
 
 ---
 
-## S2 — THE ARMY SAYING (0:18–0:45)  [THE THESIS]
+## S2 — THE ARMY SAYING (0:28–0:52)  [THE THESIS]
 
 *Narration (slower, storyteller mode):*
 
@@ -37,7 +37,7 @@
 
 ---
 
-## S3 — THE PROBLEM: RISING TOKEN COSTS (0:45–1:30)  [THE STAKES]
+## S3 — THE PROBLEM: RISING TOKEN COSTS (0:52–1:26)  [THE STAKES]
 
 *Narration:*
 
@@ -53,7 +53,7 @@
 
 ---
 
-## S4 — THE LESSON: THREE HEADS BEAT ONE (1:30–2:20)  [TEACH THE "FIGHT BACK" MECHANISM]
+## S4 — THE LESSON: THREE HEADS BEAT ONE (1:26–2:04)  [TEACH THE "FIGHT BACK" MECHANISM]
 
 *Narration (teaching mode, confident):*
 
@@ -70,47 +70,58 @@
 
 ---
 
-## S5 — THE RESULTS: WHAT WE MEASURED (2:20–3:10)  [RECEIPTS]
+## S5 — THE RESULTS: WHAT WE MEASURED (2:04–4:00)  [RECEIPTS — THE ACTUAL TESTS]
 
-*Narration (proud, concrete):*
+*Narration (proud, concrete — each claim is a real logged run):*
 
-> "And it's not just a theory — I benchmarked it against **GPT-5.5**.
-> On 24 real tasks — 14 coding, 10 translations into Spanish, French, Japanese,
-> Arabic, you name it — the three-model consensus scored **22 out of 24**.
-> GPT-5.5? *Also* 22 out of 24. Same score. But here's the kicker:
-> the free panel cost me **zero dollars**. GPT-5.5: seventy-five *cents* — for
-> the same result.
-> Translation was even cleaner: **10 out of 10, free.** My best single free
-> model actually *beat* GPT-5.5. The only trade-off? It's slower — about ten
-> times. But you're not paying for speed, you're paying for answers. And these
-> answers are free."
+> "And it's not just theory — I benchmarked it against **GPT-5.5**, head to
+> head. Twenty-four real tasks: fourteen coding challenges, ten translations —
+> Japanese, Arabic, Hindi, Russian, you name it.
+> And every one is checked by a *deterministic* verifier, **not an AI judge**.
+> The code has to compile and pass real tests. The translations have to match
+> the ground truth, character for character.
+>
+> The panel tied GPT-5.5 at **twenty-two out of twenty-four** — and cost me
+> exactly **zero dollars**, against roughly **seventy-five cents** for the same
+> score from the frontier. But the individual performances are the interesting
+> part.
+>
+> North-mini, the smallest model on the panel, went **thirteen for fourteen**
+> on the coding suite — *one up* on GPT-5.5, which missed two. My favourite
+> moment: a task that read a JSON file of users and had to return the **active
+> adults, sorted**. North-mini nailed it in **seven seconds** — returned
+> Alice. **GPT-5.5 failed that same task entirely**, spending four cents
+> trying.
+>
+> Translations were the cleanest sweep: **ten for ten, free**. And not trivial
+> ones. A Japanese *see you tomorrow*. An Arabic *peace be upon you*. A Russian
+> *good luck with your exam*. On three of those — Japanese, Italian, Russian —
+> one of the three free models actually *failed*. Two agreed, the majority won,
+> and the answer shipped. The vote rescued exactly the tasks where a single
+> free model stumbled. That's the Army saying, working live.
+>
+> The only trade-off is speed — about **ten times** slower than GPT-5.5. But
+> you're not paying for speed, you're paying for answers. And these answers
+> are free."
 
-*On-screen: side-by-side bar chart — accuracy matches, cost $0.00 vs $0.75, "10x slower" note.*
+*On-screen: side-by-side bar chart (22/24 vs 22/24, $0.00 vs $0.75); zoom into the JSON users task — north-mini ✓ in 7s vs GPT-5.5 ✗; then flash translation cards ("See you tomorrow." → また明日。 / "Peace be upon you." → السلام عليكم / "Good luck with your exam." → Удачи на экзамене.) with a "2 agree → shipped" tick on the rescued ones.*
 
 ---
 
-## S6 — HOW TO DEPLOY IT (3:10–4:00)  [THE WALKTHROUGH]
+## S6 — HOW TO RUN IT (4:00–4:21)  [THE WALKTHROUGH, LEAN]
 
-*Narration (step-by-step, encouraging):*
+*Narration (quick, confident):*
 
-> "Ready to run it yourself? Here's the deploy, start to finish.
-> **Step one** — clone the repo and set up Python:
-> `git clone <repo> && cd OpenRouterSwarm && python -m venv .venv`
-> **Step two** — get a free OpenRouter API key and drop it in `.env`:
-> `OPENROUTER_API_KEY=sk-or-...`
-> **Step three** — run the consensus benchmark:
-> `.venv/bin/python consensus/consensus_runner.py --suite translation --frontier-raw`
-> That fires three free models at every task, votes, and logs everything to
-> `runs.jsonl` — your own reproducible receipts.
-> **Step four** — see the scoreboard:
-> `.venv/bin/python consensus/report.py`
+> "Everything I ran is open source, sitting in the repo. Clone it, drop in a
+> free API key, and **one command reproduces every number you just saw**.
+> Full setup and the exact commands are in the description below.
 > Free. Local. Yours. No subscription."
 
-*On-screen: type the commands in real time, terminal-style; cut to the jsonl log table.*
+*On-screen: repo card + one command line, then a soft cut to the runs table. Full instructions live in the video description.*
 
 ---
 
-## S7 — WHY THIS MATTERS (4:00–4:25)  [THE BIGGER PICTURE]
+## S7 — WHY THIS MATTERS (4:21–4:42)  [THE BIGGER PICTURE]
 
 *Narration (grounded, sincere):*
 
@@ -124,7 +135,7 @@
 
 ---
 
-## S8 — ENDING (4:25–4:50)  [FINAL THOUGHTS + THE JOKE]
+## S8 — ENDING (4:42–5:09)  [FINAL THOUGHTS + THE JOKE]
 
 *Narration (warm, then the beat):*
 
@@ -147,9 +158,12 @@
 
 ## Production notes
 
-- Total narration ≈ 4 min 45 s; with beats/pauses the video lands ~5 min.
+- Total narration ≈ 5 min (309.5s rendered); with the 3s beat the video lands ~5m12s.
 - Tone: indignant → conspiratorial-fun → teacher → proud → sincere → wry.
 - The 3-second blank before "Thank You China" is the comedic beat — keep the
   silence absolute (no background music) for maximum deadpan.
 - All numbers come from `consensus/runs/runs.jsonl` (24 tasks, 22/24 each,
-  $0.00 vs $0.75, translation 10/10).
+  $0.00 vs $0.747, translation 10/10, north-mini 13/14 coding vs GPT-5.5 12/14,
+  json-filter: north-mini pass in 7s vs GPT-5.5 fail, vote rescued
+  tr-en-ja/it/ru). The deterministic verifiers are real — code compiles + runs,
+  translations are exact character matches.

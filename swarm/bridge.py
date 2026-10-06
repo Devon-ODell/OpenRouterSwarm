@@ -228,26 +228,30 @@ def selection_context(repo, file=None, start=None, end=None, selection_file=None
 
 # ------------------------------------------------------------------ ask
 
-ASK = """You are one of several independent models a developer asked about their code in Cursor.
-Answer on your own merits; the answers will be compared.
+ASK = """You are one of several independent models a developer asked a question about their work in Cursor.
+Answer on your own merits; the answers will be compared. The question may be about code or about the
+project's docs, copy, data or meaning — answer whatever it actually asks.
 
 QUESTION
 {question}
 {context}
 You are in the repository root and can read files (read_file, list_files, search) to check
-surrounding code before answering; do it rather than guessing.{study}
+surrounding code or material before answering; do it rather than guessing.{study}
 
 Be concrete: cite file:line for claims about the code, show corrected code when you find a bug,
-and when a technique comes from the MIT material, name the course and lecture. If you are unsure,
-say what would settle it. Keep the answer under 300 words unless code is needed."""
+and when a technique comes from the MIT material, name the course and lecture. For non-code
+questions, answer directly and usefully in the person's language, and use the code only when it
+is the subject. If you are unsure, say what would settle it. Keep the answer under 300 words
+unless code is needed."""
 
 STUDY_HINT = ("\nA `study` tool searches MIT OpenCourseWare lecture cards and source pages "
               "(algorithms, Python, machine learning, probability, finance, economics...). Use it "
               "when a known algorithm, data structure or model applies, then read_file the source "
               "page it cites before relying on it.")
 
-SYNTH = """Several models answered a developer's question about their code. Write the single best
-answer for the developer.
+SYNTH = """Several models answered a developer's question about their work in Cursor. Write the single best
+answer for the developer. The question may be about code or about the project's docs, copy, data or
+meaning; serve whichever it asks, and keep claims in the person's language.
 
 QUESTION
 {question}
@@ -255,7 +259,7 @@ QUESTION
 ANSWERS
 {answers}
 
-Check the claims that matter against the code with read_file before keeping them. Keep what is
+Check the claims that matter against the code or material with read_file before keeping them. Keep what is
 correct and useful, drop what is wrong (say briefly why), and point out real disagreements.
 Credit the model behind each key point in brackets, e.g. [qwen/qwen3.8-27b:free]. Under 300 words
 unless code is needed."""

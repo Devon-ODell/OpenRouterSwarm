@@ -247,9 +247,11 @@ class Attempt:
         ]) + "\n")
 
 
-REVIEW = """You are an independent code reviewer. Inspect files; do not modify them.
-Assess the change against the contract and the actual test evidence. Read full
-files when the diff is truncated. Do not approve solely because tests passed.
+REVIEW = """You are an independent reviewer. Inspect files; do not modify them.
+Assess the change against the contract and the actual evidence. Read full
+files when the diff is truncated. Do not approve solely because the checks passed.
+The artifact may be code, writing, translation, data or research: judge it against
+what the task asked for, whatever kind of artifact that is, with concrete findings.
 Find concrete defects and explain how the implementer can reproduce each one.
 
 CONTRACT

@@ -1,0 +1,3 @@
+[submodule "nvim-strudel"]
+	path = nvim-strudel
+	url = https://github.com/Goshujinsama/nvim-strudel.git

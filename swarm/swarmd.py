@@ -2172,7 +2172,9 @@ def persona_text(name, c):
     return text
 
 
-ARCHITECT = """You are the ARCHITECT in an engineering swarm.
+ARCHITECT = """You are the ARCHITECT in an agent swarm. The task below may be code, writing,
+translation, data or research; design whatever structure its own substance needs — files, sections,
+plans, schemas, source/target pairs — not just code modules.
 
 PROJECT GOAL
 {goal}
@@ -2201,7 +2203,9 @@ Do NOT write implementation code. Do NOT edit any file. Keep the spec under
 # The order is deliberate. A model attends most to the end of a long prompt, so the task's own
 # contract, rules and acceptance criteria go last; the goal and the reference material, which
 # were previously the freshest text in a 16.6 KB prompt, come first.
-IMPLEMENTER = """You are the IMPLEMENTER in an engineering swarm.
+IMPLEMENTER = """You are the IMPLEMENTER in an agent swarm. The task may be code, writing,
+translation, data or research — produce whatever artifact it asks for and verify it the way the
+supervisor can check (tests, exact file content, or the configured checks).
 YOUR TASK: {title}
 
 PROJECT GOAL
@@ -2242,7 +2246,9 @@ criteria are what the reviewer will check:
 When done, print a summary under 150 words: what you changed and the final
 result of `{test_cmd}`."""
 
-ADVERSARY = """You are the ADVERSARY in an engineering swarm.
+ADVERSARY = """You are the ADVERSARY in an agent swarm. The change below may be code, writing,
+translation, data or research; judge it against what the task actually asked for, whatever kind of
+artifact that is, and prove real defects with a failing test when it is code.
 Another agent just wrote this change. Your job is to find what is wrong with it,
 not to be agreeable.
 
@@ -2270,8 +2276,8 @@ Do not approve merely because the suite is green — the suite is what you are
 auditing. Do not rewrite the implementation or commit changes.
 Your final response must be exactly one line starting APPROVE: or REJECT:."""
 
-JUDGE = """You are the JUDGE for an autonomous engineering swarm. The change below
-already passed the test suite and an adversarial reviewer and has landed. Score
+JUDGE = """You are the JUDGE for an autonomous agent swarm. The change below
+already passed the supervisor's checks and an adversarial reviewer and has landed. Score
 it so the swarm learns which agents and ideas to reinforce.
 
 PROJECT GOAL
@@ -2312,7 +2318,9 @@ serves none of them. Judge honestly: useful work that serves nothing on this
 list is still 0.
 """
 
-PLANNER = """You are the PLANNER for an autonomous engineering swarm that works around the clock.
+PLANNER = """You are the PLANNER for an autonomous agent swarm that works around the clock.
+
+The goal below may ask for software, content, analysis, translations, or everyday work — take it as written, whatever it is. A task does not have to be code to be worth proposing: documentation, copy, translations, data and research belong in the queue too, provided each lands as a concrete, verifiable artifact.
 
 PROJECT GOAL
 {goal}
@@ -2358,10 +2366,14 @@ PLANNER_SERVES = """- Every task must serve one of the goal's numbered prioritie
   it is where nothing has landed.
 """
 
-DECOMPOSER = """You are the DECOMPOSER in an engineering swarm. This task timed out or failed repeatedly.
+DECOMPOSER = """You are the DECOMPOSER in an agent swarm. This task timed out or failed repeatedly.
 Split it into 2 or 3 smaller tasks that together achieve it, each small enough
 to succeed as a verified increment. Subtasks execute in array order: each depends
 on the preceding subtask landing successfully. Do not assume unlanded work exists.
+
+The task may be code, writing, translation, data or research — split it into whatever
+units its own substance suggests, not just code units. A language or content task
+splits into sections, documents, or source/target pairs rather than functions.
 
 PROJECT GOAL
 {goal}
@@ -4337,13 +4349,68 @@ def sync_usage(info):
         import flint as F
         F.Throttle()._txn(lambda d: d.update(count=max(d.get("count", 0), used)))
 
-
 def allowance_recheck(c):
     """Seconds between asking OpenRouter whether a spent free allowance is back; 0 or unset is off."""
     try:
         return max(0, int(c.get("allowance_recheck") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def resync_allowance(c, budget):
+    """Full allowance reconciliation at a run boundary, unconditionally, once.
+
+    The local counter only climbs between UTC midnights: flint counts every request it
+    starts, including failed ones OpenRouter never charged, and failed requests that were
+    charged by the provider can make the local count exceed what OpenRouter reports used.
+    A stale local counter is the one thing that can freeze the swarm while free capacity
+    exists: `allowance_recheck` only engages once the budget already looks spent and at its
+    own throttled interval, so on startup the swarm can stall — or jump to paid models — for
+    a number this key's owner never actually used. This is the startup / per-`swarm run`
+    sync: the provider's daily free-request counter is authoritative, and it is applied
+    once (no rate limiting, no budget gate) so every later check starts from a honest count.
+
+    Returns True when the resync made a change (count corrected or a daily-cap block
+    lifted), False when the provider was unreachable or already agreed with the local
+    counter."""
+    info = account()
+    q = (info or {}).get("free_model_daily_requests") or {}
+    used, limit = q.get("used"), q.get("limit")
+    if not isinstance(used, int):
+        log("allowance resync: could not read OpenRouter's free-request counter; "
+            "keeping the local count")
+        return False
+    import flint as F
+
+    def step(d):
+        changed = False
+        before = d.get("count", 0)
+        # The provider is authoritative when the local counter has climbed above it —
+        # flint counts failed requests the provider never charged, and that overshoot is
+        # the stall this resync exists to undo. Never *raise* the local count to meet a
+        # provider number *higher* than ours: requests made elsewhere with this key are
+        # already adopted by `sync_usage`'s max, and a wrong read must not shorten the day.
+        if used < before:
+            d["count"] = used
+            changed = True
+        block_lifted = bool(d.get("blocked_until")) and isinstance(limit, int) and used < limit
+        if block_lifted:
+            d.pop("blocked_until", None)
+            changed = True
+        return changed, before, int(d.get("count", before)), block_lifted
+
+    try:
+        changed, before, after, block_lifted = F.Throttle()._txn(step)
+    except Exception as e:
+        log(f"allowance resync: could not write the local counter ({type(e).__name__}: {e}); "
+            "keeping the local count")
+        return False
+    if changed:
+        log(f"allowance resync: OpenRouter reports {used}/{limit} free requests used today "
+            f"(local count was {before}); free turns run under the provider's number")
+        journal("allowance_resynced", used=used, limit=limit, counted_before=before,
+                counted_after=after, block_lifted=block_lifted)
+    return changed
 
 
 def recheck_allowance(c, budget):
@@ -5102,14 +5169,16 @@ def run_daemon(c, max_tasks=None, hours=None):
     log(f"swarm up — repo={repo.name} trunk={trunk_name(c)} workers={c['workers']}")
     log(f"config: {CONFIG} ({config_kind()})")
     log(json.dumps(budget.snapshot()))
+    # A stale local counter is the one thing that can stall the swarm on startup or push
+    # every turn to a paid model: flint counts failed requests the provider never charged,
+    # and the count survives restarts. OpenRouter's daily free-request counter is the
+    # truth, so reconcile it now, once, before any turn is routed (work order §12).
+    resync_allowance(c, budget)
     # Rests persist in learn.json across runs; say so, or a fresh start looks stuck.
     live = set(pool(c))
     for model, until, why in ledger.resting():
         if model in live:
             log(f"{model} is resting until {dt.datetime.fromtimestamp(until):%H:%M:%S} ({why[:120]})")
-    # A count left over from before the restart can say the allowance is spent when
-    # OpenRouter says otherwise; settle that before the first turn is routed.
-    recheck_allowance(c, budget)
 
     _cfg_seen["mtime"] = config_mtime()     # so the first check is a real change, not this one
     source = source_fingerprint()

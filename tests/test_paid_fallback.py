@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -780,6 +781,145 @@ class AllowanceRecheckTests(unittest.TestCase):
         self.assertNotIn("poolside/laguna-s-2.1", cmds[0])
         rows = [json.loads(l) for l in (swarmd.STATE / "journal.jsonl").read_text().splitlines()]
         self.assertEqual([r for r in rows if r["event"] == "paid_fallback"], [])
+
+
+class ResyncAllowanceTests(unittest.TestCase):
+    """The startup / per-`swarm run` full allowance reconciliation.
+
+    `resync_allowance` runs unconditionally at every run boundary, before any turn is
+    routed, so a stale local counter cannot stall the swarm or push it onto paid models.
+    Unlike `recheck_allowance` it is not gated on the budget already looking spent and is
+    not rate-limited: the provider's daily free-request number is applied once, up front.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path as P
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        root = P(self.dir.name)
+        for name in ("flint", "state", "logs"):
+            (root / name).mkdir()
+        self.requests = root / "flint" / "requests.json"
+        budget_module = sys.modules[swarmd.Budget.__module__]
+        for target, name, value in ((flint, "STATE_DIR", root / "flint"),
+                                    (budget_module, "REQUESTS_JSON", self.requests),
+                                    (swarmd, "STATE", root / "state"), (swarmd, "LOGS", root / "logs")):
+            pt = patch.object(target, name, value)
+            pt.start()
+            self.addCleanup(pt.stop)
+        self.logged = []
+        p = patch.object(swarmd, "log", lambda msg, *a, **k: self.logged.append(msg))
+        p.start()
+        self.addCleanup(p.stop)
+        self.asked = 0
+        self.reply = None
+        pt = patch.object(swarmd, "account", self.fake_account)
+        pt.start()
+        self.addCleanup(pt.stop)
+
+    def fake_account(self):
+        self.asked += 1
+        return self.reply
+
+    def counted(self, count, **extra):
+        self.requests.write_text(json.dumps({"day": UTC_TODAY, "count": count, **extra}))
+
+    def openrouter(self, used, limit=1000):
+        self.reply = {"free_model_daily_requests": {"used": used, "limit": limit,
+                                                    "remaining": max(0, limit - used)}}
+
+    def state(self):
+        return json.loads(self.requests.read_text())
+
+    def journal(self):
+        path = swarmd.STATE / "journal.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_a_stale_high_local_counter_is_corrected_at_startup(self):
+        # The exact stall: local sidecars counted 1025 (mostly failed requests the provider
+        # never charged) while OpenRouter reports 964 used. Without the resync every free
+        # turn would be refused and the swarm would sit on paid models.
+        self.counted(1025)
+        self.openrouter(964)
+        self.assertTrue(swarmd.resync_allowance({}, swarmd.Budget(cap=1000, reserve=0)))
+        self.assertEqual(self.state()["count"], 964)
+        self.assertTrue(swarmd.Budget(cap=1000, reserve=0).check()[0], "free turns can run")
+        rows = self.journal()
+        self.assertEqual([(r["used"], r["counted_before"], r["counted_after"]) for r in rows
+                          if r["event"] == "allowance_resynced"], [(964, 1025, 964)])
+
+    def test_a_stale_daily_cap_block_is_lifted(self):
+        self.counted(40, blocked_until=time.time() + 6 * 3600)
+        self.openrouter(40)
+        self.assertTrue(swarmd.resync_allowance({}, swarmd.Budget(cap=1000, reserve=0)))
+        self.assertNotIn("blocked_until", self.state())
+        self.assertTrue(swarmd.Budget(cap=1000, reserve=0).check()[0])
+
+    def test_a_provider_not_at_the_limit_does_not_raise_the_local_count(self):
+        # The provider counter can be higher than ours when other processes used the key.
+        # That direction is `sync_usage`'s business (max). Resync must never inflate the
+        # local count from a possibly-wrong read and shorten the day for no reason.
+        self.counted(10)
+        self.openrouter(20)
+        self.assertFalse(swarmd.resync_allowance({}, swarmd.Budget(cap=1000, reserve=0)))
+        self.assertEqual(self.state()["count"], 10)
+        self.assertEqual(self.asked, 1)
+
+    def test_the_resync_runs_once_no_matter_how_often_called(self):
+        self.counted(1025)
+        self.openrouter(964)
+        b = swarmd.Budget(cap=1000, reserve=0)
+        self.assertTrue(swarmd.resync_allowance({}, b))
+        self.assertFalse(swarmd.resync_allowance({}, b), "already agreed; nothing to change")
+        self.assertEqual(self.state()["count"], 964)
+        # the second call still reads the provider once (it is not rate-limited), but the
+        # point is it never *re-inflates*: the day's count stays the provider's.
+        self.assertEqual(self.asked, 2)
+
+    def test_an_unreachable_openrouter_leaves_the_local_counter_alone(self):
+        self.counted(1025)
+        self.reply = None
+        self.assertFalse(swarmd.resync_allowance({}, swarmd.Budget(cap=1000, reserve=0)))
+        self.assertEqual(self.state()["count"], 1025)
+
+    def test_run_daemon_resyncs_before_any_turn(self):
+        """A daemon that starts with a stale local counter starts working free, not paid.
+
+        The integration point is the very top of `run_daemon` (which `swarm run` and
+        `swarm grind` both reach). Patch `account` and `_stop` to be already set, so
+        `run_daemon` performs the resync and falls out of its loop immediately instead of
+        driving workers."""
+        self.counted(1025)
+        self.openrouter(964)
+
+        def fake_import_bugs(*a, **k):
+            return []
+
+        class FakeWorker:
+            def __init__(self, *a, **k):
+                pass
+            def start(self):
+                pass
+            def is_alive(self):
+                return False
+            def join(self, timeout=None):
+                pass
+
+        with patch.object(swarmd, "import_bugs", fake_import_bugs), \
+             patch.object(swarmd, "Worker", FakeWorker), \
+             patch.object(swarmd, "_stop", threading.Event()):
+            swarmd._stop.set()               # only a bounded pass: resync, then stop
+            swarmd.run_daemon({"repo": str(self.dir),
+                               "workers": 1, "test_cmd": "true",
+                               "models": ["a:free"],
+                               "daily_cap": 1000, "reserve": 0,
+                               "owner_window": ["00:00", "00:00"]},
+                              max_tasks=1)
+        self.assertEqual(self.state()["count"], 964)
+        rows = self.journal()
+        self.assertEqual([r["event"] for r in rows if r["event"] == "allowance_resynced"],
+                         ["allowance_resynced"])
 
 
 class QuotaPauseTests(unittest.TestCase):
