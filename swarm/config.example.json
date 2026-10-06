@@ -83,5 +83,11 @@
     "adversary": 300,
     "judge": 300,
     "decomposer": 300
+  },
+  "prov": {
+    "_comment": "Provisioning hooks the swarm runs in each fresh worktree before the test gate, so a bare checkout (fresh codespace, new laptop) reaches green without hand setup. Hooks run unsandboxed (they must install deps) but only in temp + package-cache writable dirs. `swarm init <repo>` writes configs/<slug>.json with a prov block filling in any of these that apply. Each hook runs exactly once per worktree, in list order; a failing hook fails the attempt with its output.",
+    "hooks": [],
+    "env": {},
+    "timeout": 1200
   }
 }

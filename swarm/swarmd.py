@@ -2560,6 +2560,73 @@ def trunk_locked():
         yield
 
 
+# ------------------------------------------------------------------ provisioning
+#
+# A fresh git worktree contains exactly the files git tracks: no node_modules/, no .venv,
+# no vendored deps, no nested-repo content. A test gate that needs any of those fails on
+# a bare checkout before a single model request, which is how the dj-bot swarm spent its
+# whole shift red-baselined with "Cannot find package '@strudel/core'" and "every task
+# would be rejected". The `prov` config block fixes that: it is a list of shell hooks the
+# swarm runs inside each fresh worktree (and the _view) before the gate, so a checkout in
+# a new codespace or on a new laptop reaches green by itself.
+
+
+def prov_block(c):
+    """The provisioning section of the live config, normalised."""
+    p = c.get("prov") or {}
+    if isinstance(p, list):
+        p = {"hooks": [h for h in p if isinstance(h, str)]}
+    elif not isinstance(p, dict):
+        return {"hooks": [], "env": {}, "timeout": 1200}
+    hooks = [h for h in p.get("hooks") or [] if isinstance(h, str) and h.strip()]
+    env = {k: str(v) for k, v in (p.get("env") or {}).items() if v is not None}
+    return {"hooks": hooks, "env": env, "timeout": int(p.get("timeout", 1200) or 1200)}
+
+
+def run_prov_hooks(c, wd, label, env_extra=None, log_on_ok=False):
+    """Run every provisioning hook in `wd` (a fresh worktree or the _view).
+
+    Hooks are allowed to write anywhere: provisioning must install packages, which the
+    sandbox would refuse, so it runs unsandboxed. The only thing we guarantee is that a
+    hook that fails stops the attempt with its output attached (so the agent never sees a
+    red gate it cannot explain) and that hook output is attributed to `label` in the log.
+    Returns (ok, output). Never raises for a failing hook.
+    """
+    prov = prov_block(c)
+    if not prov["hooks"]:
+        return True, ""
+    env = {**os.environ, **prov["env"]}
+    if env_extra:
+        env.update(env_extra)
+    out = []
+    for i, hook in enumerate(prov["hooks"], 1):
+        log(f"prov [{label}] hook {i}/{len(prov['hooks'])}: {hook[:140]}")
+        try:
+            rc, o = sh(hook, cwd=str(wd), timeout=prov["timeout"], env=env)
+        except Exception as e:
+            out.append(f"[hook {i}] {hook[:140]}\n{type(e).__name__}: {e}")
+            log(f"prov [{label}] hook {i} raised {type(e).__name__}: {e}")
+            return False, "\n".join(out)[-4000:]
+        out.append(f"[hook {i}] exit {rc}: {hook[:140]}\n{o}".strip())
+        if rc != 0:
+            log(f"prov [{label}] hook {i} failed (exit {rc})")
+            return False, "\n".join(out)[-4000:]
+        if log_on_ok:
+            log(f"prov [{label}] hook {i} ok")
+    return True, "\n".join(out)[-4000:]
+
+
+def run_gate_with_prov(c, wd, label):
+    """Provision `wd`, then run its gate. Packaging deps into every worktree is exactly
+    what a pre-flight baseline is for, so this is the one gate runner that provisions
+    first. Returns (ok, output) like run_gate. If there is nothing to provision this is
+    exactly run_gate — the gate itself is what decides whether `wd` is real."""
+    ok, out = run_prov_hooks(c, wd, label, log_on_ok=True)
+    if not ok:
+        return False, f"provisioning failed:\n{out}"
+    return run_gate(wd, c)
+
+
 def ensure_trunk(c):
     t = trunk_name(c)
     with trunk_locked():
@@ -2592,6 +2659,23 @@ def refresh_view(c):
         view.parent.mkdir(parents=True, exist_ok=True)
         git(["worktree", "add", "--detach", str(view), trunk_name(c)], cwd=c["repo"], check=True)
     return view
+
+
+def refresh_view_prov(c):
+    """The fully-provisioned _view: the bare checkout plus its provisioning hooks, with a
+    note when a hook changed files so the planner's first look at the tree is accurate.
+    """
+    view = refresh_view(c)
+    if prov_block(c)["hooks"]:
+        ok, out = run_prov_hooks(c, view, "view")
+        if not ok:
+            log(f"_view provisioning failed:\n{out}")
+    return view
+
+
+def sync_refresh_view(c):
+    """The reader for sync_trunk; never needs provisioning (deps cannot affect a merge)."""
+    return refresh_view(c)
 
 
 def sync_trunk(c):
@@ -3232,7 +3316,12 @@ class Worker(threading.Thread):
             config = dict(self.c, test_cmd=command, _gate_log=str(self.evidence.path / name))
             started = time.monotonic()
             try:
-                ok, output = run_gate(self.wt, config)
+                if i == 0 and label != "baseline":
+                    # The first gate of a fresh attempt runs in a bare worktree: install its
+                    # deps first, or a missing node_modules/ fails every gate and every repair.
+                    ok, output = run_gate_with_prov(self.c, self.wt, "attempt")
+                else:
+                    ok, output = run_gate(self.wt, config)
             except subprocess.TimeoutExpired:
                 ok, output = False, "verification command timed out"
                 Path(config["_gate_log"]).write_text(f"command: {command}\n{output}\n")
@@ -4504,7 +4593,7 @@ KNOWN_KEYS = frozenset({
     "restart_on_change", "restart_min_interval", "role_models",
     "scope_gate", "idle_improvement", "idle_improvement_cooldown", "max_review_formats",
     "task_request_cap", "run_request_cap", "max_role_calls",
-    "keep_attempts", "execution_class", "auto_plan", "_comment"})
+    "keep_attempts", "execution_class", "auto_plan", "prov", "_comment"})
 # Seconds a round of tool use really takes on these models, from the studio's own turns.
 SECONDS_PER_ROUND = 47
 
@@ -4621,10 +4710,14 @@ def preflight(c):
         log(f"baseline: cached pass for {trunk_name(c)} at {head[:12]}")
         return
     with _view_lock:
-        view = refresh_view(c)
-        ok, output = run_gate(view, c)
+        view = refresh_view_prov(c)
+        ok, output = run_gate_with_prov(c, view, "view")
     baseline_cache(key, passed=ok)
     if not ok:
+        if "provisioning failed:" in output:
+            sys.exit("provisioning failed before the gate could run. `swarm init <repo>` can "
+                     "write the hooks this repository needs; `swarm init --check <repo>` shows "
+                     f"what it would run.\n{output[-1500:]}")
         sys.exit(f"`{c['test_cmd']}` fails on {trunk_name(c)} before any work, so every task "
                  f"would be rejected. Fix the tests or pass --test-cmd."
                  f"{why_unrunnable(c['test_cmd'])}{other_test_cmds(c['repo'], c['test_cmd'])}"
@@ -5313,6 +5406,226 @@ def cmd_grind(a):
     start(c, hours=a.hours, max_tasks=a.max_tasks, awake=True)
 
 
+# ------------------------------------------------------------------ surroundings (swarm init)
+
+# Repository shapes that tell `swarm init` what a bare worktree will be missing and therefore
+# what provisioning hooks it needs. Keyed by marker file; `name` is shown to the human.
+RUNTIME_MARKERS = [
+    ("requirements.txt", "python deps"),
+    ("pyproject.toml", "python deps"),
+    ("Pipfile", "python deps"),
+    ("package.json", "node deps"),
+    ("Gemfile", "ruby deps"),
+    ("go.mod", "go deps"),
+    ("Cargo.toml", "rust deps"),
+    ("build.gradle", "gradle deps"),
+    ("pom.xml", "maven deps"),
+    ("composer.json", "php deps"),
+    ("mix.exs", "elixir deps"),
+]
+
+# Marker -> proven installer command for a bare checkout. Verified against the dj-bot repo,
+# whose postinstall writes a fix-ups shim that a fresh npm ci needs in place before `npm run
+# check` can resolve "@strudel/core".
+PROV_RECIPES = [
+    (("package.json",), "npm ci --silent --no-audit --no-fund"),
+    (("requirements.txt", "pyproject.toml", "Pipfile"),
+     "python3 -m venv .venv && .venv/bin/python -m pip install -q -r requirements.txt"),
+    (("Gemfile",), "bundle install"),
+    (("go.mod",), "go moddownload"),
+    (("Cargo.toml",), "cargo build"),
+    (("build.gradle", "pom.xml"), "mvn -q -DskipTests dependency:go-offline"),
+    (("composer.json",), "composer install --quiet"),
+    (("mix.exs",), "mix deps.get"),
+]
+
+
+def probe_surroundings(repo):
+    """A machine-readable snapshot of what a bare worktree of `repo` will lack.
+
+    Returns {"nested": [...], "runtime": {"python": bool, "node": bool, ...},
+    "venv": bool, "node_modules": bool, "gitignore": [...]}. Language markers are
+    searched one level deep as well as at the top: several swarm targets keep their whole
+    project (package.json, requirements.txt) under a subdirectory like `spike/` or
+    `server/`, and a bare worktree loses `node_modules/` wherever it lives. This is what
+    `swarm init` drops next to its tuned config, and what the baseline gate reads to fail
+    fast when the gate needs something no prov hook installs."""
+    repo = Path(repo)
+    one_deep = [p for p in repo.iterdir() if p.is_dir() and not p.name.startswith(".")
+                and not (p / ".git").exists()]
+    nested = [d.name for d in sorted(p for p in repo.iterdir() if p.is_dir() and (p / ".git").exists())]
+    gitignore = []
+    gi = repo / ".gitignore"
+    if gi.is_file():
+        for line in gi.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                gitignore.append(line)
+    # The marker file exists if it is at the top level OR one level down in any subdir.
+    deps = {}
+    subdirs = {}
+    for name, _ in RUNTIME_MARKERS:
+        deps[name] = (repo / name).is_file() or any((d / name).is_file() for d in one_deep)
+        if deps[name] and not (repo / name).is_file():
+            subdirs[name] = next(d.name for d in one_deep if (d / name).is_file())
+    node_modules = (repo / "node_modules").exists() or any(
+        (d / "node_modules").exists() for d in one_deep)
+    return {
+        "nested": nested,
+        "runtime": deps,
+        "subdirs": subdirs,
+        "venv": (repo / ".venv").exists(),
+        "node_modules": node_modules,
+        "gitignore": gitignore,
+    }
+
+
+def build_prov_block(s, test_cmd):
+    """The prov hooks a fresh worktree needs, from the surroundings probe.
+
+    Two sources: the language markers (requiring an install that the test command itself
+    may not perform), and the nested repositories listed by the probe (each one is absent
+    from a bare worktree and must be bootstrapped by a hook). If the test command already
+    runs the same install (an npm ci before npm run check, say), that recipe is skipped —
+    the hook list stays minimal and idempotent. Skip tokens are per-language so an "npm
+    ci" gate does not suppress the python-requirements hook and vice versa."""
+    # A recipe is skipped when the gate already performs that language's install.
+    # Keyed by marker file so "npm ci ..." in the gate skips the npm marker without
+    # touching the python one, and vice versa.
+    SKIP_HINTS = {
+        "package.json": ("ci", "install"),
+        # Only skip the venv recipe when the gate itself *creates* the venv. Merely
+        # referencing .venv/bin/python in the gate is a consumer, not an installer —
+        # dj-bot's gate runs `.venv/bin/python -m pytest` yet has no .venv in a fresh
+        # worktree, and skipping here is exactly the red-baseline bug this fixes.
+        "requirements.txt": ("python3 -m venv", "python -m venv"),
+        "pyproject.toml": ("python3 -m venv", "python -m venv"),
+        "Pipfile": ("python3 -m venv", "python -m venv"),
+        "Gemfile": ("bundle",),
+        "go.mod": ("go moddownload",),
+        "Cargo.toml": ("cargo",),
+        "build.gradle": ("mvn", "gradle"),
+        "pom.xml": ("mvn",),
+        "composer.json": ("composer",),
+        "mix.exs": ("mix deps",),
+    }
+    hooks, skipped = [], []
+    for markers, recipe in PROV_RECIPES:
+        if not any(s["runtime"].get(m) for m in markers):
+            continue
+        hints = tuple(h for m in markers for h in SKIP_HINTS.get(m, ()))
+        if any(h in test_cmd for h in hints):
+            skipped.append(markers[0])
+            continue
+        # A marker found one level down (dj-bot keeps spike/package.json + spike/node_modules)
+        # needs the recipe to run inside that subdirectory, or npm ci at the root has no
+        # manifest to install. Default is the repo root ("cd . && ..." is a no-op).
+        sub = s.get("subdirs", {}).get(markers[0], ".")
+        if sub == ".":
+            hooks.append(recipe)
+        else:
+            hooks.append(f"cd {shlex.quote(sub)} && {recipe}")
+        skipped.append(markers[0])
+    for name in s.get("nested", []):
+        hooks.append(f"git -C ./{name} clone . .. 2>/dev/null || true; ls ./{name} | grep -q . || echo 'nested {name} empty'")
+        skipped.append(f"nested {name}")
+    return {"hooks": hooks, "env": {}, "timeout": 1800, "_skipped": skipped}
+
+
+def render_surroundings(repo, slug, s, config_path, existing=None):
+    """A human-readable map of the repo's surroundings, to a string."""
+    lines = [f"repo:            {repo} ({git_branch(repo)})",
+             f"config:          {config_path}"]
+    if s.get("nested"):
+        lines.append(f"nested repos:    {', '.join(s['nested'])}  (absent from every worktree)")
+    runtime = [k for k, v in s.get("runtime", {}).items() if v]
+    lines.append("runtime deps:    " + (", ".join(runtime) if runtime else "none detected"))
+    if s.get("venv"):
+        lines.append("venv:            present (.venv)")
+    if s.get("node_modules"):
+        lines.append("node_modules:    present (not in git — fresh worktrees lack it)")
+    for marker, sub in sorted((s.get("subdirs") or {}).items()):
+        lines.append(f"{marker}:        under {sub}/ — installs must cd there (prov handles this)")
+    if s.get("gitignore"):
+        lines.append("gitignored:      " + ", ".join(sorted(s["gitignore"])[:8]))
+    if existing:
+        prov = existing.get("prov") or {}
+        lines.append(f"prov hooks:      {len(prov.get('hooks', []))} configured")
+        if prov.get("hooks"):
+            lines.append("  (re-run `swarm init <repo>` to refresh)")
+    return "\n".join(lines)
+
+
+def cmd_init(a):
+    """Write a tuned config for a repository, or report on one that already exists.
+
+    `swarm init <repo>` is the idempotent door into a repository for the first time: it runs
+    the same detection the harness uses, names nested repositories and runtime deps, writes
+    swarm/configs/<slug>.json with a `prov` block that a bare checkout can run, and then
+    verifies the gate actually turns green once provisioned — failing loudly before any model
+    work instead of waiting for a mid-shift red baseline. `--check` (or `-n`) prints the
+    same surroundings without writing a config.
+    """
+    if a.repo:
+        repo = Path(a.repo).expanduser().resolve()
+    elif (HERE / "config.json").exists() and load_cfg().get("repo"):
+        repo = Path(load_cfg()["repo"]).expanduser().resolve()
+    else:
+        sys.exit("no repository given: `swarm init <repo>` or `swarm init --check <repo>`")
+    slug = repo_slug(repo)
+    config_path = per_repo_config(repo)
+    config_dir = config_path.parent
+    config_dir.mkdir(parents=True, exist_ok=True)
+    if not (repo / ".git").exists():
+        sys.exit(f"{repo} needs a Git repository with at least one commit.\n  git init && git add -A && git commit -m baseline")
+    rc, _ = git(["rev-parse", "--verify", "-q", "HEAD"], cwd=str(repo))
+    if rc != 0:
+        sys.exit(f"{repo} needs at least one commit before a swarm can run on it.")
+
+    surroundings = probe_surroundings(repo)
+    if a.check:
+        print(render_surroundings(repo, slug, surroundings, config_path))
+        return
+
+    existing = json.loads(config_path.read_text()) if config_path.is_file() else None
+    if existing is not None and existing.get("repo") == str(repo):
+        # Idempotent: never overwrite a tuned file someone has edited.
+        print(render_surroundings(repo, slug, surroundings, config_path, existing=existing))
+        if existing.get("prov", {}).get("hooks"):
+            print("provisioning hooks already configured; nothing to write.")
+        return
+
+    test_cmd = detect_test_cmd(repo) or "python3 -m unittest discover -s tests -t . -q"
+    # The interpreter the swarm's own flint turns use; fall back to the running one rather
+    # than resolving a config that may not exist yet in a fresh checkout.
+    py = (HERE / ".venv" / "bin" / "python") if (HERE / ".venv" / "bin" / "python").is_file() else sys.executable
+    python = str(py)
+    c = {
+        "repo": str(repo),
+        "base_branch": git_branch(repo),
+        "trunk": "swarm/trunk",
+        "goal_file": "GOAL.md",
+        "test_cmd": test_cmd,
+        "python": python,
+        "workers": 1,
+        "daily_cap": 800,
+        "reserve": 200,
+        "prov": build_prov_block(surroundings, test_cmd),
+        "_comment": "Written by `swarm init`. Re-run `swarm init <repo>` to refresh the surroundings; edit the test gate, models or prov hooks freely.",
+    }
+    tmp = config_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(c, indent=2) + "\n")
+    tmp.replace(config_path)
+    print(render_surroundings(repo, slug, surroundings, config_path))
+    print(f"wrote {config_path}")
+    print("Next: `swarm grind <repo> --goal '...'` — the daemon provisions and verifies before any task.")
+
+
+def git_branch(repo):
+    rc, out = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(repo))
+    return out.strip() if rc == 0 and out.strip() and out.strip() != "HEAD" else "main"
+
+
 def cmd_run(a):
     if a.hours <= 0:
         sys.exit("--hours must be positive")
@@ -5612,6 +5925,12 @@ def main():
     run.add_argument("--workers", type=int)
     run.add_argument("--max-tasks", type=int)
     run.set_defaults(fn=cmd_run)
+    init = sub.add_parser("init", help="write a tuned config + prov hooks for a repository (see --check)")
+    init.add_argument("repo", nargs="?", help="target Git repository")
+    init.add_argument("-n", "--check", action="store_true",
+                      help="print the repository's surroundings (nested repos, runtime deps, "
+                           "venv, node_modules) without writing a config")
+    init.set_defaults(fn=cmd_init)
     st = sub.add_parser("status", help="what is running and where")
     st.add_argument("--repo", help="target Git repository (default: configured one)")
     st.set_defaults(fn=cmd_status)

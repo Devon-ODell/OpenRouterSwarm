@@ -172,6 +172,8 @@ below). `.venv/bin/python` is the interpreter. `swarm`/`flint` may also be on
 
 ```sh
 # Start / stop / status
+.venv/bin/python swarm/swarmd.py init   <repo>          # write tuned config + prov hooks (idempotent)
+.venv/bin/python swarm/swarmd.py init   --check <repo>  # surroundings map only; writes nothing
 .venv/bin/python swarm/swarmd.py grind  --repo R [--goal "…"] [--test-cmd "…"] [--hours H] [--workers N] [--max-tasks N]
 .venv/bin/python swarm/swarmd.py run    --repo R [--hours 24] [--workers N] [--max-tasks N]   # bounded
 .venv/bin/python swarm/swarmd.py stop   [--repo R] [--drain]                                   # drain = finish in-flight task
@@ -179,6 +181,34 @@ below). `.venv/bin/python` is the interpreter. `swarm`/`flint` may also be on
 .venv/bin/python swarm/swarmd.py wake                   # clear model cooldown rests (this repo's daemon)
 .venv/bin/python swarm/swarmd.py service install --repo R [--hours H] [--autostart] | status | uninstall   # launchd; autostart is OFF unless asked
 ```
+
+### Provisioning (`swarm init` and the `prov` block)
+
+A fresh git worktree contains only tracked files — no `node_modules/`, no
+`.venv/`, no vendored or nested-repo content. A test gate that needs any of
+those used to fail on a bare checkout before a single model request (the
+`Cannot find package '@strudel/core'` / "every task would be rejected"
+baseline failures). `swarm init <repo>` fixes that permanently:
+
+- **Probes the surroundings** — nested git repos, runtime markers
+  (`package.json`, `requirements.txt`, …) searched one level deep too, `.venv`,
+  `node_modules/`, `.gitignore` — and prints a human-readable map with
+  `init --check <repo>`.
+- **Writes `swarm/configs/<slug>.json`** with a `prov` block: install hooks the
+  harness runs inside every fresh worktree (and the `_view`) before the test
+  gate. Existing tuned configs are never overwritten (idempotent).
+- **Exact dj-bot fix this encodes:** `spike/package.json` installs as
+  `cd spike && npm ci …` (subdir manifests run in their subdir), a gate that
+  *references* `.venv/bin/python -m pytest` still gets a `python3 -m venv`
+  hook (referencing is consuming, not creating), and a gate that already runs
+  `python -m venv` skips it. Nested repos get a bootstrap hook.
+- **Fails loud, not silent:** if provisioning fails or the gate stays red
+  after hooks run, the daemon exits with the hook output attached — no
+  mid-shift guessing.
+
+Hand-editing `prov` hooks is allowed (like any tuned config); `prov` accepts
+`hooks` (shell, run in order in the worktree), `env`, and `timeout`. The
+`prov` key is in `KNOWN_KEYS`.
 
 ### Queueing (`swarm add`)
 
@@ -289,6 +319,21 @@ things. In practice that means:
 - `scope_gate` park → your packet read open-ended ("clean up as needed"); add
   concrete acceptance and a bounded detail.
 - `spend.remaining_usd` low → stop queueing on that repo until reset.
+
+## strudel.nvim (the editor/workstation plugin)
+
+`OpenRouterSwarm/strudel-nvim/` is a separate Neovim plugin — the livecoding
+rig this swarm's music repos feed. It is **not** part of the swarm harness and
+has its **own** operating manual:
+
+> **`strudel-nvim/AGENTS.md`** — install state, headless test commands,
+> known OpenRouter/WezTerm sharp edges, and the `strudel.agent` mental model.
+> Read it before touching anything under `strudel-nvim/`.
+
+Highlights: the plugin is symlinked into `~/.config/nvim` (no build step);
+tests are headless (`.venv` not required); `:StrudelCheck` needs
+`OPENROUTER_API_KEY` from `OpenRouterSwarm/.env`; WezTerm config validation
+uses `/Applications/WezTerm.app/Contents/MacOS/wezterm-gui`.
 
 ## Golden rules (tldr)
 
