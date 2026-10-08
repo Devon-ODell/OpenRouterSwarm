@@ -355,6 +355,13 @@ class BridgeTests(SwarmBase):
             with self.assertRaisesRegex(RuntimeError, "git is not installed on this machine"):
                 bridge.config_for(str(self.root / "norepo"))
 
+    def test_config_for_raises_runtime_error_when_git_times_out(self):
+        """config_for raises a RuntimeError with the repo path when git times out."""
+        repo = str(self.root / "norepo")
+        with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired(cmd=["git"], timeout=10)):
+            with self.assertRaisesRegex(RuntimeError, repo):
+                bridge.config_for(repo)
+
     def test_selection_context_names_the_file_and_lines(self):
         repo, _ = self.repo()
         (repo / "m.py").write_text("a = 1\nb = 2\nc = 3\n")

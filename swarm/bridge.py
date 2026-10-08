@@ -95,9 +95,11 @@ def config_for(repo=None):
         if c.get("repo") != repo:
             try:
                 branch = subprocess.run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
-                                        capture_output=True, text=True).stdout.strip()
+                                        capture_output=True, text=True, timeout=10).stdout.strip()
             except FileNotFoundError:
                 raise RuntimeError("git is not installed on this machine. Install git, or point the swarm at a repository that is already a git directory.")
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"git timed out for repository {repo}. Check the repository and any git hooks.")
             c = dict(c, repo=repo, base_branch=branch if branch and branch != "HEAD" else "main")
     return c
 
