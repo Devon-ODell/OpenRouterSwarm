@@ -6,7 +6,7 @@
   "arc": ["opening", "rise", "midpoint_reset", "peak", "outro"],
   "cues": [
     {
-      "id": "open-01",
+      "id": "opening-01",
       "minute": 0,
       "mode": "chill",
       "instruction": "Soft ambient wash, slow attack, let the reverb bloom fully before the next cue",
@@ -14,7 +14,7 @@
       "camera": "Wide establishing shot, slow push-in from a distant horizon line"
     },
     {
-      "id": "open-02",
+      "id": "opening-02",
       "minute": 3,
       "mode": "chill",
       "instruction": "Add a low drone underneath the wash, keep the texture transparent",
@@ -22,7 +22,7 @@
       "camera": "Hold the wide shot; foreground figures enter slowly from the left"
     },
     {
-      "id": "open-03",
+      "id": "opening-03",
       "minute": 7,
       "mode": "generate",
       "instruction": "Introduce a simple repeating motif on a single instrument, loop it gently",
@@ -30,7 +30,7 @@
       "camera": "Cut to a medium close-up of the protagonist at rest"
     },
     {
-      "id": "open-04",
+      "id": "opening-04",
       "minute": 12,
       "mode": "generate",
       "instruction": "Layer the motif with a second voice in contrary motion, build the pattern slowly",
@@ -38,7 +38,7 @@
       "camera": "Slow pan across the interior set, collecting ambient detail"
     },
     {
-      "id": "open-05",
+      "id": "opening-05",
       "minute": 18,
       "mode": "drift",
       "instruction": "Let the motif decay naturally, allow silence to fill the gaps between phrases",
@@ -86,7 +86,7 @@
       "camera": "Slow zoom into a blank wall that the character will soon touch"
     },
     {
-      "id": "mid-01",
+      "id": "midpoint_reset-01",
       "minute": 54,
       "mode": "fix",
       "instruction": "Hard cut to silence, then a low piano figure that resets the emotional center",
@@ -94,7 +94,7 @@
       "camera": "Insert a neutral shot of the landscape stripped of people"
     },
     {
-      "id": "mid-02",
+      "id": "midpoint_reset-02",
       "minute": 58,
       "mode": "chill",
       "instruction": "Sustained pad with slow filter sweep; the character exhales on screen",
@@ -102,7 +102,7 @@
       "camera": "Static wide shot, allowing the silence to speak"
     },
     {
-      "id": "mid-03",
+      "id": "midpoint_reset-03",
       "minute": 62,
       "mode": "generate",
       "instruction": "Re-enter with the original motif in a new key, played by an unfamiliar instrument",
@@ -110,7 +110,7 @@
       "camera": "Close-up of hands performing, then cut to the listening character"
     },
     {
-      "id": "mid-04",
+      "id": "midpoint_reset-04",
       "minute": 67,
       "mode": "generate",
       "instruction": "Build a counter-melody that harmonizes with the reset motif, layer gradually",
@@ -118,7 +118,7 @@
       "camera": "Two-shot framing the character and the new presence side by side"
     },
     {
-      "id": "mid-05",
+      "id": "midpoint_reset-05",
       "minute": 72,
       "mode": "fix",
       "instruction": "Anchor the counter-melody with a steady kick drum, lock the tempo to picture",
