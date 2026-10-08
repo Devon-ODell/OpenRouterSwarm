@@ -16,6 +16,7 @@ local M = {}
 
 local cfg = nil
 local U = {} -- usage tracker
+local active_jobs = {} -- jobstart ids for in-flight curl streams
 
 local function log(...)
   local ok = pcall(vim.notify, table.concat({ ... }, " "))
@@ -184,6 +185,20 @@ local function messages(history)
   return msgs
 end
 
+local function append_message(history, message)
+  local copy = {}
+  for _, item in ipairs(history or {}) do
+    copy[#copy + 1] = item
+  end
+  copy[#copy + 1] = message
+  return copy
+end
+
+local function record_turn(user_text, assistant_text)
+  U.history = append_message(U.history, { role = "user", content = user_text })
+  U.history = append_message(U.history, { role = "assistant", content = assistant_text })
+end
+
 ---------------------------------------------- core call ----------------
 
 --- The one-shot completion. Returns text, or nil, error.
@@ -284,7 +299,7 @@ function M.chat_send(text)
   local f = assert(io.open(tmp, "w"))
   f:write(vim.json.encode({
     model = cfg.model,
-    messages = messages(vim.tbl_extend("force", U.history or {}, { { role = "user", content = text } })),
+    messages = messages(append_message(U.history, { role = "user", content = text })),
     temperature = cfg.temperature,
     max_tokens = cfg.max_tokens,
     stream = true,
@@ -299,7 +314,9 @@ function M.chat_send(text)
   cmd[#cmd + 1] = "@" .. tmp
   cmd[#cmd + 1] = cfg.base_url .. "/chat/completions"
   local reasoning_phase = false -- set once when the model switches to thought text
-  local jid = vim.fn.jobstart(cmd, {
+  local response_parts = {}
+  local jid
+  jid = vim.fn.jobstart(cmd, {
     stdout_buffered = false,
     on_stdout = function(_, data)
       for _, chunk in ipairs(data) do
@@ -315,6 +332,7 @@ function M.chat_send(text)
                 local is_reasoning = (d.content == nil or d.content == "") and d.reasoning ~= nil
                 local piece = d.content and d.content ~= "" and d.content or d.reasoning
                 if piece then
+                  response_parts[#response_parts + 1] = piece
                   local cur = vim.api.nvim_buf_get_lines(buf, -1, -1, false)[1] or ""
                   if is_reasoning and not reasoning_phase then
                     cur = cur .. "⸙ "
@@ -341,16 +359,28 @@ function M.chat_send(text)
         end
       end
     end,
-    on_exit = function()
+    on_exit = function(job_id, exit_code)
+      active_jobs[job_id] = nil
       os.remove(tmp)
+      local response = table.concat(response_parts)
+      if exit_code == 0 and response ~= "" then
+        record_turn(text, response)
+      end
       log("glm · stream done")
     end,
   })
+  if jid and jid > 0 then
+    active_jobs[jid] = true
+  else
+    os.remove(tmp)
+    vim.notify("glm · could not start stream", vim.log.levels.ERROR)
+  end
 end
 
 --- Kill in-flight streams (used by <leader>ax / :StrudelStop).
 function M.stop_all()
-  for _, j in ipairs(vim.v.jobs or {}) do
+  for j in pairs(active_jobs) do
+    active_jobs[j] = nil
     pcall(vim.fn.jobstop, j)
   end
   vim.notify("glm · stopped in-flight streams", vim.log.levels.INFO)
@@ -457,5 +487,13 @@ function M.setup(opts)
     M.stop_all()
   end, { desc = "Stop in-flight glm streams" })
 end
+
+M._test = {
+  append_message = append_message,
+  record_turn = record_turn,
+  history = function() return U.history or {} end,
+  reset_history = function() U.history = {} end,
+  active_jobs = active_jobs,
+}
 
 return M

@@ -134,6 +134,14 @@ test('the flint checkout is found next to the extension', () => {
   assert.strictEqual(ext._test.flintRoot(), path.resolve(EXT, '..'));
 });
 
+test('local provider routing preserves the endpoint that the probe discovered', () => {
+  assert.deepStrictEqual(ext._test.providerArgs({ backend: 'ollama', local: true, baseUrl: 'http://127.0.0.1:22434' }),
+    ['--provider', 'ollama', '--base-url', 'http://127.0.0.1:22434']);
+  assert.deepStrictEqual(ext._test.providerArgs({ backend: 'custom:http://host:9999/v1', local: true, baseUrl: 'http://host:9999/v1' }),
+    ['--base-url', 'http://host:9999/v1']);
+  assert.deepStrictEqual(ext._test.providerArgs({ backend: 'openrouter', local: false, baseUrl: null }), []);
+});
+
 test('the renderer escapes model output and links file references', () => {
   const R = require(path.join(EXT, 'media', 'render.js'));
   const html = R.render('<img src=x onerror=alert(1)> see `app.py:12` and [x](javascript:alert(1))');

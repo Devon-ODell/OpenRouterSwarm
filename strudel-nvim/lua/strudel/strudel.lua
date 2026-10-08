@@ -33,10 +33,12 @@ local function b64encode(s)
   end
   local padding = (3 - #s % 3) % 3
   for i = 1, padding do
-    out[#out] = ("="):byte()
+    out[#out - i + 1] = ("="):byte()
   end
-  return string.char(table.unpack(out))
+  return string.char((table.unpack or unpack)(out))
 end
+
+M._test = { b64encode = b64encode }
 
 --- Write OSC 52 <clipboard|primary|buffer> payload; WezTerm accepts this and
 --- will route the paste to the recently focused window (the live tab).

@@ -20,6 +20,7 @@ local session = {
   enabled = false, -- set by the timer / :StrudelSession
   start = os.time(),
 }
+local playtime_timer = nil
 
 -------------------------------------------- autocmds --------------------
 
@@ -233,15 +234,22 @@ local function setup_timer()
       session.enabled = true
       session.start = os.time()
       session.now = "00:00:00"
-      vim.api.nvim_create_timer(1000, function()
-        tick()
-      end, {})
+      local uv = vim.uv or vim.loop
+      playtime_timer = uv.new_timer()
+      playtime_timer:start(1000, 1000, vim.schedule_wrap(tick))
       vim.api.nvim_create_autocmd("VimLeave", {
         callback = function()
           session.enabled = false
+          if playtime_timer and not playtime_timer:is_closing() then
+            playtime_timer:stop()
+            playtime_timer:close()
+          end
+          playtime_timer = nil
         end,
+        once = true,
       })
     end,
+    once = true,
   })
   vim.g.strudel_session = session -- exposed for any window-local statusline
 end
@@ -292,5 +300,11 @@ M._test_snapshot = function()
     session = session.enabled and session.now or nil,
   }
 end
+
+M._test = {
+  timer_active = function()
+    return playtime_timer ~= nil and not playtime_timer:is_closing()
+  end,
+}
 
 return M

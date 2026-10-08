@@ -23,7 +23,8 @@ end
 
 -- ANSI 0-7 from `ansi = {...}`, 8-15 from `brights = {...}`.
 local function wezterm_ansi()
-  local src = slurp("wezterm/wezterm.lua")
+  local root = vim.g.strudel_test_root or "."
+  local src = slurp(root .. "/wezterm/wezterm.lua")
   local ansi = src:match('ansi%s*=%s*(%b{})')
   local brights = src:match('brights%s*=%s*(%b{})')
   assert(ansi, "wezterm config must declare an `ansi` block")

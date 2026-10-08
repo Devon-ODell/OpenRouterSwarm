@@ -17,7 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from swarm import swarmd
 
@@ -134,6 +134,12 @@ class ProvisioningTests(unittest.TestCase):
         self.assertFalse(any("npm" in h for h in prov2["hooks"]),
                          "gate already runs npm ci; prov must not re-install npm deps")
 
+    def test_unrelated_pip_install_does_not_suppress_node_provisioning(self):
+        (self.repo / "package.json").write_text("{}\n")
+        s = swarmd.probe_surroundings(self.repo)
+        prov = swarmd.build_prov_block(s, "pip install -e . && pytest")
+        self.assertTrue(any("npm ci" in h for h in prov["hooks"]), prov)
+
     def test_build_prov_block_wraps_subdir_marker_with_cd(self):
         """dj-bot shape: package.json one level down (spike/), so npm ci must run inside
         that subdir or a bare worktree has no manifest to install."""
@@ -166,6 +172,21 @@ class ProvisioningTests(unittest.TestCase):
         prov = swarmd.build_prov_block(s, "pytest")
         self.assertTrue(any("strudel-src" in h for h in prov["hooks"]),
                         f"expected a nested-repo bootstrap hook in {prov}")
+
+    def test_language_specific_recipes_are_valid_for_go_and_modern_python(self):
+        cases = {
+            "go.mod": "go mod download",
+            "pyproject.toml": "pip install -q -e .",
+            "Pipfile": "pipenv install --dev",
+        }
+        for marker, expected in cases.items():
+            with self.subTest(marker=marker):
+                runtime = {name: name == marker for name, _ in swarmd.RUNTIME_MARKERS}
+                prov = swarmd.build_prov_block(
+                    {"runtime": runtime, "subdirs": {}, "nested": []}, "pytest")
+                self.assertEqual(len(prov["hooks"]), 1, prov)
+                self.assertIn(expected, prov["hooks"][0])
+                self.assertNotIn("requirements.txt", prov["hooks"][0])
 
     def test_prov_block_normalises_forms(self):
         self.assertEqual(swarmd.prov_block({"prov": {"hooks": ["a"], "env": {"K": "v"},
@@ -215,6 +236,23 @@ class ProvisioningTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(out, "")
 
+    def test_nested_bootstrap_clones_content_and_fails_loudly(self):
+        self.make_nested("vendor")
+        s = swarmd.probe_surroundings(self.repo)
+        nested_hooks = [h for h in swarmd.build_prov_block(s, "true")["hooks"]
+                        if h.startswith("git clone")]
+        c = self.write_config(prov={"hooks": nested_hooks, "env": {}, "timeout": 120})
+        wt = self.bare_worktree()
+        ok, out = swarmd.run_prov_hooks(c, wt, "attempt")
+        self.assertTrue(ok, out)
+        self.assertEqual((wt / "vendor" / "lib.txt").read_text(), "nested lib\n")
+
+        bad = self.write_config(prov={"hooks": ["git clone --quiet /missing/repo ./vendor"],
+                                      "env": {}, "timeout": 120})
+        ok, out = swarmd.run_prov_hooks(bad, wt, "attempt")
+        self.assertFalse(ok)
+        self.assertIn("exit", out)
+
     # ------------------------------------------------ run_gate_with_prov
 
     def test_gate_with_prov_provisions_then_gates(self):
@@ -237,6 +275,48 @@ class ProvisioningTests(unittest.TestCase):
         ok, out = swarmd.run_gate_with_prov(c, wt, "attempt")
         self.assertFalse(ok)
         self.assertIn("provisioning failed", out)
+
+    def test_worker_provisions_once_before_baseline_and_reuses_dependencies(self):
+        c = self.write_config(test_cmd="true", validation_commands=[])
+        worker = swarmd.Worker(0, c, swarmd.Queue(), Mock(), Mock())
+        worker.wt = self.repo
+        worker.task = {}
+        worker.evidence = Mock()
+        worker.evidence.path = self.root
+        worker.gate_count = 0
+        worker.worktree_provisioned = False
+        with patch.object(swarmd, "run_prov_hooks", return_value=(True, "installed")) as prov, \
+             patch.object(swarmd, "run_gate", return_value=(True, "green")) as gate:
+            self.assertTrue(worker.gate("baseline")[0])
+            self.assertTrue(worker.gate("candidate-0")[0])
+            self.assertTrue(worker.gate("candidate-1")[0])
+        prov.assert_called_once_with(c, self.repo, "attempt", log_on_ok=True)
+        self.assertEqual(gate.call_count, 3)
+
+    def test_sync_trunk_uses_provisioned_gate(self):
+        c = self.write_config(test_cmd="true", trunk="swarm/trunk")
+        swarmd._sync_failed.clear()
+
+        def fake_git(args, cwd=None, check=False):
+            if args[:2] == ["merge-base", "--is-ancestor"]:
+                return 1, ""
+            if args[:2] == ["rev-parse", "main"]:
+                return 0, "base-sha"
+            if args[:2] == ["rev-parse", "swarm/trunk"]:
+                return 0, "old-sha"
+            if args[:2] == ["rev-parse", "HEAD"]:
+                return 0, "new-sha"
+            return 0, ""
+
+        with patch.object(swarmd, "ensure_trunk"), \
+             patch.object(swarmd, "git", side_effect=fake_git), \
+             patch.object(swarmd, "checked_out_at", return_value=None), \
+             patch.object(swarmd, "wt_root", return_value=self.root / "sync-wt"), \
+             patch.object(swarmd, "run_gate_with_prov", return_value=(True, "green")) as gate:
+            self.assertEqual(swarmd.sync_trunk(c), "synced")
+        gate.assert_called_once()
+        self.assertEqual(gate.call_args.args[0], c)
+        self.assertEqual(gate.call_args.args[2], "sync")
 
     # ------------------------------------------------------- command init
 

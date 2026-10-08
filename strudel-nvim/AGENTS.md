@@ -166,6 +166,8 @@ What it covers:
 - **`tests/check_test.lua`** — offline health check never touches network
   (`agent.check_local()` must return <1s even with a dead network), key present
   vs MISSING, model row mentions `z-ai/glm-5.3-flash`.
+- **`tests/regression_test.lua`** — real libuv session timer startup, chat-history
+  append order, in-flight job cancellation, and RFC 4648 base64 padding vectors.
 - **`tests/wezterm_parity_test.lua`** — the 16 ANSI colors in
   `wezterm/wezterm.lua` must exactly match `theme.lua`'s `terminal_color_*`
   for the blue variant.

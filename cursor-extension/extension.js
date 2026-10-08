@@ -247,6 +247,18 @@ async function pickLocalModel(backend) {
   return chosen ? list.find((m) => (m.name || m.id) === chosen.label) : null;
 }
 
+/** Bridge routing flags for a provider selected by pickProviderModel(). */
+function providerArgs(prov) {
+  const args = [];
+  const backendId = prov.backend.startsWith('custom:') ? null : prov.backend;
+  // The picker probes named local providers and returns the endpoint that actually
+  // answered. Preserve it: it may not be the registry's default port.
+  const baseUrl = prov.local ? (prov.baseUrl || (prov.backend.startsWith('custom:') ? prov.backend.slice(7) : null)) : null;
+  if (backendId && backendId !== 'openrouter') args.push('--provider', backendId);
+  if (baseUrl) args.push('--base-url', baseUrl);
+  return args;
+}
+
 async function ask(question, ctx) {
   const repo = (ctx && ctx.repo) || repoFor(currentEditor() && currentEditor().document.uri);
   if (!repo) { vscode.window.showWarningMessage('Open a folder or file first; the swarm answers about a repository.'); return; }
@@ -271,10 +283,7 @@ async function ask(question, ctx) {
   const args = ['ask', '--repo', repo, '--question', question, '--models', String(c.get('models')),
     '--steps', String(c.get('stepsPerModel')), '--timeout', String(c.get('timeoutSeconds') || 300),
     '--paid', String(c.get('paidFallback') || 'auto')];
-  const backendId = prov.backend.startsWith('custom:') ? null : prov.backend;
-  const baseUrl = prov.local && (prov.backend.startsWith('custom:')) ? prov.backend.slice(7) : null;
-  if (backendId && backendId !== 'openrouter') args.push('--provider', backendId);
-  if (baseUrl) args.push('--base-url', baseUrl);
+  args.push(...providerArgs(prov));
   if (model) args.push('--model', model);
   if (!c.get('synthesize')) args.push('--no-synthesis');
   if (!c.get('useStudy')) args.push('--no-study');
@@ -1206,4 +1215,4 @@ function deactivate() {
 module.exports = { activate, deactivate,
   _test: { parseLines, innermost, flintRoot, where, bridgeJson, bridgeLast, PRESETS,
     idleFor, supportsSecondarySidebar, showActivity, providerChoices, provState, chosenBackend,
-    promptForApiKey, maybePromptForApiKey } };
+    providerArgs, promptForApiKey, maybePromptForApiKey } };

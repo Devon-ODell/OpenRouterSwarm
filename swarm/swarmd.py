@@ -2712,7 +2712,10 @@ def sync_trunk(c):
                 log(f"{base} has changes that conflict with {t}; continuing on {t} without them")
                 _sync_failed[base] = base_sha
                 return "conflict"
-            ok, output = run_gate(tmp, c)
+            # The sync worktree is just as bare as an attempt worktree.  Reuse the same
+            # provisioning path or repositories whose gate consumes ignored dependencies
+            # (node_modules, .venv, nested repositories) can never absorb upstream commits.
+            ok, output = run_gate_with_prov(c, tmp, "sync")
             if not ok:
                 log(f"merging {base} into {t} fails the tests; continuing without it")
                 _sync_failed[base] = base_sha
@@ -3026,6 +3029,7 @@ class Worker(threading.Thread):
         self.last_model = None
         self.last_role = None
         self.agent_timed_out = False
+        self.worktree_provisioned = False
         self.failure_class = "task"
         self.state = None                 # structured state code (work order §13)
         self.clock = BucketClock()        # wall-time buckets by state
@@ -3252,6 +3256,9 @@ class Worker(threading.Thread):
         self.task, self.stage, self.wt = task, "error", None
         self.doing, self.started = "starting", time.time()
         self.evidence, self.role_calls, self.gate_count = None, 0, 0
+        # Provisioning belongs to the lifetime of this fresh worktree, not to each gate.
+        # Candidate repair cycles and a rebase reuse the same installed dependencies.
+        self.worktree_provisioned = False
         self.last_model, self.last_role = None, None
         self.mit = None
         self.agent_timed_out = False
@@ -3328,10 +3335,16 @@ class Worker(threading.Thread):
             config = dict(self.c, test_cmd=command, _gate_log=str(self.evidence.path / name))
             started = time.monotonic()
             try:
-                if i == 0 and label != "baseline":
-                    # The first gate of a fresh attempt runs in a bare worktree: install its
-                    # deps first, or a missing node_modules/ fails every gate and every repair.
-                    ok, output = run_gate_with_prov(self.c, self.wt, "attempt")
+                if i == 0 and not self.worktree_provisioned:
+                    # Every attempt begins in a bare worktree. Provision it once, before the
+                    # baseline, then retain those dependencies through candidate/repair gates.
+                    prov_ok, prov_output = run_prov_hooks(
+                        self.c, self.wt, "attempt", log_on_ok=True)
+                    if not prov_ok:
+                        ok, output = False, f"provisioning failed:\n{prov_output}"
+                    else:
+                        self.worktree_provisioned = True
+                        ok, output = run_gate(self.wt, config)
                 else:
                     ok, output = run_gate(self.wt, config)
             except subprocess.TimeoutExpired:
@@ -5498,10 +5511,17 @@ RUNTIME_MARKERS = [
 # check` can resolve "@strudel/core".
 PROV_RECIPES = [
     (("package.json",), "npm ci --silent --no-audit --no-fund"),
-    (("requirements.txt", "pyproject.toml", "Pipfile"),
-     "python3 -m venv .venv && .venv/bin/python -m pip install -q -r requirements.txt"),
+    (("requirements.txt", "pyproject.toml", "Pipfile"), {
+        "requirements.txt": ("python3 -m venv .venv && "
+                             ".venv/bin/python -m pip install -q -r requirements.txt"),
+        "pyproject.toml": ("python3 -m venv .venv && "
+                           ".venv/bin/python -m pip install -q -e ."),
+        "Pipfile": ("python3 -m venv .venv && "
+                    ".venv/bin/python -m pip install -q pipenv && "
+                    ".venv/bin/pipenv install --dev"),
+    }),
     (("Gemfile",), "bundle install"),
-    (("go.mod",), "go moddownload"),
+    (("go.mod",), "go mod download"),
     (("Cargo.toml",), "cargo build"),
     (("build.gradle", "pom.xml"), "mvn -q -DskipTests dependency:go-offline"),
     (("composer.json",), "composer install --quiet"),
@@ -5541,6 +5561,8 @@ def probe_surroundings(repo):
         (d / "node_modules").exists() for d in one_deep)
     return {
         "nested": nested,
+        "nested_sources": {d.name: str(d.resolve()) for d in sorted(
+            p for p in repo.iterdir() if p.is_dir() and (p / ".git").exists())},
         "runtime": deps,
         "subdirs": subdirs,
         "venv": (repo / ".venv").exists(),
@@ -5562,41 +5584,44 @@ def build_prov_block(s, test_cmd):
     # Keyed by marker file so "npm ci ..." in the gate skips the npm marker without
     # touching the python one, and vice versa.
     SKIP_HINTS = {
-        "package.json": ("ci", "install"),
+        "package.json": (r"\bnpm\s+(?:ci|install)\b",),
         # Only skip the venv recipe when the gate itself *creates* the venv. Merely
         # referencing .venv/bin/python in the gate is a consumer, not an installer —
         # dj-bot's gate runs `.venv/bin/python -m pytest` yet has no .venv in a fresh
         # worktree, and skipping here is exactly the red-baseline bug this fixes.
-        "requirements.txt": ("python3 -m venv", "python -m venv"),
-        "pyproject.toml": ("python3 -m venv", "python -m venv"),
-        "Pipfile": ("python3 -m venv", "python -m venv"),
-        "Gemfile": ("bundle",),
-        "go.mod": ("go moddownload",),
-        "Cargo.toml": ("cargo",),
-        "build.gradle": ("mvn", "gradle"),
-        "pom.xml": ("mvn",),
-        "composer.json": ("composer",),
-        "mix.exs": ("mix deps",),
+        "requirements.txt": (r"\bpython3?\s+-m\s+venv\b",),
+        "pyproject.toml": (r"\bpython3?\s+-m\s+venv\b",),
+        "Pipfile": (r"\bpython3?\s+-m\s+venv\b",),
+        "Gemfile": (r"\bbundle\s+install\b",),
+        "go.mod": (r"\bgo\s+mod\s+download\b",),
+        "Cargo.toml": (r"\bcargo\s+(?:build|fetch)\b",),
+        "build.gradle": (r"\b(?:mvn|gradle|gradlew)\b",),
+        "pom.xml": (r"\bmvn\b",),
+        "composer.json": (r"\bcomposer\s+install\b",),
+        "mix.exs": (r"\bmix\s+deps\.get\b",),
     }
     hooks, skipped = [], []
-    for markers, recipe in PROV_RECIPES:
-        if not any(s["runtime"].get(m) for m in markers):
+    for markers, recipe_spec in PROV_RECIPES:
+        marker = next((m for m in markers if s["runtime"].get(m)), None)
+        if marker is None:
             continue
-        hints = tuple(h for m in markers for h in SKIP_HINTS.get(m, ()))
-        if any(h in test_cmd for h in hints):
-            skipped.append(markers[0])
+        hints = SKIP_HINTS.get(marker, ())
+        if any(re.search(pattern, test_cmd) for pattern in hints):
+            skipped.append(marker)
             continue
+        recipe = recipe_spec[marker] if isinstance(recipe_spec, dict) else recipe_spec
         # A marker found one level down (dj-bot keeps spike/package.json + spike/node_modules)
         # needs the recipe to run inside that subdirectory, or npm ci at the root has no
         # manifest to install. Default is the repo root ("cd . && ..." is a no-op).
-        sub = s.get("subdirs", {}).get(markers[0], ".")
+        sub = s.get("subdirs", {}).get(marker, ".")
         if sub == ".":
             hooks.append(recipe)
         else:
             hooks.append(f"cd {shlex.quote(sub)} && {recipe}")
-        skipped.append(markers[0])
+        skipped.append(marker)
     for name in s.get("nested", []):
-        hooks.append(f"git -C ./{name} clone . .. 2>/dev/null || true; ls ./{name} | grep -q . || echo 'nested {name} empty'")
+        source = s.get("nested_sources", {}).get(name, name)
+        hooks.append(f"git clone --quiet {shlex.quote(source)} {shlex.quote('./' + name)}")
         skipped.append(f"nested {name}")
     return {"hooks": hooks, "env": {}, "timeout": 1800, "_skipped": skipped}
 
