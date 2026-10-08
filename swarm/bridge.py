@@ -93,8 +93,11 @@ def config_for(repo=None):
     if repo:
         repo = str(Path(repo).expanduser().resolve())
         if c.get("repo") != repo:
-            branch = subprocess.run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
-                                    capture_output=True, text=True).stdout.strip()
+            try:
+                branch = subprocess.run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+                                        capture_output=True, text=True).stdout.strip()
+            except FileNotFoundError:
+                raise RuntimeError("git is not installed on this machine. Install git, or point the swarm at a repository that is already a git directory.")
             c = dict(c, repo=repo, base_branch=branch if branch and branch != "HEAD" else "main")
     return c
 

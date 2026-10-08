@@ -349,6 +349,12 @@ class BridgeTests(SwarmBase):
             rc = bridge.main(list(argv))
         return rc, [json.loads(l) for l in out.getvalue().splitlines() if l.strip()]
 
+    def test_config_for_raises_runtime_error_when_git_missing(self):
+        """config_for raises a RuntimeError with an actionable message when git is not installed."""
+        with patch.object(subprocess, "run", side_effect=FileNotFoundError):
+            with self.assertRaisesRegex(RuntimeError, "git is not installed on this machine"):
+                bridge.config_for(str(self.root / "norepo"))
+
     def test_selection_context_names_the_file_and_lines(self):
         repo, _ = self.repo()
         (repo / "m.py").write_text("a = 1\nb = 2\nc = 3\n")
