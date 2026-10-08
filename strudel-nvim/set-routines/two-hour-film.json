@@ -1,0 +1,209 @@
+{
+  "title": "Two-Hour Film Score",
+  "duration_minutes": 120,
+  "author": "strudel-nvim",
+  "version": "1.0",
+  "arc": ["opening", "rise", "midpoint_reset", "peak", "outro"],
+  "cues": [
+    {
+      "id": "open-01",
+      "minute": 0,
+      "mode": "chill",
+      "instruction": "Soft ambient wash, slow attack, let the reverb bloom fully before the next cue",
+      "energy": 0.1,
+      "camera": "Wide establishing shot, slow push-in from a distant horizon line"
+    },
+    {
+      "id": "open-02",
+      "minute": 3,
+      "mode": "chill",
+      "instruction": "Add a low drone underneath the wash, keep the texture transparent",
+      "energy": 0.15,
+      "camera": "Hold the wide shot; foreground figures enter slowly from the left"
+    },
+    {
+      "id": "open-03",
+      "minute": 7,
+      "mode": "generate",
+      "instruction": "Introduce a simple repeating motif on a single instrument, loop it gently",
+      "energy": 0.25,
+      "camera": "Cut to a medium close-up of the protagonist at rest"
+    },
+    {
+      "id": "open-04",
+      "minute": 12,
+      "mode": "generate",
+      "instruction": "Layer the motif with a second voice in contrary motion, build the pattern slowly",
+      "energy": 0.35,
+      "camera": "Slow pan across the interior set, collecting ambient detail"
+    },
+    {
+      "id": "open-05",
+      "minute": 18,
+      "mode": "drift",
+      "instruction": "Let the motif decay naturally, allow silence to fill the gaps between phrases",
+      "energy": 0.2,
+      "camera": "Insert a brief cutaway to an object that will matter later"
+    },
+    {
+      "id": "rise-01",
+      "minute": 24,
+      "mode": "generate",
+      "instruction": "Bring back the motif at a higher tempo with a driving eighth-note pulse",
+      "energy": 0.45,
+      "camera": "Match cut to action; the pace of editing tightens"
+    },
+    {
+      "id": "rise-02",
+      "minute": 30,
+      "mode": "generate",
+      "instruction": "Add brass or synth pads beneath the pulse; let the harmony shift to the dominant",
+      "energy": 0.55,
+      "camera": "Steadicam tracking shot following the character through a crowd"
+    },
+    {
+      "id": "rise-03",
+      "minute": 36,
+      "mode": "fix",
+      "instruction": "Resolve the rising tension with a short, clean statement of the home key",
+      "energy": 0.4,
+      "camera": "Close-up of a face registering decision or doubt"
+    },
+    {
+      "id": "rise-04",
+      "minute": 42,
+      "mode": "generate",
+      "instruction": "Re-enter the drive with added distortion or saturation on the lead line",
+      "energy": 0.65,
+      "camera": "Over-the-shoulder cut to the antagonist entering the frame"
+    },
+    {
+      "id": "rise-05",
+      "minute": 48,
+      "mode": "drift",
+      "instruction": "Strip the instrumentation back to a single pulsing note; let anticipation build",
+      "energy": 0.5,
+      "camera": "Slow zoom into a blank wall that the character will soon touch"
+    },
+    {
+      "id": "mid-01",
+      "minute": 54,
+      "mode": "fix",
+      "instruction": "Hard cut to silence, then a low piano figure that resets the emotional center",
+      "energy": 0.2,
+      "camera": "Insert a neutral shot of the landscape stripped of people"
+    },
+    {
+      "id": "mid-02",
+      "minute": 58,
+      "mode": "chill",
+      "instruction": "Sustained pad with slow filter sweep; the character exhales on screen",
+      "energy": 0.15,
+      "camera": "Static wide shot, allowing the silence to speak"
+    },
+    {
+      "id": "mid-03",
+      "minute": 62,
+      "mode": "generate",
+      "instruction": "Re-enter with the original motif in a new key, played by an unfamiliar instrument",
+      "energy": 0.35,
+      "camera": "Close-up of hands performing, then cut to the listening character"
+    },
+    {
+      "id": "mid-04",
+      "minute": 67,
+      "mode": "generate",
+      "instruction": "Build a counter-melody that harmonizes with the reset motif, layer gradually",
+      "energy": 0.45,
+      "camera": "Two-shot framing the character and the new presence side by side"
+    },
+    {
+      "id": "mid-05",
+      "minute": 72,
+      "mode": "fix",
+      "instruction": "Anchor the counter-melody with a steady kick drum, lock the tempo to picture",
+      "energy": 0.5,
+      "camera": "Wide shot as the two figures begin to move in sync"
+    },
+    {
+      "id": "peak-01",
+      "minute": 78,
+      "mode": "generate",
+      "instruction": "Double the tempo, stack thirds under the lead line, push toward the climax",
+      "energy": 0.75,
+      "camera": "Rapid cuts escalating through three reaction shots"
+    },
+    {
+      "id": "peak-02",
+      "minute": 84,
+      "mode": "generate",
+      "instruction": "Add a rising scale figure and a snare roll; let the dissonance increase",
+      "energy": 0.85,
+      "camera": "Handheld shake on the moment of impact"
+    },
+    {
+      "id": "peak-03",
+      "minute": 88,
+      "mode": "fix",
+      "instruction": "Crash to a single held chord with the full ensemble, then cut to a fermata",
+      "energy": 0.9,
+      "camera": "Extreme close-up of an eye reflecting the action"
+    },
+    {
+      "id": "peak-04",
+      "minute": 92,
+      "mode": "generate",
+      "instruction": "Release the chord into a cascading arpeggio, brighter and faster than before",
+      "energy": 0.8,
+      "camera": "Pull back to reveal the full scale of the set"
+    },
+    {
+      "id": "peak-05",
+      "minute": 96,
+      "mode": "drift",
+      "instruction": "Fade the arpeggio into a soft pedal tone; let the resolution feel earned",
+      "energy": 0.55,
+      "camera": "Slow dolly back as the character walks away from the climax"
+    },
+    {
+      "id": "peak-06",
+      "minute": 100,
+      "mode": "chill",
+      "instruction": "Return to the opening wash texture, now transformed by the journey's events",
+      "energy": 0.35,
+      "camera": "Profile shot silhouetted against a warm key light"
+    },
+    {
+      "id": "peak-07",
+      "minute": 114,
+      "mode": "fix",
+      "instruction": "Settle on a final sustained triad that does not fully resolve, leaving it open",
+      "energy": 0.45,
+      "camera": "Two-shot holding on the connection between the two figures"
+    },
+    {
+      "id": "outro-01",
+      "minute": 116,
+      "mode": "chill",
+      "instruction": "Decay the triad into a low hum; let each note hang in the air before the next",
+      "energy": 0.25,
+      "camera": "Slow fade to black over ten seconds"
+    },
+    {
+      "id": "outro-02",
+      "minute": 118,
+      "mode": "chill",
+      "instruction": "Add a distant chime or bell tone; keep the energy below the midpoint threshold",
+      "energy": 0.15,
+      "camera": "Title card or credit roll over the lingering ambient tone"
+    },
+    {
+      "id": "outro-03",
+      "minute": 119,
+      "mode": "chill",
+      "instruction": "Final decay to near-silence, leaving only a breath of texture",
+      "energy": 0.05,
+      "camera": "Slow fade to black; hold for two seconds before cut"
+    }
+  ]
+}
