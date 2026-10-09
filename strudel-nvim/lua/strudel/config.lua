@@ -45,6 +45,11 @@ M.defaults = {
   winbar = true, -- show file + session clock in the winbar
   playtime_timer = true, -- HH:MM:SS set clock in the statusline
 
+  --- Performance logging ------------------------------------------------
+  -- Path to JSONL file for agent performance events. If nil, defaults to
+  -- stdpath('state') .. '/strudel_performance.jsonl'.
+  log_path = nil,
+
   --- Keymaps (empty string disables). -----------------------------------
   keys = {
     send = "<leader>ss", -- send selection / current line / whole buffer

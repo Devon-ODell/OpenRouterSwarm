@@ -60,6 +60,67 @@ local function acc(usage)
   emit()
 end
 
+--- Get the performance log path from config or default.
+local function get_log_path()
+  if cfg.log_path and cfg.log_path ~= "" then
+    return cfg.log_path
+  end
+  return vim.fn.stdpath('state') .. '/strudel_performance.jsonl'
+end
+
+--- Append a JSONL performance event to the log file.
+--- @param event table Fields: schema_version, timestamp, latency_ms, model, mode, outcome, prompt_tokens, completion_tokens, cost_increment, cost_session, cue_id, run_id, response_chars
+local function log_performance(event)
+  local log_path = get_log_path()
+  local ok, dir = pcall(vim.fn.fnamemodify, log_path, ':h')
+  if not ok then
+    dir = nil
+  end
+  if dir then
+    pcall(vim.loop.fs_mkdir, dir, 511, function() end)
+  end
+  local file, err = io.open(log_path, "a")
+  if not file then
+    vim.notify("strudel: could not open performance log at " .. log_path .. ": " .. tostring(err), vim.log.levels.WARN)
+    return
+  end
+  local json_str = vim.json.encode(event)
+  if json_str then
+    file:write(json_str .. "\n")
+  else
+    vim.notify("strudel: failed to encode performance event", vim.log.levels.WARN)
+  end
+  file:close()
+end
+
+--- Compute the cost in dollars from a usage object.
+local function usage_cost(usage)
+  if not usage then return 0 end
+  local p = tonumber(usage.prompt_tokens) or 0
+  local c = tonumber(usage.completion_tokens) or 0
+  return p * 0.00000015 + c * 0.0000005 + (tonumber(usage.total_cost) or 0)
+end
+
+--- Build a performance event table.
+local function build_performance_event(latency_ms, model, mode, outcome, prompt_tokens, completion_tokens, cost_increment, cost_session, cue_id, run_id, response_chars)
+  local end_time = vim.loop.gettimeofday()
+  return {
+    schema_version = "1.0.0",
+    timestamp = end_time.seconds * 1000 + end_time.microseconds / 1000,
+    latency_ms = latency_ms,
+    model = model,
+    mode = mode,
+    outcome = outcome,
+    prompt_tokens = prompt_tokens,
+    completion_tokens = completion_tokens,
+    cost_increment = cost_increment,
+    cost_session = cost_session,
+    cue_id = cue_id,
+    run_id = run_id,
+    response_chars = response_chars,
+  }
+end
+
 function M.toggle_meter()
   U.visible = not U.visible
   if U.visible and U.started == nil then
