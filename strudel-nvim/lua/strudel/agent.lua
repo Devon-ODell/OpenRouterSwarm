@@ -232,6 +232,109 @@ function M.complete(prompt_extra)
   return text
 end
 
+--- Nonblocking streaming completion. Returns via callback(err, result).
+--- result: { text, model, usage?, run_id?, cue_id? }
+function M.complete_async(prompt, context, callback)
+  if type(callback) ~= "function" then
+    error("callback must be a function", 2)
+  end
+  local done = false
+  local tmp = vim.fn.tempname()
+  local f = assert(io.open(tmp, "w"))
+  local body = {
+    model = cfg.model,
+    messages = messages(append_message((context and context.history) or U.history, { role = "user", content = prompt })),
+    temperature = cfg.temperature,
+    max_tokens = cfg.max_tokens,
+    stream = true,
+    stream_options = { include_usage = true },
+  }
+  f:write(vim.json.encode(body))
+  f:close()
+  local cmd = { "curl", "-sS", "-N", "-m", tostring(cfg.timeout) }
+  for k, v in pairs(headers()) do
+    cmd[#cmd + 1] = "-H"
+    cmd[#cmd + 1] = string.format("%s: %s", k, v)
+  end
+  cmd[#cmd + 1] = "-d"
+  cmd[#cmd + 1] = "@" .. tmp
+  cmd[#cmd + 1] = cfg.base_url .. "/chat/completions"
+  local response_parts = {}
+  local last_usage = nil
+  local jid
+  jid = vim.fn.jobstart(cmd, {
+    stdout_buffered = false,
+    on_stdout = function(_, data)
+      for _, chunk in ipairs(data) do
+        for line in chunk:gmatch("[^\r\n]+") do
+          if line:find("^data: ") then
+            local payload = line:sub(7)
+            if payload ~= "[DONE]" then
+              local ok, obj = pcall(vim.json.decode, payload)
+              if ok and obj.choices and obj.choices[1] and obj.choices[1].delta then
+                local d = obj.choices[1].delta
+                local piece = d.content and d.content ~= "" and d.content or d.reasoning
+                if piece then
+                  table.insert(response_parts, piece)
+                end
+                if obj.usage then
+                  last_usage = obj.usage
+                end
+              end
+            end
+          end
+        end
+      end
+    end,
+    on_stderr = function(_, data)
+      for _, line in ipairs(data or {}) do
+        if line and line ~= "" then
+          log("glm stderr:", line)
+        end
+      end
+    end,
+    on_exit = function(job_id, exit_code)
+      active_jobs[job_id] = nil
+      os.remove(tmp)
+      local response = table.concat(response_parts)
+      local function fail(err)
+        if done then return end
+        done = true
+        callback(err, nil)
+      end
+      local function succeed(text_val, usage_val)
+        if done then return end
+        done = true
+        -- record turn and account usage
+        M.record_turn(prompt, text_val)
+        if usage_val then
+          acc(usage_val)
+        end
+        callback(nil, {
+          text = text_val,
+          model = cfg.model,
+          usage = usage_val,
+          run_id = context and context.run_id,
+          cue_id = context and context.cue_id,
+        })
+      end
+      if exit_code == 0 and response ~= "" then
+        succeed(response, last_usage)
+      else
+        fail("stream failed")
+      end
+    end,
+  })
+  if jid and jid > 0 then
+    active_jobs[jid] = { tmp = tmp }
+  else
+    os.remove(tmp)
+    vim.notify("glm · could not start stream", vim.log.levels.ERROR)
+    done = true
+    callback("could not start stream", nil)
+  end
+end
+
 ---------------------------------------------- user-facing commands ------
 
 --- Ask GLM from the cursor line — super fast feedback loop for the agent in
@@ -370,7 +473,7 @@ function M.chat_send(text)
     end,
   })
   if jid and jid > 0 then
-    active_jobs[jid] = true
+    active_jobs[jid] = { tmp = tmp }
   else
     os.remove(tmp)
     vim.notify("glm · could not start stream", vim.log.levels.ERROR)
@@ -379,9 +482,12 @@ end
 
 --- Kill in-flight streams (used by <leader>ax / :StrudelStop).
 function M.stop_all()
-  for j in pairs(active_jobs) do
-    active_jobs[j] = nil
-    pcall(vim.fn.jobstop, j)
+  for jid, job in pairs(active_jobs) do
+    active_jobs[jid] = nil
+    pcall(vim.fn.jobstop, jid)
+    if type(job) == "table" and job.tmp then
+      os.remove(job.tmp)
+    end
   end
   vim.notify("glm · stopped in-flight streams", vim.log.levels.INFO)
 end
@@ -494,6 +600,51 @@ M._test = {
   history = function() return U.history or {} end,
   reset_history = function() U.history = {} end,
   active_jobs = active_jobs,
+  --- Test-only: accumulate text and usage from a list of SSE payload strings.
+  --- Each string is the JSON payload after "data: " prefix.
+  --- Returns accumulated text and last usage object seen.
+  accumulate_from_chunks = function(chunks)
+    local response_parts = {}
+    local last_usage = nil
+    for _, chunk in ipairs(chunks) do
+      local ok, obj = pcall(vim.json.decode, chunk)
+      if ok and obj.choices and obj.choices[1] and obj.choices[1].delta then
+        local d = obj.choices[1].delta
+        local piece = d.content and d.content ~= "" and d.content or d.reasoning
+        if piece then
+          table.insert(response_parts, piece)
+        end
+        if obj.usage then
+          last_usage = obj.usage
+        end
+      end
+    end
+    return table.concat(response_parts), last_usage
+  end,
+  --- Test-only: simulate complete_async with synthetic SSE chunks and exit code.
+  --- Invokes the callback exactly once with either success or error.
+  simulate_complete_async = function(prompt, context, callback, chunks, exit_code)
+    local tmp = vim.fn.tempname()
+    local text, usage = M._test.accumulate_from_chunks(chunks)
+    local done = false
+    local function finish(err, result)
+      if done then return end
+      done = true
+      os.remove(tmp)
+      if err then
+        callback(err, nil)
+      else
+        callback(nil, result)
+      end
+    end
+    if exit_code == 0 and text ~= "" then
+      -- record turn (but skip accounting to avoid affecting test meter)
+      M._test.record_turn(prompt, text)
+      finish(nil, { text = text, model = cfg.model, usage = usage, run_id = context and context.run_id, cue_id = context and context.cue_id })
+    else
+      finish("stream failed", nil)
+    end
+  end,
 }
 
 return M
