@@ -301,6 +301,7 @@ function M.complete_async(prompt, context, callback)
   end
   local done = false
   local tmp = vim.fn.tempname()
+  local start_time = vim.loop.gettimeofday()
   local f = assert(io.open(tmp, "w"))
   local body = {
     model = cfg.model,
@@ -358,12 +359,39 @@ function M.complete_async(prompt, context, callback)
       active_jobs[job_id] = nil
       os.remove(tmp)
       local response = table.concat(response_parts)
-      local function fail(err)
+      local end_time = vim.loop.gettimeofday()
+      local latency_ms = (end_time.seconds - start_time.seconds) * 1000 + (end_time.microseconds - start_time.microseconds) / 1000
+      local function log_and_fail(err, outcome_val)
         if done then return end
         done = true
+        -- Log failure event
+        local function safe_log()
+          pcall(function()
+            local usage = last_usage or {}
+            local prompt_tokens = tonumber(usage.prompt_tokens) or 0
+            local completion_tokens = tonumber(usage.completion_tokens) or 0
+            local cost_increment = usage_cost(usage)
+            local cost_session = U.cost or 0
+            local event = build_performance_event(
+              latency_ms,
+              cfg.model,
+              cfg.mode,
+              outcome_val,
+              prompt_tokens,
+              completion_tokens,
+              cost_increment,
+              cost_session,
+              context and context.cue_id,
+              context and context.run_id,
+              #response
+            )
+            log_performance(event)
+          end)
+        end
+        safe_log()
         callback(err, nil)
       end
-      local function succeed(text_val, usage_val)
+      local function log_and_succeed(text_val, usage_val)
         if done then return end
         done = true
         -- record turn and account usage
@@ -371,6 +399,31 @@ function M.complete_async(prompt, context, callback)
         if usage_val then
           acc(usage_val)
         end
+        -- Log success event
+        local function safe_log()
+          pcall(function()
+            local usage = usage_val or {}
+            local prompt_tokens = tonumber(usage.prompt_tokens) or 0
+            local completion_tokens = tonumber(usage.completion_tokens) or 0
+            local cost_increment = usage_cost(usage)
+            local cost_session = U.cost or 0
+            local event = build_performance_event(
+              latency_ms,
+              cfg.model,
+              cfg.mode,
+              "success",
+              prompt_tokens,
+              completion_tokens,
+              cost_increment,
+              cost_session,
+              context and context.cue_id,
+              context and context.run_id,
+              #text_val
+            )
+            log_performance(event)
+          end)
+        end
+        safe_log()
         callback(nil, {
           text = text_val,
           model = cfg.model,
@@ -380,18 +433,40 @@ function M.complete_async(prompt, context, callback)
         })
       end
       if exit_code == 0 and response ~= "" then
-        succeed(response, last_usage)
+        log_and_succeed(response, last_usage)
       else
-        fail("stream failed")
+        log_and_fail("stream failed", "failure")
       end
     end,
   })
   if jid and jid > 0 then
-    active_jobs[jid] = { tmp = tmp }
+    active_jobs[jid] = { tmp = tmp, prompt = prompt, context = context, callback = callback, start_time = start_time }
   else
     os.remove(tmp)
+    local end_time = vim.loop.gettimeofday()
+    local latency_ms = (end_time.seconds - start_time.seconds) * 1000 + (end_time.microseconds - start_time.microseconds) / 1000
     vim.notify("glm · could not start stream", vim.log.levels.ERROR)
     done = true
+    -- Log start failure
+    local function safe_log()
+      pcall(function()
+        local event = build_performance_event(
+          latency_ms,
+          cfg.model,
+          cfg.mode,
+          "start_failure",
+          0,
+          0,
+          0,
+          U.cost or 0,
+          context and context.cue_id,
+          context and context.run_id,
+          0
+        )
+        log_performance(event)
+      end)
+    end
+    safe_log()
     callback("could not start stream", nil)
   end
 end
@@ -546,8 +621,37 @@ function M.stop_all()
   for jid, job in pairs(active_jobs) do
     active_jobs[jid] = nil
     pcall(vim.fn.jobstop, jid)
-    if type(job) == "table" and job.tmp then
-      os.remove(job.tmp)
+    if type(job) == "table" then
+      if job.tmp then
+        os.remove(job.tmp)
+      end
+      -- Emit cancellation event for this job
+      local function safe_log()
+        pcall(function()
+          local end_time = vim.loop.gettimeofday()
+          local start_time = job.start_time or vim.loop.gettimeofday()
+          local latency_ms = (end_time.seconds - start_time.seconds) * 1000 + (end_time.microseconds - start_time.microseconds) / 1000
+          local event = build_performance_event(
+            latency_ms,
+            cfg.model,
+            cfg.mode,
+            "cancelled",
+            0,
+            0,
+            0,
+            U.cost or 0,
+            job.context and job.context.cue_id,
+            job.context and job.context.run_id,
+            0
+          )
+          log_performance(event)
+        end)
+      end
+      safe_log()
+      -- Invoke callback with cancellation error
+      if job.callback then
+        job.callback("cancelled", nil)
+      end
     end
   end
   vim.notify("glm · stopped in-flight streams", vim.log.levels.INFO)
