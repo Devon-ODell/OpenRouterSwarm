@@ -22,16 +22,11 @@ fi
 echo "==> venv ready ($("$PY" -V))"
 
 # ---------------------------------------------------------------- 2. API key
-if ! grep -qs '^OPENROUTER_API_KEY=.\+' "$ROOT/.env"; then
+if ! grep -qs '^OPENROUTER_API_KEY=.\+' "$ROOT/.env" 2>/dev/null; then
   key=""
-  for old in "$HOME/Desktop/LingAI-Trader/.env" "$ROOT/../LingAI-Trader/.env"; do
-    if [ -f "$old" ] && grep -qs '^OPENROUTER_API_KEY=.\+' "$old"; then
-      key="$(grep '^OPENROUTER_API_KEY=' "$old" | tail -1 | cut -d= -f2-)"
-      echo "==> using OPENROUTER_API_KEY from $old"
-      break
-    fi
-  done
-  if [ -z "$key" ] && [ -t 0 ]; then
+  if [ -t 0 ]; then
+    echo ""
+    echo "You need an OpenRouter API key (free to create): https://openrouter.ai/keys"
     read -r -s -p "OpenRouter API key (sk-or-...): " key; echo
   fi
   if [ -n "$key" ]; then
@@ -40,7 +35,7 @@ if ! grep -qs '^OPENROUTER_API_KEY=.\+' "$ROOT/.env"; then
     chmod 600 "$ROOT/.env"
     echo "==> wrote $ROOT/.env"
   else
-    echo "!! no API key yet: add OPENROUTER_API_KEY=sk-or-... to $ROOT/.env"
+    echo "!! no API key yet: add OPENROUTER_API_KEY=sk-or-... to $ROOT/.env, then re-run this script"
   fi
 else
   echo "==> .env has OPENROUTER_API_KEY"
@@ -57,9 +52,7 @@ fi
 # ---------------------------------------------------------------- 3b. commands
 mkdir -p "$HOME/.local/bin"
 printf '#!/bin/sh\nexec "%s" "%s/flint.py" "$@"\n' "$PY" "$ROOT" > "$HOME/.local/bin/flint"
-printf '#!/bin/sh\ncase "$1" in\n  vector) shift; exec "%s" "%s/swarm/vector_runner.py" "$@" ;;
-  *) exec "%s" "%s/swarm/swarmd.py" "$@" ;;
-esac\n' "$PY" "$ROOT" "$PY" "$ROOT" "$PY" "$ROOT" > "$HOME/.local/bin/swarm"
+printf '#!/bin/sh\nexec "%s" "%s/swarm/swarmd.py" "$@"\n' "$PY" "$ROOT" > "$HOME/.local/bin/swarm"
 chmod +x "$HOME/.local/bin/flint" "$HOME/.local/bin/swarm"
 if ! echo ":$PATH:" | grep -q ":$HOME/.local/bin:"; then
   for rc in "$HOME/.zshrc" "$HOME/.bash_profile"; do
@@ -84,12 +77,46 @@ if [ "$EXTENSION" = 1 ]; then
   fi
 fi
 
+# ---------------------------------------------------------------- 6. OpenRouter credit-tier check
+# OpenRouter's own policy, not something this project invents: a key with $0 ever purchased
+# is capped at a low daily rate for free models. Load $10 in credits once (never spent down —
+# free models stay free) and the cap rises to 1000/day, which is what every tuned config here
+# assumes. This step tells you, concretely, which side of that line your key is on right now.
+echo ""
+echo "==> checking your OpenRouter account tier"
+if grep -qs '^OPENROUTER_API_KEY=.\+' "$ROOT/.env" 2>/dev/null; then
+  "$PY" - "$ROOT" <<'PYEOF' || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import os
+for line in open(os.path.join(sys.argv[1], ".env")):
+    if line.startswith("OPENROUTER_API_KEY="):
+        os.environ["OPENROUTER_API_KEY"] = line.strip().split("=", 1)[1]
+import flint
+info = flint.fetch_key_info(os.environ["OPENROUTER_API_KEY"])
+if info is None:
+    print("    could not reach OpenRouter to check (offline, or the key is invalid) — "
+          "the swarm will tell you the same thing on first run.")
+elif info.get("is_free_tier"):
+    quota = info.get("free_model_daily_requests") or {}
+    print(f"    free tier, no credits purchased yet — today's free-model limit is "
+          f"{quota.get('limit', 'low')}, not the 1000/day this project is tuned for.")
+    print("    One-time fix: add $10 in credits at https://openrouter.ai/credits")
+    print("    (you will not be charged unless you also turn on paid fallback — free models stay free)")
+else:
+    quota = info.get("free_model_daily_requests") or {}
+    print(f"    credits on file — free-model limit today: {quota.get('limit', '1000')}/day. You're set.")
+PYEOF
+else
+  echo "    skipped (no API key yet)"
+fi
+
 cat <<EOF
 
 Done. Next:
-  .venv/bin/python flint.py                     # or just: flint
-  swarm grind ~/path/to/game --goal "..."        # start the swarm on a project
-  swarm vector run --task 2 --model dots-studio/dots-3-note-preview:free   # recursive bench
-In Cursor: 'Developer: Reload Window'. If you ever set 'Flint Swarm: Flint Path'
-to the old LingAI-Trader folder, clear it (or set it to $ROOT).
+  flint                                          # one interactive session, right here
+  swarm init ~/path/to/some/other/repo           # point the swarm at a project (writes a tuned config)
+  swarm grind ~/path/to/some/other/repo --goal "what it should become"   # start it
+
+Fully quit Cursor and open it again, then look for Flint in the secondary sidebar.
 EOF

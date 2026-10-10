@@ -9,6 +9,8 @@
   let status = saved.status || null, info = saved.info || null;
   let landed = saved.landed || null, parked = saved.parked || null;
   let settings = saved.settings || null;
+  let skin = saved.skin || null;                // custom look: colors, background, fonts, fx
+  let updateState = saved.updateState || { count: 0, version: '0.0.0', busy: false };
   let tab = saved.tab || 'ask';
   const open = new Set();                       // queue rows expanded to show their detail
   let editing = null;                           // {id, task} while a task is being rewritten
@@ -16,9 +18,23 @@
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
-  const save = () => vscode.setState({ threads: threads.slice(-20), status, info, tab, landed, parked, settings });
+  const save = () => vscode.setState({ threads: threads.slice(-20), status, info, tab, landed, parked, settings, skin, updateState });
   // Cents are the unit that matters under a dollar: the first few questions cost fractions of one.
   const money = (n) => '$' + Number(n || 0).toFixed(Math.abs(Number(n) || 0) < 1 ? 4 : 2);
+
+  function renderUpdateVersion(message) {
+    updateState = Object.assign({}, updateState, message);
+    const button = $('updateVersion');
+    button.disabled = !!updateState.busy;
+    button.textContent = updateState.busy
+      ? `Updating ${updateState.version}…`
+      : `Update · ${updateState.version}`;
+    button.title = `${Number(updateState.count || 0).toLocaleString()} total update clicks — install this checkout and restart Cursor`;
+    if (updateState.error) {
+      $('notice').textContent = `Update ${updateState.version} failed: ${updateState.error}`;
+      $('notice').className = 'notice error';
+    }
+  }
 
   /** "4m10s" for a duration in seconds. */
   function forHuman(seconds) { return idleFor(seconds); }
@@ -112,24 +128,22 @@
         const spent = sp.left != null && sp.left <= 0;
         bits.push(`<span class="meter" title="${money(sp.used)} of ${money(sp.cap)}">`
           + `<span class="meter-fill${spent ? ' full' : ''}" style="width:${Math.min(100, (sp.used / sp.cap) * 100).toFixed(1)}%"></span></span>`
-          + ` $ spent this month (OpenRouter-reported) <b>${money(sp.used)}</b> of ${money(sp.cap)} cap`
+          + ` background budget <b>${money(sp.used)} / ${money(sp.cap)}</b>`
           + (sp.shared ? ' this month' : ' today')
           + (sp.resets ? ` <span class="dim">· back ${R.esc(sp.resets)}</span>` : '')
           + (spent ? ' <span class="err">— spent</span>' : ''));
       }
       const paid = status.paid_fallback || 'off';
-      const paidWord = { off: 'OFF — free models only', auto: 'on, as a rescue when no free model answers',
-        always: 'ON from the first request' }[paid] || paid;
-      bits.push(`<span class="${paid === 'off' ? 'ok' : 'warn'}">paid requests: <b>${R.esc(paidWord)}</b></span>`
-        + ` <button class="icon" id="paidToggle" title="${paid === 'off' ? 'Allow paid models as a rescue' : 'Switch paid requests off'}">${paid === 'off' ? '🔒' : '⏻'}</button>`);
-      // What the daemon does once the free allowance runs out and no turn can start:
-      // stop (default), idle until the reset, or keep retrying a paid model forever.
       const quota = status.quota_mode || 'shutdown';
-      const quotaWord = { shutdown: 'stop the daemon', wait: 'wait for the daily reset',
-        paid: 'fall back to paid, never stop' }[quota] || quota;
-      const quotaEmoji = { shutdown: '🛑', wait: '⏳', paid: '💳' }[quota] || '🛑';
-      bits.push(`<span class="${quota === 'shutdown' ? 'ok' : 'warn'}">on quota exhaustion: <b>${R.esc(quotaWord)}</b></span>`
-        + ` <button class="icon" id="quotaModeToggle" title="Click to cycle shutdown → wait → paid">${quotaEmoji}</button>`);
+      const paidWord = { off: 'questions stay free', auto: 'paid rescue for questions',
+        always: 'questions use paid first' }[paid] || paid;
+      const quotaWord = { shutdown: 'swarm stops at the free limit', wait: 'swarm waits for reset',
+        paid: 'swarm may continue on paid' }[quota] || quota;
+      const w = status.wallet;
+      const capWord = w ? `${money(w.spent)} / ${money(w.cap)} paid-answer cap` : 'no paid-answer cap';
+      bits.push(`<span class="cost-line"><span class="cost-shield" aria-hidden="true">◇</span><b>Cost safety</b> · `
+        + `${R.esc(paidWord)} · ${R.esc(quotaWord)} · ${R.esc(capWord)}`
+        + ` <button class="inline-link" id="costSettings" title="Open cost and fallback settings">Manage</button></span>`);
       // The provider/model the developer's ask will use (local picks stay off OpenRouter).
       const prov = status.ask_provider || 'openrouter';
       const provLabel = prov === 'openrouter' ? 'OpenRouter' : prov;
@@ -140,12 +154,6 @@
         bits.push(`<span class="err">no OpenRouter API key set</span> `
           + `<button class="icon" id="setkey" title="Set the OpenRouter API key in Cursor encrypted SecretStorage">🔑</button>`);
       }
-      const w = status.wallet;
-      if (w) {
-        bits.push(`editor wallet: recorded <b>${money(w.spent)}</b> of ${money(w.cap)} cap` +
-          (w.remaining <= 0 ? ' <span class="err">— spent</span>' : '') +
-          ` <button class="icon" id="budget" title="Change the paid budget">✎</button>`);
-      } else bits.push('<span class="dim">no editor wallet configured</span> <button class="icon" id="budget" title="Set a paid budget">✎</button>');
       const held = status.roadmap && status.roadmap.roots;
       if (held && held.length) {
         const rows = status.roadmap.blocked || {};
@@ -189,14 +197,6 @@
     $('stop').disabled = !running;
     $('drain').disabled = !running;
     $('restart').disabled = !running;
-    const recent = (status && status.recent) || [];
-    const age = status && status.stale_seconds;
-    const quiet = running && age != null
-      ? `<div class="quiet${age >= 600 ? ' warn' : ''}">quiet ${idleFor(age)}`
-        + `<button class="icon" id="activity" title="Watch the activity log">log&nbsp;↗</button></div>`
-      : '';
-    $('recent').innerHTML = (recent.length
-      ? recent.slice(-6).reverse().map((r) => `<div>${R.esc(r)}</div>`).join('') : '') + quiet;
     const n = status ? status.queue.length : 0;
     const badge = $('qcount');
     badge.textContent = n ? String(n) : '';
@@ -258,6 +258,27 @@
     }
   }
 
+  const PAID_PILL = { off: 'Free only', auto: 'Paid rescue', always: 'Paid first' };
+  function renderCostSettings() {
+    const configured = (settings && settings.keyConfigured) || !!(info && info.api_key);
+    const wallet = status && status.wallet;
+    const paidOn = $('settingPaid').value !== 'off' || $('settingQuota').value === 'paid';
+    const pill = $('costSummaryPill');
+    pill.textContent = PAID_PILL[$('settingPaid').value] || 'Free only';
+    pill.classList.toggle('good', !paidOn);
+    $('budgetSummary').textContent = wallet
+      ? `${money(wallet.remaining)} left of ${money(wallet.cap)} · ${money(wallet.spent)} used`
+      : 'No paid-answer cap is configured.';
+    const needsPaidKey = ($('settingPaid').value !== 'off' || $('settingQuota').value === 'paid') && !configured;
+    const daemonMissing = $('settingQuota').value === 'paid' && status && status.daemon_paid_configured === false;
+    const capSpent = $('settingPaid').value !== 'off' && wallet && wallet.remaining <= 0;
+    const warning = needsPaidKey ? 'Paid fallback needs an OpenRouter key.'
+      : daemonMissing ? 'Background paid fallback still needs a paid model and spending cap in this repository’s swarm config.'
+        : capSpent ? 'The paid-answer cap is exhausted. Change or reset it before using paid rescue.' : '';
+    $('costWarning').textContent = warning;
+    $('costWarning').className = 'cost-note' + (warning ? ' warn' : '');
+  }
+
   function renderSettings() {
     if (!settings) return;
     const v = settings.values || {};
@@ -265,6 +286,7 @@
     $('settingSteps').value = v.stepsPerModel == null ? 8 : v.stepsPerModel;
     $('settingTimeout').value = v.timeoutSeconds == null ? 300 : v.timeoutSeconds;
     $('settingPaid').value = v.paidFallback || 'off';
+    $('settingQuota').value = (status && status.quota_mode) || 'shutdown';
     $('settingSynthesize').checked = v.synthesize !== false;
     $('settingStudy').checked = v.useStudy !== false;
     $('settingPath').value = v.flintPath || '';
@@ -273,21 +295,216 @@
     $('keyStatus').textContent = configured ? 'Configured' : 'Not set';
     $('keyStatus').className = 'state-pill ' + (configured ? 'good' : '');
     $('clearKey').disabled = !settings.keyConfigured;
+    renderCostSettings();
     renderModelControls();
+  }
+
+  // ---------------------------------------------------------------- customization ("dress it up")
+
+  const SKIN_DEFAULTS = { bg: '#1e1e1e', surface: '#262626', text: '#cccccc', accent: '#6b8afd',
+    border: '#7f7f7f66', radius: 8, font: '', fontCustom: '',
+    bgImage: null, bgFit: 'cover', bgDarkness: 55, bgBlur: 0,
+    headerImage: null, headerFit: 'cover', headerDarkness: 45, headerBlur: 0,
+    composerImage: null, composerFit: 'cover', composerDarkness: 45, composerBlur: 0,
+    glow: false, crt: false, marquee: false, marqueeText: '', confettiOnLand: false };
+
+  const SKIN_PRESETS = [
+    { id: 'winamp', cls: 'sw-winamp', name: 'Winamp Llama', desc: 'Two decibels above tasteful.',
+      skin: { bg: '#140d26', surface: '#1f1640', text: '#e6e6ff', accent: '#2de2c2', border: '#3a2d66',
+        radius: 3, font: "'Courier New', monospace", glow: true, crt: false, marquee: false, bgImage: null } },
+    { id: 'vapor', cls: 'sw-vapor', name: 'Vaporwave Sunset', desc: 'Lo-fi beats to grind a swarm to.',
+      skin: { bg: '#1a0f2e', surface: '#2a1850', text: '#ffe3fb', accent: '#ff6ec7', border: '#52317f',
+        radius: 14, font: "'Trebuchet MS', sans-serif", glow: true, crt: false, marquee: false,
+        bgImage: 'linear-gradient(160deg,#2a0a4a 0%,#5a1a6e 40%,#ff6ec7 75%,#ffd37a 100%)', bgFit: 'cover', bgDarkness: 35, bgBlur: 0 } },
+    { id: 'fine', cls: 'sw-fine', name: 'This Is Fine', desc: "Everything's under control.",
+      skin: { bg: '#2b1308', surface: '#3d1c0d', text: '#ffe7d6', accent: '#ff8a3d', border: '#6b3317',
+        radius: 18, font: "'Comic Sans MS', cursive", glow: false, crt: false, marquee: false, bgImage: null } },
+    { id: 'crt', cls: 'sw-crt', name: 'CRT Terminal', desc: 'Green text, tall tales, zero chill.',
+      skin: { bg: '#021402', surface: '#041f04', text: '#7cff9b', accent: '#33ff66', border: '#0f5c22',
+        radius: 2, font: "'Courier New', monospace", glow: true, crt: true, marquee: false, bgImage: null } },
+    { id: 'comic', cls: 'sw-comic', name: 'Comic Sans Chaos', desc: 'Legally distinct from a ransom note.',
+      skin: { bg: '#fff176', surface: '#ffe066', text: '#2b2400', accent: '#ff5c5c', border: '#d4b400',
+        radius: 20, font: "'Comic Sans MS', cursive", glow: false, crt: false, marquee: false, confettiOnLand: true, bgImage: null } },
+    { id: 'myspace', cls: 'sw-myspace', name: 'MySpace 2008', desc: 'Top 8 friends not included.',
+      skin: { bg: '#120014', surface: '#28002b', text: '#ffd6f5', accent: '#ff1f8f', border: '#5c0050',
+        radius: 10, font: 'Papyrus, fantasy', glow: true, crt: false, marquee: true,
+        marqueeText: '✦ THANKS FOR VISITING MY SWARM ✦ PLEASE SIGN THE GUESTBOOK ✦ xoxo ✦', bgImage: null } },
+  ];
+
+  function clamp(n, lo, hi, dflt) { n = Number(n); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; }
+
+  /** Black or white, whichever reads better on this hex color — so a wild accent choice never eats its own button label. */
+  function contrastOf(hex) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+    if (!m) return '#ffffff';
+    const n = parseInt(m[1], 16);
+    const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+    const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+    return lum > 0.6 ? '#1a1a1a' : '#ffffff';
+  }
+
+  // A single nonce'd <style> tag carries every dynamic visual change. The CSP has no
+  // 'unsafe-inline' for style-src, so a plain element.style write would be silently dropped;
+  // nonce sources only cover <style>/<link> elements, never the style="" attribute or CSSOM writes.
+  function skinStyleEl() {
+    let s = document.getElementById('skinStyleTag');
+    if (!s) {
+      s = document.createElement('style');
+      s.id = 'skinStyleTag';
+      s.nonce = window.__NONCE__ || '';
+      document.head.appendChild(s);
+    }
+    return s;
+  }
+
+  // For the one free-text field (a pasted URL): strip characters that could break out of the
+  // url("...") wrapper or the declaration around it. Applied once, at the point of entry — not
+  // to the already-assembled bgImage value, which by then is a complete, trusted CSS value
+  // (either this, a preset's literal gradient() string, or an upload's base64 data: URI).
+  function sanitizeCssText(v) { return String(v == null ? '' : v).replace(/["');{}]/g, ''); }
+
+  /** One image/color/fit/darkness/blur layer, shared by the full backdrop, header, and composer. */
+  function layerCss(selector, image, fit, darkness, blur, dfltDark) {
+    if (!image) return `${selector}{opacity:0;}`;
+    const dark = clamp(darkness, 0, 90, dfltDark) / 100;
+    const b = clamp(blur, 0, 20, 0);
+    const f = fit || 'cover';
+    const fitCss = f === 'tile' ? 'background-repeat:repeat;background-size:auto;'
+      : `background-repeat:no-repeat;background-size:${f};`;
+    return `${selector}{opacity:1;filter:blur(${b}px);background-position:center;` +
+      `background-image:linear-gradient(rgba(0,0,0,${dark}),rgba(0,0,0,${dark})),${image};${fitCss}}`;
+  }
+
+  function applySkin(s) {
+    s = s || {};
+    const root = [];
+    if (s.bg) root.push(`--vscode-sideBar-background:${s.bg};`);
+    if (s.surface) root.push(`--surface:${s.surface};--surface-raised:${s.surface};`);
+    if (s.text) root.push(`--vscode-foreground:${s.text};--vscode-descriptionForeground:color-mix(in srgb, ${s.text} 65%, transparent);`);
+    if (s.accent) {
+      const onAccent = contrastOf(s.accent);
+      root.push(`--accent:${s.accent};--vscode-focusBorder:${s.accent};--vscode-button-background:${s.accent};` +
+        `--vscode-textLink-foreground:${s.accent};--vscode-badge-background:${s.accent};` +
+        `--vscode-button-foreground:${onAccent};--vscode-badge-foreground:${onAccent};`);
+    }
+    if (s.border) root.push(`--hairline:${s.border};--edge:${s.border};`);
+    if (s.radius != null) {
+      const r = clamp(s.radius, 0, 24, 8);
+      root.push(`--r-sm:${Math.round(r * .3)}px;--r-md:${Math.round(r * .45)}px;--r-lg:${Math.round(r * .6)}px;--r-xl:${Math.round(r)}px;`);
+    }
+    const css = root.length ? [`:root{${root.join('')}}`] : [];
+    // A typed font always wins over the preset list — that's the actual "no whitelist" freedom;
+    // the select is just a quick-pick. Sanitized because, unlike the select, this is free text.
+    const fontValue = s.fontCustom ? sanitizeCssText(s.fontCustom) : s.font;
+    if (fontValue) css.push(`body{font-family:${fontValue};}`);
+    css.push(layerCss('#skinBackdrop', s.bgImage, s.bgFit, s.bgDarkness, s.bgBlur, 55));
+    css.push(layerCss('#skinHeaderLayer', s.headerImage, s.headerFit, s.headerDarkness, s.headerBlur, 45));
+    css.push(layerCss('#skinComposerLayer', s.composerImage, s.composerFit, s.composerDarkness, s.composerBlur, 45));
+    skinStyleEl().textContent = css.join('\n');
+    document.body.classList.toggle('fx-glow', !!s.glow);
+    document.body.classList.toggle('fx-crt', !!s.crt);
+    document.body.classList.toggle('fx-marquee', !!s.marquee);
+    $('skinMarquee').hidden = !s.marquee;
+    $('skinMarqueeText').textContent = s.marqueeText || '✦ YOUR SWARM, YOUR RULES ✦ MADE WITH VIBES AND DUCT TAPE ✦';
+  }
+
+  let skinSaveTimer = null;
+  function scheduleSkinSave() {
+    clearTimeout(skinSaveTimer);
+    skinSaveTimer = setTimeout(() => vscode.postMessage({ type: 'skinSave', skin }), 400);
+  }
+
+  function readSkinForm() {
+    const s = {
+      bg: $('skinBg').value, surface: $('skinSurface').value, text: $('skinText').value,
+      accent: $('skinAccent').value, border: $('skinBorder').value, radius: +$('skinRadius').value,
+      font: $('skinFont').value, fontCustom: $('skinFontCustom').value.trim(),
+      bgFit: $('skinBgFit').value, bgDarkness: +$('skinBgDark').value, bgBlur: +$('skinBgBlur').value,
+      headerFit: $('skinHeaderFit').value, headerDarkness: +$('skinHeaderDark').value, headerBlur: +$('skinHeaderBlur').value,
+      composerFit: $('skinComposerFit').value, composerDarkness: +$('skinComposerDark').value, composerBlur: +$('skinComposerBlur').value,
+      glow: $('skinGlow').checked, crt: $('skinCrt').checked,
+      marquee: $('skinMarqueeToggle').checked, marqueeText: $('skinMarqueeTextInput').value,
+      confettiOnLand: $('skinConfetti').checked,
+      // Images aren't form fields with a visible current value — they're set by upload/URL/clear
+      // and just carried forward here so a color/slider tweak doesn't accidentally drop them.
+      bgImage: skin && skin.bgImage || null,
+      headerImage: skin && skin.headerImage || null,
+      composerImage: skin && skin.composerImage || null,
+    };
+    return s;
+  }
+
+  function fillSkinForm(s) {
+    s = Object.assign({}, SKIN_DEFAULTS, s || {});
+    $('skinBg').value = s.bg; $('skinSurface').value = s.surface; $('skinText').value = s.text;
+    $('skinAccent').value = s.accent; $('skinBorder').value = s.border;
+    $('skinRadius').value = s.radius; $('skinRadiusVal').textContent = s.radius;
+    $('skinFont').value = s.font || ''; $('skinFontCustom').value = s.fontCustom || '';
+    $('skinBgFit').value = s.bgFit; $('skinBgDark').value = s.bgDarkness; $('skinBgDarkVal').textContent = s.bgDarkness + '%';
+    $('skinBgBlur').value = s.bgBlur; $('skinBgBlurVal').textContent = s.bgBlur + 'px';
+    $('skinHeaderFit').value = s.headerFit; $('skinHeaderDark').value = s.headerDarkness; $('skinHeaderDarkVal').textContent = s.headerDarkness + '%';
+    $('skinHeaderBlur').value = s.headerBlur; $('skinHeaderBlurVal').textContent = s.headerBlur + 'px';
+    $('skinComposerFit').value = s.composerFit; $('skinComposerDark').value = s.composerDarkness; $('skinComposerDarkVal').textContent = s.composerDarkness + '%';
+    $('skinComposerBlur').value = s.composerBlur; $('skinComposerBlurVal').textContent = s.composerBlur + 'px';
+    $('skinGlow').checked = !!s.glow; $('skinCrt').checked = !!s.crt;
+    $('skinMarqueeToggle').checked = !!s.marquee; $('skinMarqueeTextField').hidden = !s.marquee;
+    $('skinMarqueeTextInput').value = s.marqueeText || '';
+    $('skinConfetti').checked = !!s.confettiOnLand;
+  }
+
+  function renderSkinPane() {
+    const box = $('skinPresets');
+    if (!box.childElementCount) {
+      box.innerHTML = SKIN_PRESETS.map((p) =>
+        `<button type="button" class="skin-swatch ${p.cls}" data-preset="${p.id}">` +
+        `<span class="sw-preview" aria-hidden="true"></span><span class="sw-name">${R.esc(p.name)}</span>` +
+        `<span class="sw-desc">${R.esc(p.desc)}</span></button>`).join('');
+    }
+    fillSkinForm(skin);
+  }
+
+  function burstConfetti() {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const canvas = document.createElement('canvas');
+    canvas.className = 'confetti-canvas';
+    canvas.width = innerWidth; canvas.height = innerHeight;
+    document.body.appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+    const colors = ['#ff6ec7', '#6f42ff', '#3fd6c0', '#ffd23f', '#ff5c5c', '#4dd4ff'];
+    const pieces = Array.from({ length: 70 }, () => ({
+      x: Math.random() * canvas.width, y: -20 - Math.random() * canvas.height * 0.3,
+      r: 3 + Math.random() * 4, c: colors[Math.floor(Math.random() * colors.length)],
+      vy: 2 + Math.random() * 3, vx: -1 + Math.random() * 2, rot: Math.random() * Math.PI, vr: -.2 + Math.random() * .4,
+    }));
+    let frames = 0;
+    function tick() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      for (const p of pieces) {
+        p.x += p.vx; p.y += p.vy; p.rot += p.vr;
+        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+        ctx.fillStyle = p.c; ctx.fillRect(-p.r, -p.r, p.r * 2, p.r * 2); ctx.restore();
+      }
+      frames++;
+      if (frames < 110) requestAnimationFrame(tick); else canvas.remove();
+    }
+    requestAnimationFrame(tick);
   }
 
   // ---------------------------------------------------------------- tabs
 
   function renderTab() {
-    for (const name of ['ask', 'queue', 'landed', 'settings', 'help']) {
+    for (const name of ['ask', 'queue', 'landed', 'settings', 'help', 'skin']) {
       $('pane-' + name).hidden = tab !== name;
       const t = $('tab-' + name);
-      t.classList.toggle('active', tab === name);
-      t.setAttribute('aria-selected', tab === name ? 'true' : 'false');
+      if (t) {
+        t.classList.toggle('active', tab === name);
+        t.setAttribute('aria-selected', tab === name ? 'true' : 'false');
+      }
     }
     if (tab === 'queue') { renderQueue(); renderParked(); }
     if (tab === 'landed') renderLanded();
     if (tab === 'settings') { renderSettings(); vscode.postMessage({ type: 'settingsRefresh' }); }
+    if (tab === 'skin') renderSkinPane();
   }
 
   function showTab(name) {
@@ -453,12 +670,6 @@
   // ---------------------------------------------------------------- threads
 
   function cardHtml(c) {
-    if (c.kind === 'hit') {
-      const where = [c.hit.course, c.hit.lecture || c.hit.document, c.hit.page ? 'p. ' + c.hit.page : null].filter(Boolean).join(' · ');
-      return `<div class="meta"><span class="tag">${R.esc(c.hit.kind)}</span> ${R.esc(where)}
-        <a href="#" class="file" data-path="${R.esc(c.hit.path)}"${c.hit.page ? ` data-page="${c.hit.page}"` : ''}>open</a></div>
-        <div class="md">${R.render(c.hit.text.slice(0, 900))}</div>`;
-    }
     const m = R.esc(c.model || '');
     const paid = c.paid ? '<span class="tag paid" title="a paid model, charged to the extension budget">paid</span> ' : '';
     if (c.state === 'pending') return `<div class="meta">${paid}<span class="spin"></span> ${m}${c.role === 'synthesis' ? ' is checking and merging the answers…' : ' is reading your code…'}` +
@@ -478,14 +689,51 @@
     const node = el('article', 'thread');
     node.dataset.id = t.id;
     node.dataset.repo = t.repo || '';
-    const head = t.kind === 'study' ? `📚 MIT lookup: ${R.esc(t.question)}` : R.esc(t.question);
-    node.appendChild(el('div', 'q', `${head}${t.where ? ` <span class="where">${R.esc(t.where)}</span>` : ''}` +
+    node.appendChild(el('div', 'q', `${R.esc(t.question)}${t.where ? ` <span class="where">${R.esc(t.where)}</span>` : ''}` +
       `<button class="icon close" title="Remove">✕</button>`));
     const ordered = t.order.map((k) => t.cards[k]);
-    ordered.sort((a, b) => (b.role === 'synthesis') - (a.role === 'synthesis'));
-    for (const c of ordered) node.appendChild(el('div', 'card' + (c.role === 'synthesis' ? ' synthesis' : '') + (c.state === 'error' ? ' failed' : ''), cardHtml(c)));
+    const synthesis = ordered.find((c) => c.role === 'synthesis' && c.state === 'done');
+    const others = ordered.filter((c) => c.role !== 'synthesis');
+    if (!t.done) {
+      // One quiet line instead of a stack of per-model pending cards — the free-model
+      // consensus is an implementation detail, not something to watch happen live.
+      node.appendChild(el('div', 'thinking-line', 'thinking'));
+    } else if (synthesis) {
+      node.appendChild(el('div', 'card synthesis', cardHtml(synthesis)));
+      if (others.length) {
+        const d = el('details', 'other-answers',
+          `<summary>${others.length} other answer${others.length === 1 ? '' : 's'}</summary>`);
+        for (const c of others) d.appendChild(el('div', 'card' + (c.state === 'error' ? ' failed' : ''), cardHtml(c)));
+        node.appendChild(d);
+      }
+    } else {
+      // No merged answer to lead with (synthesis is off, or every model including the
+      // merger failed) — fall back to showing whatever individual answers/errors exist.
+      for (const c of ordered) node.appendChild(el('div', 'card' + (c.state === 'error' ? ' failed' : ''), cardHtml(c)));
+    }
     if (t.note) node.appendChild(el('div', 'note', R.esc(t.note)));
     return node;
+  }
+
+  /** Border color on the composer: idle (no color), thinking (red) while a model composes
+   * text, running (light blue) while a model is actively calling a tool against the repo. */
+  function updateComposerState() {
+    const form = $('askForm');
+    if (!form) return;
+    let state = 'idle';
+    for (const t of threads) {
+      if (t.done) continue;
+      for (const key of t.order) {
+        const c = t.cards[key];
+        if (!c || c.state !== 'pending') continue;
+        if (c.progress && c.progress.startsWith('tool:')) { state = 'running'; break; }
+        if (state !== 'running') state = 'thinking';
+      }
+      if (state === 'idle') state = 'thinking';  // a thread is live before its first card exists
+      if (state === 'running') break;
+    }
+    form.classList.toggle('state-thinking', state === 'thinking');
+    form.classList.toggle('state-running', state === 'running');
   }
 
   function renderThreads() {
@@ -493,6 +741,7 @@
     box.innerHTML = '';
     for (const t of threads.slice().reverse()) box.appendChild(renderThread(t));
     if (!threads.length) box.innerHTML = '<div class="empty-state"><span class="empty-mark">✦</span><h1>What are we building?</h1><p>Ask about the file you have open, select a few lines for a focused review, or describe the change you want.</p><div class="prompt-grid"><button class="prompt-chip" data-prompt="Find bugs in the code I have selected">Find a bug</button><button class="prompt-chip" data-prompt="Explain the code I have selected in plain English">Explain this code</button><button class="prompt-chip" data-prompt="What tests should this code have?">Plan tests</button><button class="prompt-chip" data-prompt="How could this code be simpler or faster?">Improve it</button></div></div>';
+    updateComposerState();
   }
 
   function thread(id) { return threads.find((t) => t.id === id); }
@@ -528,26 +777,43 @@
       if (editing && !status.queue.some((t) => t.id === editing.id)) editing = null;
       renderStatus();
       if (tab === 'queue') { renderQueue(); renderParked(); }
+      if (tab === 'settings') renderSettings();
     } else if (msg.type === 'info') { info = msg.data; renderStatus(); renderModelControls(); renderSettings(); }
     else if (msg.type === 'settings') { settings = msg.data; renderSettings(); save(); }
     else if (msg.type === 'settingsSaved') { $('settingsFeedback').className = 'dim'; $('settingsFeedback').textContent = msg.text || 'Saved.'; }
+    else if (msg.type === 'settingsWarning') { $('settingsFeedback').className = 'warn'; $('settingsFeedback').textContent = msg.text || 'Saved with a warning.'; }
     else if (msg.type === 'settingsError') { $('settingsFeedback').textContent = msg.text || 'Could not save settings.'; $('settingsFeedback').className = 'err'; }
     else if (msg.type === 'keySaved') { settings = settings || {}; settings.keyConfigured = true; settings.keyStorage = msg.storage; $('apiKey').value = ''; $('settingsFeedback').className = 'dim'; $('settingsFeedback').textContent = `Key saved in ${msg.storage}.`; renderSettings(); }
     else if (msg.type === 'keyCleared') { settings = settings || {}; settings.keyConfigured = false; $('settingsFeedback').className = 'dim'; $('settingsFeedback').textContent = 'The encrypted key was forgotten on this laptop.'; renderSettings(); }
-    else if (msg.type === 'landed') { landed = msg.commits || []; save(); if (tab === 'landed') renderLanded(); }
+    else if (msg.type === 'landed') {
+      const prevShas = new Set((landed || []).map((c) => c.sha));
+      const isFirstLoad = landed === null;
+      const commits = msg.commits || [];
+      landed = commits; save(); if (tab === 'landed') renderLanded();
+      if (!isFirstLoad && skin && skin.confettiOnLand && commits.some((c) => !prevShas.has(c.sha))) burstConfetti();
+    }
     else if (msg.type === 'parked') { parked = msg.parked || []; save(); if (tab === 'queue') renderParked(); }
-    else if (msg.type === 'tab') { tab = ['queue', 'landed', 'settings', 'help'].includes(msg.tab) ? msg.tab : 'ask'; renderTab(); }
+    else if (msg.type === 'tab') { tab = ['queue', 'landed', 'settings', 'help', 'skin'].includes(msg.tab) ? msg.tab : 'ask'; renderTab(); }
+    else if (msg.type === 'skin') {
+      skin = msg.skin || null; applySkin(skin);
+      // Font lives in Settings, not here, so it needs filling regardless of which tab is open.
+      if (tab === 'skin') renderSkinPane(); else fillSkinForm(skin);
+      save();
+    }
+    else if (msg.type === 'updateVersion') { renderUpdateVersion(msg); }
+    else if (msg.type === 'skinImageResult') {
+      const field = msg.target || 'bgImage';
+      skin = Object.assign({}, SKIN_DEFAULTS, skin, readSkinForm());
+      skin[field] = `url("${msg.dataUri}")`;
+      applySkin(skin); fillSkinForm(skin); scheduleSkinSave(); save();
+      $('skinFeedback').className = 'dim'; $('skinFeedback').textContent = 'Background set.';
+    } else if (msg.type === 'skinImageError') { $('skinFeedback').className = 'err'; $('skinFeedback').textContent = msg.text || 'Could not load that image.'; }
     else if (msg.type === 'queueTask') { editing = { id: msg.task.id, task: msg.task }; editError = null; showTab('queue'); renderQueue(); }
     else if (msg.type === 'queueSaved') { editing = null; editError = null; renderQueue(); }
     else if (msg.type === 'queueError') { editError = msg.error; renderQueue(); }
     else if (msg.type === 'askStart') { threads.push({ id: msg.id, kind: 'ask', question: msg.question, where: msg.where, repo: msg.repo, cards: {}, order: [] }); showTab('ask'); renderThreads(); }
     else if (msg.type === 'askEvent') { const t = thread(msg.id); if (t) { onAskEvent(t, msg.event); renderThreads(); } }
-    else if (msg.type === 'study') {
-      const t = { id: msg.id, kind: 'study', question: msg.query, cards: {}, order: [], done: true };
-      (msg.hits || []).forEach((h, i) => { t.cards['h' + i] = { kind: 'hit', hit: h }; t.order.push('h' + i); });
-      if (!(msg.hits || []).length) t.note = 'No matches in the MIT corpus.';
-      threads.push(t); showTab('ask'); renderThreads();
-    } else if (msg.type === 'notice') { $('notice').textContent = msg.text; $('notice').className = 'notice ' + (msg.level || ''); }
+    else if (msg.type === 'notice') { $('notice').textContent = msg.text; $('notice').className = 'notice ' + (msg.level || ''); }
     else if (msg.type === 'prefill') { $('question').value = msg.question || ''; $('question').focus(); }
     save();
   });
@@ -565,15 +831,9 @@
     if (prompt) { $('question').value = prompt.dataset.prompt || ''; $('question').focus(); return; }
     if (e.target.closest('#board')) { vscode.postMessage({type:'board'}); return; }
     if (e.target.closest('#completed')) { vscode.postMessage({type:'completed'}); return; }
-    if (e.target.closest('#activity')) { vscode.postMessage({ type: 'activity' }); return; }
+    if (e.target.closest('#costSettings')) { showTab('settings'); return; }
     if (e.target.closest('#budget')) { vscode.postMessage({ type: 'budget' }); return; }
     if (e.target.closest('#setkey')) { vscode.postMessage({ type: 'setApiKey' }); return; }
-    if (e.target.closest('#paidToggle')) { vscode.postMessage({ type: 'togglePaid' }); return; }
-    if (e.target.closest('#quotaModeToggle')) {
-      vscode.postMessage({ type: 'cycleQuotaMode', repo: status && status.repo,
-        from: (status && status.quota_mode) || 'shutdown' });
-      return;
-    }
     if (e.target.closest('#qclear')) {
       vscode.postMessage({ type: 'queueClear', repo: status && status.repo });
       return;
@@ -692,6 +952,8 @@
     $('settingModelField').hidden = custom;
     $('customSetting').hidden = !custom;
   });
+  $('settingPaid').addEventListener('change', renderCostSettings);
+  $('settingQuota').addEventListener('change', renderCostSettings);
   $('settingsForm').addEventListener('submit', (e) => {
     e.preventDefault();
     $('settingsFeedback').className = 'dim';
@@ -701,7 +963,9 @@
       model: $('settingProvider').value === '__custom__' ? $('settingCustomModel').value.trim() : $('settingModel').value,
       customUrl: $('settingCustomEndpoint').value.trim(), models: +$('settingModels').value,
       stepsPerModel: +$('settingSteps').value, timeoutSeconds: +$('settingTimeout').value,
-      paidFallback: $('settingPaid').value, synthesize: $('settingSynthesize').checked,
+      paidFallback: $('settingPaid').value, quotaMode: $('settingQuota').value,
+      quotaChanged: $('settingQuota').value !== ((status && status.quota_mode) || 'shutdown'),
+      synthesize: $('settingSynthesize').checked,
       useStudy: $('settingStudy').checked, flintPath: $('settingPath').value,
       python: $('settingPython').value,
     } });
@@ -713,8 +977,14 @@
     vscode.postMessage({ type: 'settingsKeySave', key });
   });
   $('clearKey').addEventListener('click', () => vscode.postMessage({ type: 'settingsKeyClear' }));
+  $('changeBudget').addEventListener('click', () => vscode.postMessage({ type: 'budget' }));
+  $('updateVersion').addEventListener('click', () => {
+    if (updateState.busy) return;
+    updateState = Object.assign({}, updateState, { busy: true, error: null });
+    renderUpdateVersion(updateState);
+    vscode.postMessage({ type: 'updateInstall' });
+  });
   $('queue').addEventListener('click', () => vscode.postMessage({ type: 'queue', title: $('question').value.trim(), withCode: $('withCode').checked }));
-  $('lookup').addEventListener('click', () => vscode.postMessage({ type: 'study', query: $('question').value.trim(), withCode: $('withCode').checked }));
   $('start').addEventListener('click', () => vscode.postMessage({ type: 'start' }));
   $('drain').addEventListener('click', () => vscode.postMessage({ type: 'stop', repo: status && status.repo, drain: true }));
   $('restart').addEventListener('click', () => vscode.postMessage({ type: 'restart', repo: status && status.repo }));
@@ -722,8 +992,100 @@
   $('stop').addEventListener('click', () => vscode.postMessage({ type: 'stop', repo: status && status.repo }));
   $('report').addEventListener('click', () => vscode.postMessage({ type: 'report' }));
 
+  // ---------------------------------------------------------------- customization controls
+
+  function applyFromForm() {
+    skin = readSkinForm();
+    applySkin(skin);
+    scheduleSkinSave();
+    save();
+  }
+
+  $('skinPresets').addEventListener('click', (e) => {
+    const btn = e.target.closest('.skin-swatch');
+    if (!btn) return;
+    const preset = SKIN_PRESETS.find((p) => p.id === btn.dataset.preset);
+    if (!preset) return;
+    skin = Object.assign({}, SKIN_DEFAULTS, preset.skin);
+    fillSkinForm(skin);
+    applySkin(skin);
+    scheduleSkinSave(); save();
+    $('skinFeedback').className = 'dim'; $('skinFeedback').textContent = `${preset.name} applied.`;
+  });
+  for (const id of ['skinBg', 'skinSurface', 'skinText', 'skinAccent', 'skinBorder', 'skinMarqueeTextInput']) {
+    $(id).addEventListener('input', applyFromForm);
+  }
+  $('skinRadius').addEventListener('input', () => { $('skinRadiusVal').textContent = $('skinRadius').value; applyFromForm(); });
+  $('skinBgDark').addEventListener('input', () => { $('skinBgDarkVal').textContent = $('skinBgDark').value + '%'; applyFromForm(); });
+  $('skinBgBlur').addEventListener('input', () => { $('skinBgBlurVal').textContent = $('skinBgBlur').value + 'px'; applyFromForm(); });
+  for (const id of ['skinFont', 'skinBgFit']) $(id).addEventListener('change', applyFromForm);
+  for (const id of ['skinGlow', 'skinCrt', 'skinConfetti']) $(id).addEventListener('change', applyFromForm);
+  $('skinMarqueeToggle').addEventListener('change', () => {
+    $('skinMarqueeTextField').hidden = !$('skinMarqueeToggle').checked;
+    applyFromForm();
+  });
+  for (const id of ['skinFontCustom']) $(id).addEventListener('input', applyFromForm);
+  for (const id of ['skinHeaderFit', 'skinComposerFit']) $(id).addEventListener('change', applyFromForm);
+  for (const id of ['skinHeaderDark', 'skinHeaderBlur', 'skinComposerDark', 'skinComposerBlur']) {
+    const suffix = id.endsWith('Blur') ? 'px' : '%';
+    $(id).addEventListener('input', () => { $(id + 'Val').textContent = $(id).value + suffix; applyFromForm(); });
+  }
+
+  /** Wires upload/paste-URL/clear for one image layer. `field` is the skin property it sets. */
+  function wireImageControls(prefix, field) {
+    $(prefix + 'Upload').addEventListener('click', () => vscode.postMessage({ type: 'skinPickImage', target: field }));
+    $(prefix + 'UrlApply').addEventListener('click', () => {
+      const url = $(prefix + 'Url').value.trim();
+      if (!url) return;
+      skin = Object.assign({}, SKIN_DEFAULTS, skin, readSkinForm());
+      skin[field] = `url("${sanitizeCssText(url)}")`;
+      applySkin(skin); scheduleSkinSave(); save();
+      $('skinFeedback').className = 'dim'; $('skinFeedback').textContent = 'Background set.';
+    });
+    $(prefix + 'Clear').addEventListener('click', () => {
+      skin = Object.assign({}, readSkinForm());
+      skin[field] = null;
+      $(prefix + 'Url').value = '';
+      applySkin(skin); scheduleSkinSave(); save();
+    });
+  }
+  wireImageControls('skinBg', 'bgImage');
+  wireImageControls('skinHeader', 'headerImage');
+  wireImageControls('skinComposer', 'composerImage');
+
+  $('skinConfettiTest').addEventListener('click', burstConfetti);
+  $('skinChaos').addEventListener('click', () => {
+    const rnd = () => '#' + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0');
+    const fonts = ["'Courier New', monospace", "'Comic Sans MS', cursive", 'Papyrus, fantasy',
+      'Impact, sans-serif', "'Brush Script MT', cursive", "'Trebuchet MS', sans-serif"];
+    const carry = skin || {};
+    skin = Object.assign({}, SKIN_DEFAULTS, {
+      bg: rnd(), surface: rnd(), text: rnd(), accent: rnd(), border: rnd(),
+      radius: Math.round(Math.random() * 24), font: fonts[Math.floor(Math.random() * fonts.length)],
+      fontCustom: '',   // chaos picks from the curated list; a leftover custom font would silently override it
+      glow: Math.random() > .5, crt: Math.random() > .7, marquee: Math.random() > .6,
+      marqueeText: carry.marqueeText, confettiOnLand: Math.random() > .5,
+      // Chaos is for colors and fonts, not your pictures — carry every image layer forward as-is.
+      bgImage: carry.bgImage || null, bgFit: carry.bgFit, bgDarkness: carry.bgDarkness, bgBlur: carry.bgBlur,
+      headerImage: carry.headerImage || null, headerFit: carry.headerFit, headerDarkness: carry.headerDarkness, headerBlur: carry.headerBlur,
+      composerImage: carry.composerImage || null, composerFit: carry.composerFit, composerDarkness: carry.composerDarkness, composerBlur: carry.composerBlur,
+    });
+    fillSkinForm(skin); applySkin(skin); scheduleSkinSave(); save();
+    $('skinFeedback').className = 'dim'; $('skinFeedback').textContent = 'Chaos applied. Good luck.';
+  });
+  $('skinResetBtn').addEventListener('click', () => {
+    skin = null;
+    fillSkinForm(null); applySkin(null);
+    vscode.postMessage({ type: 'skinReset' }); save();
+    $('skinFeedback').className = 'dim'; $('skinFeedback').textContent = 'Back to default.';
+  });
+
   renderStatus();
   renderThreads();
   renderTab();
+  applySkin(skin);
+  // The font control lives in Settings now, not the Customize tab, so it needs filling in
+  // regardless of which tab (if any) happens to get opened first.
+  fillSkinForm(skin);
   vscode.postMessage({ type: 'ready' });
 })();

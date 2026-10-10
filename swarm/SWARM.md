@@ -195,7 +195,7 @@ extension into Cursor. From the editor you can:
 - ask several free models about the selection, or the function under the cursor, in parallel, with a merged and checked answer;
 - queue a swarm task for the selection, with file and lines attached;
 - see the queue in its own tab, and edit or drop a task from it (hover a row for ✎ and ✕);
-- look up MIT lectures;
+  answering models may use the MIT corpus internally through the `study` tool;
 - start, stop and read reports on the swarm for the current repository.
 
 It talks to `swarm/bridge.py`, a JSON CLI you can also use directly (see its

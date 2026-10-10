@@ -863,6 +863,10 @@ def cmd_status(a):
           "config_warnings": swarmd.config_warnings(c),
           "config_tuned_available": str(tuned) if tuned.is_file() else None,
           "quota_mode": swarmd.quota_mode(c),
+          # Enough for the settings UI to explain whether "continue with paid" is
+          # configured, without exposing model ids or making the UI infer config rules.
+          "daemon_paid_configured": bool(swarmd.paid_pool(c)) and
+                                    (swarmd.spend_cap(c) or 0) > 0,
           "trunk": swarmd.trunk_name(c), "trunk_ahead": int(ahead) if str(ahead or "").isdigit() else None,
           # A roadmap run whose packets are all held looks exactly like an idle one from the
           # queue alone. The report says which packet is held, why, and what releases it.

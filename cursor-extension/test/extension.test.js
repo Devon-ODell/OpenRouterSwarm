@@ -38,14 +38,14 @@ const vscode = {
     createStatusBarItem: () => ({ show() {}, dispose() {} }),
     registerWebviewViewProvider: (id, p) => { providers.push(id); provider = p; return disposable; },
     createTerminal: (opts) => {
-      const term = { name: opts.name, pty: opts.pty, out: [], exitStatus: undefined,
+      const term = { ...opts, name: opts.name, pty: opts.pty, out: [], exitStatus: undefined,
         show() {}, dispose() { this.exitStatus = { code: 0 }; } };
-      opts.pty.onDidWrite((s) => term.out.push(s));
+      if (opts.pty) opts.pty.onDidWrite((s) => term.out.push(s));
       terminals.push(term);
       return term;
     },
     onDidChangeActiveTextEditor: () => disposable,
-    showWarningMessage: () => Promise.resolve(undefined),
+    showWarningMessage: () => Promise.resolve(vscode.__warningAnswer),
     showInformationMessage: (msg) => { vscode.__info = msg; return Promise.resolve(undefined); },
     showErrorMessage: (msg) => { vscode.__error = msg; return Promise.resolve(undefined); },
     showInputBox: (opts) => {
@@ -79,8 +79,15 @@ const ext = require(path.join(EXT, 'extension.js'));
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
 
+// Shared across every test in this file, the way the real host hands one context to activate()
+// once. A plain Map is enough: the real contract is just "what you update() comes back from get()".
+const globalState = { store: new Map(), syncedKeys: [],
+  get(key, dflt) { return this.store.has(key) ? this.store.get(key) : dflt; },
+  update(key, value) { this.store.set(key, value); return Promise.resolve(); },
+  setKeysForSync(keys) { this.syncedKeys = keys.slice(); } };
+
 test('every contributed command is registered, and menus only use contributed commands', () => {
-  ext.activate({ subscriptions: [], extensionUri: { fsPath: EXT } });
+  ext.activate({ subscriptions: [], extensionUri: { fsPath: EXT }, globalState });
   const declared = manifest.contributes.commands.map((c) => c.command).sort();
   assert.deepStrictEqual(Object.keys(registered).sort(), declared);
   const used = [...Object.values(manifest.contributes.menus).flat(), ...manifest.contributes.keybindings].map((m) => m.command);
@@ -88,6 +95,21 @@ test('every contributed command is registered, and menus only use contributed co
   for (const group of Object.values(manifest.contributes.viewsContainers)) {
     group.forEach((c) => assert.ok(fs.existsSync(path.join(EXT, c.icon)), c.icon));
   }
+  assert.ok(globalState.syncedKeys.includes(ext._test.UPDATE_CLICKS_KEY),
+    'the lifetime click counter participates in editor Settings Sync');
+});
+
+test('update clicks render as a bounded three-field base-1000 version', () => {
+  const version = ext._test.updateVersion;
+  assert.strictEqual(version(-1), '0.0.0');
+  assert.strictEqual(version(0), '0.0.0');
+  assert.strictEqual(version(1), '0.0.1');
+  assert.strictEqual(version(999), '0.0.999');
+  assert.strictEqual(version(1000), '0.1.0');
+  assert.strictEqual(version(999999), '0.999.999');
+  assert.strictEqual(version(1000000), '1.0.0');
+  assert.strictEqual(version(999999999), '999.999.999');
+  assert.strictEqual(version(1000000000), '999.999.999');
 });
 
 test('the panel is contributed to the secondary sidebar, with the activity bar as fallback', () => {
@@ -158,24 +180,66 @@ test('the webview has a nonce CSP and no inline handlers', () => {
   provider.resolveWebviewView(view);
   const html = view.webview.html;
   const nonce = html.match(/'nonce-([^']+)'/)[1];
-  assert.strictEqual(html.split(`nonce="${nonce}"`).length - 1, 2);
+  assert.strictEqual(html.split(`nonce="${nonce}"`).length - 1, 3);
   assert.ok(html.includes("default-src 'none'"));
   assert.ok(!/\son\w+=/.test(html));
   assert.ok(html.includes('id="providerSelect"') && html.includes('id="modelSelect"'), 'the composer owns model selection');
+  assert.ok(html.includes('id="updateVersion"') && html.includes('Update · 0.0.0'),
+    'the persistent updater begins visibly at zero');
+  assert.ok(!html.includes('Search MIT notes') && !html.includes('id="lookup"'), 'corpus retrieval is not a human-facing action');
+  // Font is a serious, boring setting with a sane default — not a toy buried in the skin tab.
+  const settingsSection = html.slice(html.indexOf('id="pane-settings"'), html.indexOf('id="pane-skin"'));
+  assert.ok(settingsSection.includes('id="skinFont"') && settingsSection.includes('id="skinFontCustom"'),
+    'the font control lives in Settings');
+  assert.ok(settingsSection.includes('<option value="">Helvetica (default)</option>'),
+    'Helvetica is the default option, not a Cursor-matching or novelty font');
+  const skinSection = html.slice(html.indexOf('id="pane-skin"'), html.indexOf('id="pane-help"'));
+  assert.ok(!skinSection.includes('id="skinFont"'), 'not duplicated in the Customize tab');
+  assert.ok(skinSection.includes('id="skinRadius"'), 'roundness still lives in Customize, just not font');
+  // Paid fallback is off by default and most people never touch it — it's collapsed behind a
+  // <details>, not an open section competing with Model/Key/Answer-behavior for attention.
+  assert.ok(settingsSection.includes('<details class="settings-card cost-card advanced-card">'),
+    'the cost & fallback card starts collapsed (no open attribute), not force-opened');
+  assert.ok(settingsSection.includes('id="costSummaryPill"'), 'its current policy still shows on the closed summary line');
+  // Helvetica has to be the ACTUAL rendered default, not just what the dropdown label claims —
+  // an empty font value falls through to this base rule when nothing has been customized.
+  const css = fs.readFileSync(path.join(EXT, 'media', 'panel.css'), 'utf8');
+  assert.ok(/\bbody\s*\{[^}]*font-family:\s*'Helvetica Neue',\s*Helvetica,\s*Arial,\s*sans-serif/.test(css),
+    'the base stylesheet defaults to Helvetica, independent of any skin');
   assert.ok(html.includes('id="pane-settings"') && html.includes('id="pane-help"'), 'settings and zero-to-hero help are first-class pages');
   assert.ok(html.includes('type="password"') && !html.includes('value="sk-'), 'the key field never embeds a secret');
   provider.post({ type: 'status', data: {} });
   assert.strictEqual(posted.length, 0, 'messages wait for the ready handshake');
 });
 
+test('a saved skin persists under its own globalState key, and reset clears it rather than writing a sentinel', async () => {
+  const posted = [];
+  const view = { visible: true, show() {}, onDidChangeVisibility: () => disposable,
+    webview: { options: null, cspSource: 'vscode-resource:', asWebviewUri: (u) => u, postMessage: (m) => posted.push(m), onDidReceiveMessage: () => disposable } };
+  provider.resolveWebviewView(view);
+  // Skip the 'ready' handshake here: it also kicks off refreshStatus()/sendSettings(), which spawn
+  // the real bridge — unrelated to what this test checks, and not something to trigger incidentally.
+  provider.ready = true;
+  const mySkin = { bg: '#021402', accent: '#33ff66', crt: true };
+  await provider.onMessage({ type: 'skinSave', skin: mySkin });
+  assert.deepStrictEqual(globalState.get('flintSwarm.skin'), mySkin, 'saved under its own key, not folded into project settings');
+  await provider.onMessage({ type: 'skinReset' });
+  assert.strictEqual(globalState.get('flintSwarm.skin'), undefined, 'reset clears the key outright');
+  assert.deepStrictEqual(posted[posted.length - 1], { type: 'skin', skin: null }, 'the webview is told to drop back to default immediately');
+});
+
 test('the panel script renders a streamed ask with the merged answer first', () => {
   const els = {};
   const make = (tag) => {
+    const classes = new Set();
     const e = { tag, children: [], dataset: {}, className: '', textContent: '', value: '', checked: true,
-      disabled: false, hidden: false, attrs: {},
-      appendChild(c) { this.children.push(c); }, addEventListener() {}, focus() {}, requestSubmit() {},
+      disabled: false, hidden: false, attrs: {}, listeners: {},
+      appendChild(c) { this.children.push(c); }, addEventListener(t, fn) { this.listeners[t] = fn; }, focus() {}, requestSubmit() {},
       setAttribute(k, v) { this.attrs[k] = v; },
-      classList: { toggle() {}, add() {}, remove() {} },
+      classList: {
+        toggle(c, on) { (on == null ? !classes.has(c) : on) ? classes.add(c) : classes.delete(c); },
+        add(c) { classes.add(c); }, remove(c) { classes.delete(c); }, contains(c) { return classes.has(c); },
+      },
       text() { return this.innerHTML + this.children.map((c) => c.text()).join(''); } };
     let html = '';   // like the DOM: assigning innerHTML replaces the children
     Object.defineProperty(e, 'innerHTML', { get: () => html, set: (v) => { html = v; e.children = []; } });
@@ -183,6 +247,7 @@ test('the panel script renders a streamed ask with the merged answer first', () 
   };
   const handlers = {};
   global.document = { getElementById: (id) => (els[id] = els[id] || make(id)), createElement: make,
+    body: make('body'), head: make('head'),
     addEventListener: (t, fn) => { handlers['doc:' + t] = fn; } };
   global.window = { FlintRender: require(path.join(EXT, 'media', 'render.js')), addEventListener: (t, fn) => { handlers[t] = fn; } };
   const sent = [];
@@ -192,22 +257,98 @@ test('the panel script renders a streamed ask with the merged answer first', () 
   assert.deepStrictEqual(sent, [{ type: 'ready' }]);
   const send = (data) => handlers.message({ data });
   send({ type: 'askStart', id: 'q1', question: 'Find bugs', where: 'app.py:1-9', repo: '/r' });
+  // The free-model consensus is an implementation detail now: one quiet "thinking" line,
+  // not a live stack of per-model pending cards, and the composer outline turns red.
+  assert.ok(els.threads.text().includes('thinking'));
+  assert.ok(els.askForm.classList.contains('state-thinking'));
+  assert.ok(!els.askForm.classList.contains('state-running'));
   send({ type: 'askEvent', id: 'q1', event: { event: 'start', model: 'a:free' } });
   send({ type: 'askEvent', id: 'q1', event: { event: 'progress', model: 'a:free', text: 'tool: study' } });
-  assert.ok(els.threads.text().includes('tool: study'));
+  assert.ok(!els.threads.text().includes('tool: study'), 'raw tool progress text is not surfaced live');
+  // A tool call in flight turns the composer outline light blue instead of red.
+  assert.ok(els.askForm.classList.contains('state-running'));
+  assert.ok(!els.askForm.classList.contains('state-thinking'));
   send({ type: 'askEvent', id: 'q1', event: { event: 'answer', model: 'a:free', text: 'Bug at `app.py:3`', secs: 9, study_calls: 2 } });
   send({ type: 'askEvent', id: 'q1', event: { event: 'start', model: 'b:free', role: 'synthesis' } });
   send({ type: 'askEvent', id: 'q1', event: { event: 'synthesis', model: 'b:free', role: 'synthesis', text: 'Merged: **one bug**' } });
   send({ type: 'askEvent', id: 'q1', event: { event: 'done', answered: 1, asked: 1, requests: 5 } });
   const out = els.threads.text();
-  assert.ok(out.indexOf('Merged:') < out.indexOf('Bug at'), 'merged answer comes first');
+  assert.ok(out.indexOf('Merged:') < out.indexOf('Bug at'), 'merged answer leads; the individual answer is still reachable after it');
+  assert.ok(out.includes('1 other answer'), 'the collapsed-by-default disclosure names how many other answers exist');
   assert.ok(out.includes('2 MIT lookups'));
   assert.ok(out.includes('data-vote="1" data-model="a:free"'));
   assert.ok(out.includes('1/1 models answered'));
-  send({ type: 'study', id: 's1', query: 'dijkstra', hits: [{ kind: 'card', course: '6.006', lecture: 'L13', page: null, path: '/x/cards.md', text: 'relax edges' }] });
-  assert.ok(els.threads.text().includes('MIT lookup: dijkstra'));
+  // The outline goes back to neutral once the thread is done.
+  assert.ok(!els.askForm.classList.contains('state-thinking') && !els.askForm.classList.contains('state-running'));
+  sent.length = 0;
+  els.updateVersion.listeners.click();
+  assert.deepStrictEqual(sent, [{ type: 'updateInstall' }]);
+  assert.strictEqual(els.updateVersion.disabled, true);
+  assert.strictEqual(els.updateVersion.textContent, 'Updating 0.0.0…');
+  send({ type: 'updateVersion', count: 1, version: '0.0.1', busy: false });
+  assert.strictEqual(els.updateVersion.textContent, 'Update · 0.0.1');
+  assert.ok(els.updateVersion.title.startsWith('1 total update clicks'));
   void origBox;
   panelHarness = { els, handlers, sent, send };
+});
+
+test('the customize tab reskins live through a nonce\'d <style> tag, never an inline style attribute', () => {
+  const { els, send, sent } = panelHarness;
+  send({ type: 'tab', tab: 'skin' });
+  assert.ok(els.skinPresets.innerHTML.includes('sw-crt') && els.skinPresets.innerHTML.includes('CRT Terminal'),
+    'preset swatches render from data, not hardcoded markup');
+  sent.length = 0;
+  const preset = { dataset: { preset: 'crt' } };
+  els.skinPresets.listeners.click(hit({ '.skin-swatch': preset }));
+  assert.strictEqual(els.skinBg.value, '#021402', 'picking a preset fills the color inputs so they stay in sync');
+  assert.strictEqual(els.skinCrt.checked, true);
+  const css = els.skinStyleTag.textContent;
+  assert.ok(css.includes('--accent:#33ff66'), 'colors land as CSS custom properties, which the whole stylesheet already keys off of');
+  assert.ok(css.includes('#skinBackdrop{opacity:0;}'), 'the CRT preset has no background image, so the backdrop stays hidden');
+  assert.ok(!sent.some((m) => m.type === 'skinSave'), 'the save is debounced, not fired on every click');
+
+  // Clearing the background and typing a custom marquee message both go through the same path.
+  els.skinMarqueeToggle.checked = true;
+  els.skinMarqueeToggle.listeners.change();
+  assert.strictEqual(els.skinMarqueeTextField.hidden, false);
+  document.getElementById('skinBgUrl').value = 'https://example.com/pug.png';
+  els.skinBgUrlApply.listeners.click();
+  assert.ok(els.skinStyleTag.textContent.includes('url("https://example.com/pug.png")'));
+  els.skinBgClear.listeners.click();
+  assert.ok(els.skinStyleTag.textContent.includes('#skinBackdrop{opacity:0;}'), 'clearing drops the image again');
+  send({ type: 'tab', tab: 'ask' });
+});
+
+test('header and composer get their own independent image layers, and a typed font beats the preset list', () => {
+  const { els, send } = panelHarness;
+  send({ type: 'tab', tab: 'skin' });
+
+  // "No whitelist" freedom: typing a font wins over whatever the select says, sanitized the same
+  // way a pasted URL is (it's the other genuinely free-text field).
+  els.skinFontCustom.value = 'Wingdings';
+  els.skinFontCustom.listeners.input();
+  assert.ok(els.skinStyleTag.textContent.includes('body{font-family:Wingdings;}'));
+
+  // Header image via upload: the click just asks the host; the host echoes back which layer
+  // ('target') the picked file was for, which is how the result gets routed without extra state.
+  els.skinHeaderUpload.listeners.click();
+  send({ type: 'skinImageResult', target: 'headerImage', dataUri: 'data:image/png;base64,AAAA' });
+  let css = els.skinStyleTag.textContent;
+  assert.ok(css.includes('#skinHeaderLayer{opacity:1') && css.includes('data:image/png;base64,AAAA'));
+  assert.ok(css.includes('#skinComposerLayer{opacity:0;}'), 'a header-only change leaves the composer layer alone');
+
+  // Composer background via a pasted URL — independent of the header, and the header image
+  // from the step above has to survive this (readSkinForm carries images forward, not the form).
+  document.getElementById('skinComposerUrl').value = 'https://example.com/lofi.gif';
+  els.skinComposerUrlApply.listeners.click();
+  css = els.skinStyleTag.textContent;
+  assert.ok(css.includes('#skinComposerLayer{opacity:1') && css.includes('url("https://example.com/lofi.gif")'));
+  assert.ok(css.includes('data:image/png;base64,AAAA'), 'the header image survives a composer-only change');
+
+  els.skinHeaderClear.listeners.click();
+  assert.ok(els.skinStyleTag.textContent.includes('#skinHeaderLayer{opacity:0;}'));
+  assert.ok(els.skinStyleTag.textContent.includes('url("https://example.com/lofi.gif")'), 'clearing the header leaves the composer image alone');
+  send({ type: 'tab', tab: 'ask' });
 });
 
 // The queue tab is driven entirely by the status message; these run against the same loaded
@@ -217,6 +358,7 @@ let panelHarness = null;
 const QUEUE_STATUS = {
   repo: '/r/demo', is_target: true, daemon_running: true, landed: 2, max_queue: 20,
   kinds: ['feature', 'bugfix', 'test', 'refactor'], recent: [], budget: null, experiment: null,
+  paid_fallback: 'off', quota_mode: 'shutdown', daemon_paid_configured: false,
   wallet: { cap: 5, spent: 0.1234, remaining: 4.8766, calls: 3 },
   spend: { used: 2.199104, cap: 20, left: 17.800896, resets: '2026-10-05', shared: true },
   stale_seconds: 900,
@@ -233,6 +375,7 @@ const QUEUE_STATUS = {
 
 test('the settings page exposes project models and encrypted-key state', () => {
   const { els, send } = panelHarness;
+  send({ type: 'status', data: QUEUE_STATUS });
   send({ type: 'info', data: { api_key: true, models: ['alpha/code:free', 'beta/code:free'] } });
   send({ type: 'settings', data: {
     values: { models: 4, stepsPerModel: 10, timeoutSeconds: 420, paidFallback: 'off',
@@ -247,8 +390,11 @@ test('the settings page exposes project models and encrypted-key state', () => {
   assert.ok(els.modelSelect.text().includes('alpha/code:free') && els.modelSelect.text().includes('beta/code:free'));
   assert.strictEqual(els.settingModels.value, 4);
   assert.strictEqual(els.settingStudy.checked, false);
+  assert.strictEqual(els.settingQuota.value, 'shutdown');
+  assert.strictEqual(els.costSummaryPill.textContent, 'Free only');
   assert.strictEqual(els.keyStatus.textContent, 'Configured');
   assert.strictEqual(els.clearKey.disabled, false);
+  assert.ok(els.budgetSummary.textContent.includes('$4.88 left'));
   send({ type: 'tab', tab: 'ask' });
 });
 
@@ -267,6 +413,8 @@ test('the queue tab lists every task with its state and a remove control', () =>
   assert.ok(els.queueHead.text().includes('3 of 20 queued'));
   assert.strictEqual(els.qcount.textContent, '3');
   assert.ok(els.status.text().includes('$0.1234'), 'the paid budget is on show');
+  assert.ok(els.status.text().includes('Cost safety') && els.status.text().includes('questions stay free'));
+  assert.ok(!els.status.text().includes('quotaModeToggle'), 'quota policy is changed explicitly in Settings, never by an emoji cycle');
   // the claimed task is listed first, then by priority
   assert.ok(out.indexOf('Verbose flag') < out.indexOf('Handle empty input'));
   assert.ok(out.indexOf('Handle empty input') < out.indexOf('Write tests'));
@@ -310,26 +458,28 @@ test('✎ fetches the whole task, and saving posts the rewritten fields', () => 
   assert.ok(els.queueList.text().includes('class="icon qdel"'), 'saving closes the form');
 });
 
-test('Clear all and the budget pencil reach the extension', () => {
-  const { handlers, sent } = panelHarness;
+test('Clear all and the settings budget control reach the extension', () => {
+  const { handlers, sent, els } = panelHarness;
   sent.length = 0;
   handlers['doc:click'](hit({ '#qclear': {} }));
-  handlers['doc:click'](hit({ '#budget': {} }));
-  assert.deepStrictEqual(sent, [{ type: 'queueClear', repo: '/r/demo' }, { type: 'budget' }]);
+  handlers['doc:click'](hit({ '#costSettings': {} }));
+  els.changeBudget.listeners.click();
+  assert.deepStrictEqual(sent, [
+    { type: 'queueClear', repo: '/r/demo' },
+    { type: 'settingsRefresh' },
+    { type: 'budget' },
+  ]);
+  assert.strictEqual(els['pane-settings'].hidden, false, 'Manage opens the actual cost settings');
 });
 
-test('the monthly budget shows as a meter, and silence shows as a clock', () => {
+test('the monthly budget shows as a meter without duplicating the activity log', () => {
   const { els, send } = panelHarness;
   send({ type: 'status', data: QUEUE_STATUS });
   const out = els.status.text();
   assert.ok(out.includes('$2.20') && out.includes('$20.00'), 'both sides of the cap are shown');
   assert.ok(out.includes('this month') && out.includes('back 2026-10-05'), 'the window is named');
   assert.ok(/class="meter-fill"[^>]*width:11\.0%/.test(out), 'the meter is filled by proportion');
-  // 900s of silence on a running daemon is what a hang looks like
-  const quiet = els.recent.text();
-  assert.ok(quiet.includes('quiet 15m00s'), quiet);
-  assert.ok(quiet.includes('class="quiet warn"'), 'past ten minutes it is marked');
-  assert.ok(quiet.includes('id="activity"'), 'and offers the activity log');
+  assert.strictEqual(els.recent, undefined, 'the chat does not duplicate the title-bar activity tracker');
 });
 
 test('a spent month is called out and the meter is full', () => {
@@ -348,7 +498,7 @@ test('provider usage is separate from local costs and missing values never becom
   assert.ok(out.includes('OpenRouter key usage') && out.includes('$1.23') && out.includes('$4.56'));
   // The spend meter is labelled by where the number comes from: OpenRouter reported it, this
   // panel did not price it locally. Renamed from "locally recorded response costs".
-  assert.ok(out.includes('$ spent this month (OpenRouter-reported)') && out.includes('all activity on this key'));
+  assert.ok(out.includes('background budget') && out.includes('all activity on this key'));
   send({ type: 'info', data: { provider_usage: { available: false } } });
   out = els.status.text();assert.ok(out.includes('usage unavailable'));assert.ok(!out.includes('OpenRouter key usage: <b>$0'));
   send({ type: 'info', data: {} });
@@ -360,7 +510,18 @@ test('the stylesheet is built on one spacing and radius scale', () => {
    '--r-sm: 4px', '--r-md: 6px', '--r-lg: 8px'].forEach((tok) => assert.ok(css.includes(tok), tok));
   // the input-border fallback chain, so a theme setting only one still shows an edge
   assert.ok(/--edge:.*inlineChatInput-border.*input-border.*widget-border/.test(css));
-  assert.ok(css.includes('.meter-fill') && css.includes('.quiet.warn'));
+  // Cursor defines --vscode-input-background as an empty string rather than omitting it, so
+  // var(--vscode-input-background, fallback) never engages its fallback — the empty value is
+  // substituted as-is, which makes the whole `background` declaration invalid and transparent.
+  // --field-bg/--field-fg must not reference the vscode-input-* tokens at all; build them from
+  // --surface/--vscode-foreground, which are already proven to render in this same panel.
+  assert.ok(/--field-bg:\s*var\(--surface-raised\)/.test(css));
+  assert.ok(/--field-fg:\s*var\(--vscode-foreground/.test(css));
+  const cssNoComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.ok(!cssNoComments.includes('--vscode-input-background'), 'do not reference this token outside comments, even as a fallback source — it is defined-but-empty in Cursor, which defeats var() fallback');
+  assert.ok(!cssNoComments.includes('--vscode-input-foreground'), 'do not reference this token outside comments, even as a fallback source');
+  assert.ok(css.includes('.meter-fill') && css.includes('.status-deck:not([open])'));
+  assert.ok(css.includes('#threads:has(.empty-state) + .composer'), 'the empty state cannot slide under the chat box');
   assert.ok(css.includes('.composer') && css.includes('.settings-card') && css.includes('@media (max-width: 270px)'),
     'the polished composer, settings and narrow sidebar layout are styled');
 });
@@ -416,6 +577,43 @@ test('the HUD command is contributed with an icon and reaches the title bar', ()
   assert.ok(manifest.contributes.menus['view/title'].some((m) => m.command === 'flintSwarm.showActivity'));
   assert.ok(typeof registered['flintSwarm.showActivity'] === 'function');
   assert.ok(typeof registered['flintSwarm.showPanel'] === 'function');
+});
+
+test('an update click persists before install and reloads only after success', async () => {
+  const key = ext._test.UPDATE_CLICKS_KEY;
+  const previous = globalState.get(key, undefined);
+  const previousError = vscode.__error;
+  globalState.store.delete(key);
+  const posts = [];
+  const actions = [];
+  const installed = await ext._test.installExtensionUpdate(
+    { globalState },
+    (message) => posts.push(message),
+    async (root) => { actions.push(['install', root]); },
+    async () => { actions.push(['restart']); },
+  );
+  assert.strictEqual(installed, true);
+  assert.strictEqual(globalState.get(key), 1);
+  assert.strictEqual(posts[0].version, '0.0.1');
+  assert.strictEqual(posts[0].busy, true);
+  assert.strictEqual(posts[1].installed, true);
+  assert.deepStrictEqual(actions.map((entry) => entry[0]), ['install', 'restart']);
+
+  const failedPosts = [];
+  const failed = await ext._test.installExtensionUpdate(
+    { globalState },
+    (message) => failedPosts.push(message),
+    async () => { throw new Error('package failed'); },
+    async () => { throw new Error('restart must not run'); },
+  );
+  assert.strictEqual(failed, false);
+  assert.strictEqual(globalState.get(key), 2, 'the lifetime count includes a click even when installation fails');
+  assert.strictEqual(failedPosts[0].version, '0.0.2');
+  assert.match(failedPosts[1].error, /package failed/);
+
+  if (previous === undefined) globalState.store.delete(key);
+  else globalState.store.set(key, previous);
+  vscode.__error = previousError;
 });
 
 test('a real bridge call returns MIT hits with absolute paths', async () => {

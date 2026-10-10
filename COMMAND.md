@@ -40,8 +40,8 @@ swarm config, and its own quadrant on the dashboard.
 - **Success metric:** shipped, playable games at near-zero marginal cost.
 
 ### Front 2 — desktop.influencers (image-generating influencer suite)
-- **Where:** `/Users/devonodell/Desktop/influencers` (agency) and `influencer-studio/`
-  (local stdlib image-chat studio, port 8787)
+- **Where:** `/Users/devonodell/Desktop/influencers`. (A duplicate `influencer-studio/`
+  build had drifted into this repo; it was removed — this is the one real target.)
 - **Swarm config:** `swarm/configs/influencers.json`
 - **What it is:** AI Girlfriend experiences sold on Fanvue and Instagram, with
   the sole intent of money extraction. Three personas, all fictional adults:
@@ -73,7 +73,9 @@ and prove the delta. Ship nothing on vibes.
 
 ## SABER — the measurement loop
 
-`swarm/saber.py` is the single entry point for the three-axis loop:
+SABER (and the leaderboard it feeds) now lives in `swarm-measurement-lab`, a sibling
+checkout — split out because it's tuning infrastructure, not something the swarm itself needs
+at runtime. The entry point there is unchanged:
 
 ```sh
 .venv/bin/python swarm/saber.py --models dots-studio/dots-3-note-preview:free,openrouter:openai/gpt-5-mini
@@ -90,9 +92,9 @@ captures:
   backoff, because that is the latency the user actually feels
 - **spend** — summed FLINT_CHARGE_FILE charges per run
 
-Every run is appended to `swarm/saber_history.sqlite` as a time series, so
-"did the harness get faster/more accurate/cheaper" is a trend line, not a
-feeling. Run it weekly against the current model pool.
+Every run is appended to a time series, so "did the harness get faster/more accurate/cheaper"
+is a trend line, not a feeling. Run it weekly against the current model pool, in that other
+checkout, and bring a finding back here as a focused change — not the tool itself.
 
 ## Ground rules
 

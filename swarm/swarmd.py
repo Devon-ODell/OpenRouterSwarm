@@ -2666,7 +2666,9 @@ def run_prov_hooks(c, wd, label, env_extra=None, log_on_ok=False):
     prov = prov_block(c)
     if not prov["hooks"]:
         return True, ""
-    env = {**os.environ, **prov["env"]}
+    # Package-manager installs don't need the daemon's own secrets (OPENROUTER_API_KEY and
+    # friends); clean_env() is what run_gate() already uses for the same reason.
+    env = {**clean_env(), **prov["env"]}
     if env_extra:
         env.update(env_extra)
     out = []

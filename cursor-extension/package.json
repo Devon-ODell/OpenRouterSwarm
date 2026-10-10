@@ -1,7 +1,7 @@
 {
   "name": "flint-swarm",
   "displayName": "Flint Swarm",
-  "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers with a merged verdict, a queue you can edit, and MIT OpenCourseWare lookups.",
+  "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers, a tested task queue, and repeatable harness training.",
   "version": "0.5.0",
   "publisher": "devon-odell",
   "license": "UNLICENSED",
@@ -70,11 +70,6 @@
         "category": "Flint Swarm"
       },
       {
-        "command": "flintSwarm.studySelection",
-        "title": "Find MIT Lectures for This Code",
-        "category": "Flint Swarm"
-      },
-      {
         "command": "flintSwarm.startGrind",
         "title": "Start the Swarm on This Repository",
         "category": "Flint Swarm"
@@ -124,7 +119,7 @@
       },
       {
         "command": "flintSwarm.togglePaid",
-        "title": "Turn Paid Requests On or Off",
+        "title": "Set the Paid Answer Policy",
         "category": "Flint Swarm"
       },
       {
@@ -153,6 +148,12 @@
         "title": "Open Flint Swarm Setup Guide",
         "category": "Flint Swarm",
         "icon": "$(question)"
+      },
+      {
+        "command": "flintSwarm.showCustomize",
+        "title": "Customize Flint Swarm's Look",
+        "category": "Flint Swarm",
+        "icon": "$(paintcan)"
       }
     ],
     "menus": {
@@ -164,10 +165,6 @@
         {
           "command": "flintSwarm.queueTask",
           "group": "flintSwarm@2"
-        },
-        {
-          "command": "flintSwarm.studySelection",
-          "group": "flintSwarm@3"
         }
       ],
       "view/title": [
@@ -195,6 +192,11 @@
           "command": "flintSwarm.showHelp",
           "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
           "group": "navigation@4"
+        },
+        {
+          "command": "flintSwarm.showCustomize",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
+          "group": "navigation@5"
         }
       ]
     },
@@ -263,7 +265,7 @@
             "Answer with paid models from the start. Fastest and most reliable; spends the budget quickest."
           ],
           "default": "off",
-          "description": "Whether a question may fall back to a paid model, spending from the budget set with \"Flint Swarm: Set the Paid Model Budget\" (default $5 in total). Free-only by default: turn it on deliberately, from the panel or with \"Flint Swarm: Turn Paid Requests On or Off\"."
+          "description": "Whether a question may fall back to a paid model, spending from the budget set with \"Flint Swarm: Set the Paid Model Budget\" (default $5 in total). Free-only by default: turn it on deliberately in the panel's Cost & fallback settings."
         },
         "flintSwarm.providerState": {
           "type": "object",

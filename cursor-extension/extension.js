@@ -13,7 +13,6 @@ const PRESETS = [
   { label: 'Explain what this code does and why', detail: 'Walk through the logic with file:line references' },
   { label: 'How could this be simpler or faster?', detail: 'Concrete rewrites, with complexity where it matters' },
   { label: 'What tests should this have?', detail: 'Test cases with inputs and expected outputs' },
-  { label: 'Which MIT technique applies here?', detail: 'Algorithms, probability, ML or finance methods from the course notes' },
   { label: 'Ask something else…', custom: true },
 ];
 
@@ -27,6 +26,10 @@ let secretReady = Promise.resolve();
 let modelProvidersCache = [];
 const running = new Set();
 const SECRET_KEY = 'flintSwarm.openRouterApiKey';
+const SKIN_KEY = 'flintSwarm.skin';
+const UPDATE_CLICKS_KEY = 'flintSwarm.updateClicks';
+const MAX_UPDATE_CLICKS = 999999999;
+let updateInstallPromise = null;
 
 // ---------------------------------------------------------------- locating flint
 
@@ -46,6 +49,76 @@ function pythonFor(root) {
   if (configured) return configured;
   const venv = path.join(root, '.venv', 'bin', 'python');
   return fs.existsSync(venv) ? venv : 'python3';
+}
+
+// ---------------------------------------------------------------- self-update click counter
+
+/** Render the persistent click count as three base-1000 fields: 1000 -> 0.1.0. */
+function updateVersion(count) {
+  const safe = Math.max(0, Math.min(MAX_UPDATE_CLICKS, Math.trunc(Number(count) || 0)));
+  return `${Math.floor(safe / 1000000)}.${Math.floor(safe / 1000) % 1000}.${safe % 1000}`;
+}
+
+function updateClicks(context) {
+  const raw = context.globalState.get(UPDATE_CLICKS_KEY, 0);
+  return Math.max(0, Math.min(MAX_UPDATE_CLICKS, Math.trunc(Number(raw) || 0)));
+}
+
+/** Run the existing installer as a child so success is known before Cursor reloads. */
+function runExtensionInstaller(root) {
+  return new Promise((resolve, reject) => {
+    const script = path.join(root, 'cursor-extension', 'install.sh');
+    if (!fs.existsSync(script)) {
+      reject(new Error(`installer not found: ${script}`));
+      return;
+    }
+    const child = cp.spawn(script, [], {
+      cwd: root,
+      env: { ...process.env, FLINT_REQUIRE_INSTALL: '1' },
+    });
+    running.add(child);
+    let stdout = '', stderr = '', settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      running.delete(child);
+      if (error) reject(error); else resolve(value);
+    };
+    child.stdout.on('data', (data) => { stdout = (stdout + data.toString('utf8')).slice(-30000); });
+    child.stderr.on('data', (data) => { stderr = (stderr + data.toString('utf8')).slice(-30000); });
+    child.on('error', (error) => finish(error));
+    child.on('close', (code) => {
+      if (code === 0) finish(null, { stdout, stderr });
+      else finish(new Error(`install.sh exited ${code}: ${tail(stderr || stdout, 8)}`));
+    });
+  });
+}
+
+/** Count the click first, then install and reload. The count deliberately survives failure. */
+function installExtensionUpdate(context, post, installer = runExtensionInstaller,
+  restart = () => vscode.commands.executeCommand('workbench.action.reloadWindow')) {
+  if (updateInstallPromise) return updateInstallPromise;
+  updateInstallPromise = (async () => {
+    const count = Math.min(MAX_UPDATE_CLICKS, updateClicks(context) + 1);
+    await context.globalState.update(UPDATE_CLICKS_KEY, count);
+    const version = updateVersion(count);
+    post({ type: 'updateVersion', count, version, busy: true });
+    try {
+      const root = flintRoot();
+      if (!root) throw new Error('cannot find the Flint checkout containing cursor-extension/install.sh');
+      await installer(root);
+      post({ type: 'updateVersion', count, version, busy: false, installed: true });
+      void vscode.window.showInformationMessage(`Flint update ${version} installed. Restarting this Cursor window…`);
+      await restart();
+      return true;
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      post({ type: 'updateVersion', count, version, busy: false, error: message });
+      vscode.window.showErrorMessage(`Flint update ${version} failed: ${message}`);
+      return false;
+    }
+  })().finally(() => { updateInstallPromise = null; });
+  return updateInstallPromise;
 }
 
 // ---------------------------------------------------------------- bridge
@@ -314,7 +387,7 @@ async function ask(question, ctx, choice = null) {
   const c = cfg();
   const args = ['ask', '--repo', repo, '--question', question, '--models', String(c.get('models')),
     '--steps', String(c.get('stepsPerModel')), '--timeout', String(c.get('timeoutSeconds') || 300),
-    '--paid', String(c.get('paidFallback') || 'auto')];
+    '--paid', String(c.get('paidFallback') || 'off')];
   args.push(...providerArgs(prov));
   if (model) args.push('--model', model);
   if (!c.get('synthesize')) args.push('--no-synthesis');
@@ -421,7 +494,9 @@ async function togglePaid(to) {
   const c = cfg();
   const now = c.get('paidFallback') || 'off';
   const next = to || (now === 'off' ? 'auto' : 'off');
-  await c.update('paidFallback', next, vscode.ConfigurationTarget.Global);
+  const target = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length
+    ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+  await c.update('paidFallback', next, target);
   vscode.window.setStatusBarMessage(
     next === 'off' ? '$(circle-slash) Swarm: paid requests OFF' : `$(credit-card) Swarm: paid requests ${next}`, 5000);
   if (next !== 'off') {
@@ -444,9 +519,9 @@ async function cmdTogglePaid() {
 
 const QUOTA_MODE_ORDER = ['shutdown', 'wait', 'paid'];
 const QUOTA_MODE_LABEL = {
-  shutdown: "Stop the daemon once free is out and paid can't help.",
-  wait: 'Idle until the free allowance resets.',
-  paid: 'Never stop while a paid model is configured — keep retrying it instead.',
+  shutdown: 'Stop safely after the current task.',
+  wait: 'Stay open and continue after the daily reset.',
+  paid: 'Continue with a configured paid model and spending cap.',
 };
 
 /** Flip the repo daemon's quota-exhaustion failsafe, via the bridge (it lives in that
@@ -457,16 +532,11 @@ async function setQuotaMode(repo, mode) {
     vscode.window.showWarningMessage(`Flint swarm: ${res.error}`);
     return null;
   }
-  vscode.window.setStatusBarMessage(`$(sync) Swarm: on quota exhaustion → "${mode}"`, 5000);
+  const words = { shutdown: 'stop safely', wait: 'wait for reset', paid: 'continue with paid fallback' };
+  vscode.window.setStatusBarMessage(`$(sync) Swarm at free limit: ${words[mode] || mode}`, 5000);
   lastInfo = 0;
   refreshStatus();
   return mode;
-}
-
-async function cycleQuotaMode(repo, from) {
-  const now = QUOTA_MODE_ORDER.includes(from) ? from : 'shutdown';
-  const next = QUOTA_MODE_ORDER[(QUOTA_MODE_ORDER.indexOf(now) + 1) % QUOTA_MODE_ORDER.length];
-  return setQuotaMode(repo, next);
 }
 
 async function cmdSetQuotaMode() {
@@ -651,26 +721,6 @@ async function setBudget() {
   }
   lastInfo = 0;
   refreshStatus();
-}
-
-async function study(query) {
-  if (!query) return;
-  try {
-    const res = await bridgeJson(['study', '--query', query.slice(0, 400), '-k', '6']);
-    panel.post({ type: 'study', id: crypto.randomBytes(6).toString('hex'), query: query.slice(0, 120), hits: res.hits });
-    await panel.reveal();
-  } catch (e) {
-    vscode.window.showErrorMessage(`Flint swarm: ${e.message}`);
-  }
-}
-
-async function cmdStudy() {
-  const editor = currentEditor();
-  const selected = editor && !editor.selection.isEmpty ? editor.document.getText(editor.selection) : '';
-  const guess = selected.replace(/[^A-Za-z0-9_]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
-  const query = await vscode.window.showInputBox({ prompt: 'Search MIT OpenCourseWare notes (technical terms work best)', value: guess,
-    placeHolder: 'e.g. dijkstra priority queue, monte carlo variance, gradient clipping' });
-  await study(query);
 }
 
 let swarmTerminal = null;
@@ -1093,7 +1143,20 @@ async function saveProjectSettings(values) {
     await c.update(key, value, target);
   }
   if (values.backend) await saveProvState(values.backend, values.model === '__auto__' ? null : values.model, values.customUrl);
-  panel.post({ type: 'settingsSaved', text: `Saved for ${path.basename(panelRepo({}) || 'this project')}.` });
+  let quotaWarning = '';
+  if (values.quotaChanged && ['shutdown', 'wait', 'paid'].includes(values.quotaMode)) {
+    const repo = panelRepo({});
+    if (repo) {
+      try {
+        await setQuotaMode(repo, values.quotaMode);
+      } catch (e) {
+        quotaWarning = `Workspace settings were saved, but the background-swarm policy was not changed: ${e.message}`;
+      }
+    }
+  }
+  panel.post(quotaWarning
+    ? { type: 'settingsWarning', text: quotaWarning }
+    : { type: 'settingsSaved', text: `Saved for ${path.basename(panelRepo({}) || 'this project')}.` });
   await sendSettings(false);
   lastInfo = 0;
   refreshStatus();
@@ -1175,13 +1238,17 @@ class SwarmPanel {
     const nonce = crypto.randomBytes(16).toString('base64');
     const uri = (f) => webview.asWebviewUri(vscode.Uri.joinPath(media, f));
     return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'nonce-${nonce}'; img-src ${webview.cspSource} data: https:; script-src 'nonce-${nonce}';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="stylesheet" href="${uri('panel.css')}"></head>
 <body>
+<div id="skinBackdrop" aria-hidden="true"></div>
+<div id="skinScanlines" aria-hidden="true"></div>
 <header class="app-header">
+  <div id="skinHeaderLayer" aria-hidden="true"></div>
   <div class="brand"><span class="brand-mark" aria-hidden="true">✦</span><span>Flint</span><span id="runState" class="status-dot" title="Swarm status"></span></div>
-  <div class="header-actions"><button class="icon tab-jump" data-tab="help" title="Setup guide" aria-label="Setup guide">?</button><button class="icon tab-jump" data-tab="settings" title="Settings" aria-label="Settings">⚙</button></div>
+  <div class="header-actions"><button id="updateVersion" class="update-button" type="button" title="0 total update clicks — install this checkout and restart Cursor">Update · 0.0.0</button><button class="icon tab-jump" data-tab="skin" title="Dress it up" aria-label="Customize appearance">🎨</button><button class="icon tab-jump" data-tab="help" title="Setup guide" aria-label="Setup guide">?</button><button class="icon tab-jump" data-tab="settings" title="Settings" aria-label="Settings">⚙</button></div>
 </header>
+<div id="skinMarquee" class="marquee" hidden><span id="skinMarqueeText"></span></div>
 <details id="statusDeck" class="status-deck">
   <summary><span>Project &amp; swarm status</span><span class="chevron">⌄</span></summary>
   <div id="status"></div>
@@ -1191,14 +1258,12 @@ class SwarmPanel {
   <button class="tab" id="tab-ask" data-tab="ask" role="tab" aria-selected="true">Chat</button>
   <button class="tab" id="tab-queue" data-tab="queue" role="tab" aria-selected="false">Queue<span id="qcount" class="badge" hidden></span></button>
   <button class="tab" id="tab-landed" data-tab="landed" role="tab" aria-selected="false">Changes</button>
-  <button class="tab" id="tab-settings" data-tab="settings" role="tab" aria-selected="false">Settings</button>
-  <button class="tab" id="tab-help" data-tab="help" role="tab" aria-selected="false">Help</button>
 </nav>
 <div id="notice" class="notice"></div>
 <section id="pane-ask" role="tabpanel">
-  <div id="recent"></div>
   <section id="threads"></section>
   <form id="askForm" class="composer">
+    <div id="skinComposerLayer" aria-hidden="true"></div>
     <textarea id="question" rows="2" placeholder="Ask Flint to explain, review, or improve your code…"></textarea>
     <div class="context-row"><label class="context-pill"><input type="checkbox" id="withCode" checked><span aria-hidden="true">＋</span> Current selection</label></div>
     <div class="composer-footer">
@@ -1207,7 +1272,7 @@ class SwarmPanel {
     </div>
     <input id="customEndpoint" class="custom-endpoint" type="url" placeholder="http://localhost:1234/v1" aria-label="Custom OpenAI-compatible endpoint" hidden>
     <input id="customModel" class="custom-endpoint" type="text" placeholder="Model id reported by that endpoint" aria-label="Custom endpoint model id" hidden>
-    <div class="composer-tools"><button id="queue" type="button" class="tool-button">Queue as task</button><button id="lookup" type="button" class="tool-button">Search MIT notes</button></div>
+    <div class="composer-tools"><button id="queue" type="button" class="tool-button">Queue as task</button></div>
   </form>
 </section>
 <section id="pane-queue" role="tabpanel" hidden>
@@ -1222,8 +1287,23 @@ class SwarmPanel {
   <div id="landedList"></div>
 </section>
 <section id="pane-settings" class="page" role="tabpanel" hidden>
-  <div class="page-heading"><span class="eyebrow">PROJECT PREFERENCES</span><h2>Settings</h2><p>These choices apply to this workspace only. Another project can use a different model, budget, or runtime.</p></div>
+  <div class="page-heading"><span class="eyebrow">PROJECT PREFERENCES</span><h2>Settings</h2><p>Your model and answer choices apply to this workspace. The background-swarm policy belongs to this repository.</p></div>
   <form id="settingsForm">
+    <section class="settings-card"><h3>Appearance</h3><p class="setting-help">One sane, serious font control. For actual customization — colors, pictures, nonsense — see the 🎨 tab.</p>
+      <label class="field"><span>Font</span><select id="skinFont">
+        <option value="">Helvetica (default)</option>
+        <option value="var(--vscode-font-family)">Match Cursor's editor font</option>
+        <option value="Arial, sans-serif">Arial</option>
+        <option value="Georgia, serif">Georgia</option>
+        <option value="'Courier New', monospace">Courier New — hacker mode</option>
+        <option value="'Comic Sans MS', cursive">Comic Sans MS — maximum trust</option>
+        <option value="Papyrus, fantasy">Papyrus — ancient scrolls, modern swarm</option>
+        <option value="Impact, sans-serif">Impact — meme lord</option>
+        <option value="'Brush Script MT', cursive">Brush Script MT — wedding invitation</option>
+        <option value="'Trebuchet MS', sans-serif">Trebuchet MS — early-internet clean</option>
+      </select></label>
+      <label class="field"><span>…or type any font family</span><input id="skinFontCustom" type="text" placeholder="e.g. 'Segoe Print', system-ui, Arial Black"></label>
+    </section>
     <section class="settings-card"><h3>Model &amp; provider</h3><p class="setting-help">Choose where answers run. “Auto” lets Flint route across the configured free model pool.</p>
       <label class="field"><span>Provider</span><select id="settingProvider"><option value="openrouter">OpenRouter cloud</option><option value="ollama">Ollama</option><option value="lm-studio">LM Studio</option><option value="mlx">MLX</option><option value="llamacpp">llama.cpp</option><option value="__custom__">Custom endpoint</option></select></label>
       <label class="field" id="settingModelField"><span>Default model</span><select id="settingModel"><option value="__auto__">Auto — best available</option></select></label>
@@ -1233,8 +1313,14 @@ class SwarmPanel {
       <label class="field"><span>API key</span><input id="apiKey" type="password" autocomplete="off" placeholder="sk-or-…"></label>
       <div class="row"><button id="saveKey" type="button">Save key securely</button><button id="clearKey" type="button" class="secondary">Forget saved key</button></div>
     </section>
+    <details class="settings-card cost-card advanced-card"><summary><h3>Cost &amp; fallback<span id="costSummaryPill" class="state-pill">Free only</span></h3></summary><p class="setting-help">These are separate on purpose: one controls questions you ask in this panel; the other controls the unattended background swarm. Both are free-only by default — nothing here spends a cent until you change it.</p>
+      <label class="policy-row"><span><b>Questions in this panel</b><small>What to do if free models cannot answer.</small></span><select id="settingPaid"><option value="off">Free only</option><option value="auto">Use paid only as rescue</option><option value="always">Use paid first</option></select></label>
+      <label class="policy-row"><span><b>Background swarm at free limit</b><small>What the daemon should do after free requests run out.</small></span><select id="settingQuota"><option value="shutdown">Stop safely</option><option value="wait">Wait for daily reset</option><option value="paid">Continue with paid fallback</option></select></label>
+      <div class="budget-row"><div><b>Paid-answer cap</b><small id="budgetSummary">Loading budget…</small></div><button id="changeBudget" type="button" class="secondary">Change cap</button></div>
+      <div id="costWarning" class="cost-note"></div>
+    </details>
     <section class="settings-card"><h3>Answer behavior</h3>
-      <div class="field-grid"><label class="field"><span>Parallel models</span><input id="settingModels" type="number" min="1" max="6"></label><label class="field"><span>Tool rounds per model</span><input id="settingSteps" type="number" min="2" max="20"></label><label class="field"><span>Timeout (seconds)</span><input id="settingTimeout" type="number" min="60" max="1800"></label><label class="field"><span>Paid fallback</span><select id="settingPaid"><option value="off">Off — free only</option><option value="auto">Auto — rescue only</option><option value="always">Always — paid first</option></select></label></div>
+      <div class="field-grid"><label class="field"><span>Parallel models</span><input id="settingModels" type="number" min="1" max="6"></label><label class="field"><span>Tool rounds per model</span><input id="settingSteps" type="number" min="2" max="20"></label><label class="field"><span>Timeout (seconds)</span><input id="settingTimeout" type="number" min="60" max="1800"></label></div>
       <label class="switch-row"><span><b>Merge the answers</b><small>Ask one more model to check and synthesize the result.</small></span><input id="settingSynthesize" type="checkbox"></label>
       <label class="switch-row"><span><b>MIT study tools</b><small>Let models search the local OpenCourseWare corpus.</small></span><input id="settingStudy" type="checkbox"></label>
     </section>
@@ -1242,20 +1328,81 @@ class SwarmPanel {
     <div class="settings-save"><span id="settingsFeedback" class="dim"></span><button type="submit">Save project settings</button></div>
   </form>
 </section>
+<section id="pane-skin" class="page" role="tabpanel" hidden>
+  <div class="page-heading"><span class="eyebrow">ZERO RESTRAINT, MAXIMUM VIBES</span><h2>Make it yours</h2><p>Early-2010s winamp-skin energy. Nobody else has to look at this panel. Go nuts.</p></div>
+  <section class="settings-card"><h3>One-click vibes</h3><p class="setting-help">Each one sets everything below at once. You can still fiddle after.</p>
+    <div id="skinPresets" class="skin-presets"></div>
+  </section>
+  <section class="settings-card"><h3>Background</h3><p class="setting-help">A picture from your machine, a link to one, or just a flat color. Blur it until nobody can tell what it is.</p>
+    <div class="row"><button id="skinBgUpload" type="button">Upload a picture</button><button id="skinBgClear" type="button" class="secondary">Clear background</button></div>
+    <label class="field"><span>…or paste an image URL</span>
+      <div class="row"><input id="skinBgUrl" type="url" class="grow" placeholder="https://example.com/your-cat.png"><button id="skinBgUrlApply" type="button" class="secondary">Use it</button></div>
+    </label>
+    <div class="field-grid">
+      <label class="field"><span>Fit</span><select id="skinBgFit"><option value="cover">Cover (crop to fill)</option><option value="contain">Contain (letterboxed)</option><option value="tile">Tile (repeat, chaotic)</option><option value="100% 100%">Stretch (ignore the aspect ratio, as God intended in 2009)</option></select></label>
+      <label class="field"><span>Darken <span id="skinBgDarkVal"></span></span><input id="skinBgDark" type="range" min="0" max="90" step="5"></label>
+    </div>
+    <label class="field"><span>Blur <span id="skinBgBlurVal"></span></span><input id="skinBgBlur" type="range" min="0" max="20" step="1"></label>
+  </section>
+  <section class="settings-card"><h3>Header image</h3><p class="setting-help">The bar at the very top, behind the Flint logo. Same deal: picture, link, or skip it.</p>
+    <div class="row"><button id="skinHeaderUpload" type="button">Upload a picture</button><button id="skinHeaderClear" type="button" class="secondary">Clear</button></div>
+    <label class="field"><span>…or paste an image URL</span>
+      <div class="row"><input id="skinHeaderUrl" type="url" class="grow" placeholder="https://example.com/banner.png"><button id="skinHeaderUrlApply" type="button" class="secondary">Use it</button></div>
+    </label>
+    <div class="field-grid">
+      <label class="field"><span>Fit</span><select id="skinHeaderFit"><option value="cover">Cover</option><option value="contain">Contain</option><option value="tile">Tile</option><option value="100% 100%">Stretch</option></select></label>
+      <label class="field"><span>Darken <span id="skinHeaderDarkVal"></span></span><input id="skinHeaderDark" type="range" min="0" max="90" step="5"></label>
+    </div>
+    <label class="field"><span>Blur <span id="skinHeaderBlurVal"></span></span><input id="skinHeaderBlur" type="range" min="0" max="20" step="1"></label>
+  </section>
+  <section class="settings-card"><h3>Chat composer background</h3><p class="setting-help">The box you actually type your prompt into. Put whatever's funniest behind your own cursor.</p>
+    <div class="row"><button id="skinComposerUpload" type="button">Upload a picture</button><button id="skinComposerClear" type="button" class="secondary">Clear</button></div>
+    <label class="field"><span>…or paste an image URL</span>
+      <div class="row"><input id="skinComposerUrl" type="url" class="grow" placeholder="https://example.com/vibes.png"><button id="skinComposerUrlApply" type="button" class="secondary">Use it</button></div>
+    </label>
+    <div class="field-grid">
+      <label class="field"><span>Fit</span><select id="skinComposerFit"><option value="cover">Cover</option><option value="contain">Contain</option><option value="tile">Tile</option><option value="100% 100%">Stretch</option></select></label>
+      <label class="field"><span>Darken <span id="skinComposerDarkVal"></span></span><input id="skinComposerDark" type="range" min="0" max="90" step="5"></label>
+    </div>
+    <label class="field"><span>Blur <span id="skinComposerBlurVal"></span></span><input id="skinComposerBlur" type="range" min="0" max="20" step="1"></label>
+  </section>
+  <section class="settings-card"><h3>Colors</h3><p class="setting-help">Whatever you want. We will pick readable button text for you so it still works.</p>
+    <div class="color-grid">
+      <label class="color-field"><span>Background</span><input id="skinBg" type="color"></label>
+      <label class="color-field"><span>Panels &amp; cards</span><input id="skinSurface" type="color"></label>
+      <label class="color-field"><span>Text</span><input id="skinText" type="color"></label>
+      <label class="color-field"><span>Accent / buttons</span><input id="skinAccent" type="color"></label>
+      <label class="color-field"><span>Borders</span><input id="skinBorder" type="color"></label>
+    </div>
+  </section>
+  <section class="settings-card"><h3>Shape</h3><p class="setting-help">Font lives in Settings now, with a sane default — this tab is just for colors, pictures, and nonsense.</p>
+    <label class="field"><span>Corner roundness: brutalist ↔ bubbly <span id="skinRadiusVal"></span></span><input id="skinRadius" type="range" min="0" max="24" step="1"></label>
+  </section>
+  <section class="settings-card"><h3>Extras</h3><p class="setting-help">Within reason. Mostly.</p>
+    <label class="switch-row"><span><b>Neon glow</b><small>Buttons and the active tab get a soft glow in your accent color.</small></span><input id="skinGlow" type="checkbox"></label>
+    <label class="switch-row"><span><b>CRT scanlines</b><small>A faint scanline overlay, because the swarm is basically a terminal anyway.</small></span><input id="skinCrt" type="checkbox"></label>
+    <label class="switch-row"><span><b>Scrolling marquee banner</b><small>Under the header, like it's 2006.</small></span><input id="skinMarqueeToggle" type="checkbox"></label>
+    <div class="field" id="skinMarqueeTextField" hidden><span>Marquee text</span><input id="skinMarqueeTextInput" type="text" maxlength="200" placeholder="✦ WELCOME TO MY SWARM ✦"></div>
+    <label class="switch-row"><span><b>🎉 Confetti when work lands</b><small>Fires once when a new commit lands on trunk while you have the Changes tab open.</small></span><input id="skinConfetti" type="checkbox"></label>
+    <div class="row"><button id="skinConfettiTest" type="button" class="secondary">Test confetti</button></div>
+  </section>
+  <div class="settings-save"><span id="skinFeedback" class="dim"></span><button id="skinChaos" type="button" class="secondary">🎲 I'm feeling chaotic</button><button id="skinResetBtn" type="button">Reset to default</button></div>
+</section>
 <section id="pane-help" class="page guide" role="tabpanel" hidden>
   <div class="page-heading"><span class="eyebrow">ZERO TO WORKING</span><h2>Put Flint on any laptop</h2><p>No jargon, no cloud lock-in, and no mystery spending. You own the checkout, the key, and every commit.</p></div>
   <div class="guide-callout"><b>The short version</b><span>Install four ordinary tools, clone the repository, run one setup command, paste one API key, and reload Cursor.</span></div>
   <ol class="steps">
     <li><span class="step-number">1</span><div><h3>Install the basics</h3><p>Install <b>Cursor</b>, <b>Git</b>, <b>Python 3</b>, and the current <b>Node.js LTS</b>. On Windows, install <b>WSL with Ubuntu</b> and do the terminal steps inside Ubuntu. These are tools on your laptop—not subscriptions to Flint.</p></div></li>
     <li><span class="step-number">2</span><div><h3>Get an OpenRouter key</h3><p>Create your own OpenRouter account, make an API key, and copy it. A key is a password for models. Do not email it, paste it into source code, or commit it to Git.</p></div></li>
-    <li><span class="step-number">3</span><div><h3>Download and install Flint</h3><p>Open a terminal, then run these commands one line at a time:</p><pre><code>git clone https://github.com/Devon-ODell/OpenRouterSwarm.git&#10;cd OpenRouterSwarm&#10;./setup.sh</code></pre><p>The setup creates an isolated Python environment, runs the checks, packages the extension, and installs it into Cursor when Cursor’s command-line tool is available.</p></div></li>
-    <li><span class="step-number">4</span><div><h3>Reload Cursor</h3><p>In Cursor, open the Command Palette, run <b>Developer: Reload Window</b>, then open the Flint star in the sidebar. Open this Settings page and save your OpenRouter key.</p></div></li>
+    <li><span class="step-number">3</span><div><h3>Download and install Flint</h3><p>Open a terminal, then run these commands one line at a time:</p><pre><code>git clone https://github.com/Devon-ODell/OpenRouterSwarm.git&#10;cd OpenRouterSwarm&#10;./setup.sh</code></pre><p>Run <code>./setup.sh</code> from inside the <code>OpenRouterSwarm</code> folder. The setup creates an isolated Python environment, runs the checks, packages the extension, and installs it into Cursor when Cursor’s command-line tool is available. If Flint is already set up and you only want to reinstall this extension, run <code>./cursor-extension/install.sh</code> from that same folder.</p></div></li>
+    <li><span class="step-number">4</span><div><h3>Restart Cursor</h3><p>Fully quit Cursor and open it again, then look for Flint in the secondary sidebar. On macOS, quitting means <b>Cursor → Quit Cursor</b> or <b>Cmd+Q</b>, not merely closing the window. Open this Settings page and save your OpenRouter key.</p></div></li>
     <li><span class="step-number">5</span><div><h3>Use it on a project</h3><p>Open a Git project in Cursor. Put the cursor inside a function—or select exact lines—then ask a question below. Use <b>Queue as task</b> when you want tested work prepared on <code>swarm/trunk</code>. Flint never merges that branch into your main branch unless you do it.</p></div></li>
   </ol>
   <section class="settings-card"><h3>Moving to another laptop</h3><p>Repeat steps 1–4 on the new machine. Clone your project separately, open it in Cursor, and choose its project settings here. Keys are deliberately not copied with Git; save the key once on each laptop.</p></section>
   <section class="settings-card"><h3>What the buttons mean</h3><dl><dt>Ask</dt><dd>Read-only advice about the code in front of you.</dd><dt>Queue as task</dt><dd>Tested implementation work in a separate worktree.</dd><dt>Start swarm</dt><dd>Begin taking queued work until you stop it.</dd><dt>Changes</dt><dd>Commits that passed tests and adversarial review.</dd></dl></section>
   <section class="settings-card"><h3>Your control, plainly stated</h3><p>Cloud requests go only to the provider you choose. Local providers keep prompts on your own machine. Paid fallback is off unless you enable it, and its cap is visible. The daemon works in its own Git worktrees; you decide whether accepted commits ever reach <code>main</code>.</p></section>
 </section>
+<script nonce="${nonce}">window.__NONCE__=${JSON.stringify(nonce)};</script>
 <script nonce="${nonce}" src="${uri('render.js')}"></script>
 <script nonce="${nonce}" src="${uri('panel.js')}"></script>
 </body></html>`;
@@ -1268,18 +1415,14 @@ class SwarmPanel {
       lastInfo = 0;
       refreshStatus();
       sendSettings(true).catch((e) => this.post({ type: 'settingsError', text: e.message }));
+      this.post({ type: 'skin', skin: this.context.globalState.get(SKIN_KEY, null) });
+      const count = updateClicks(this.context);
+      this.post({ type: 'updateVersion', count, version: updateVersion(count), busy: false });
     } else if (m.type === 'ask') {
       await ask(m.question, m.withCode ? await codeContext(currentEditor()) : null,
         { backend: m.backend, model: m.model, customUrl: m.customUrl });
     } else if (m.type === 'queue') {
       await queueTask(m.title, m.withCode ? await codeContext(currentEditor()) : null);
-    } else if (m.type === 'study') {
-      let q = m.query;
-      if (!q && m.withCode) {
-        const ctx = await codeContext(currentEditor());
-        q = ctx && ctx.text.replace(/[^A-Za-z0-9_]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
-      }
-      if (q) await study(q); else await cmdStudy();
     } else if (m.type === 'vote') {
       bridgeJson(['vote', '--model', m.model, '--useful', m.useful ? '1' : '0']).catch((e) => vscode.window.showErrorMessage(e.message));
     } else if (m.type === 'open') {
@@ -1306,9 +1449,6 @@ class SwarmPanel {
       await showReport();
     } else if (m.type === 'togglePaid') {
       await togglePaid(m.to);
-    } else if (m.type === 'cycleQuotaMode') {
-      const repo = m.repo || repoFor(currentEditor() && currentEditor().document.uri);
-      if (repo) await cycleQuotaMode(repo, m.from);
     } else if (m.type === 'evidence') {
       await showEvidence(m);
     } else if (m.type === 'queueGet') {
@@ -1347,6 +1487,43 @@ class SwarmPanel {
       await sendSettings(true);
     } else if (m.type === 'refresh') {
       await refreshStatus();
+    } else if (m.type === 'skinSave') {
+      await this.context.globalState.update(SKIN_KEY, m.skin || null);
+    } else if (m.type === 'skinReset') {
+      await this.context.globalState.update(SKIN_KEY, undefined);
+      this.post({ type: 'skin', skin: null });
+    } else if (m.type === 'updateInstall') {
+      await installExtensionUpdate(this.context, (message) => this.post(message));
+    } else if (m.type === 'skinPickImage') {
+      await this.pickSkinImage(m.target);
+    }
+  }
+
+  // target says which layer this picture is for ('bgImage', 'headerImage', 'composerImage');
+  // echoed straight back so the webview routes the result without having to track "what did I
+  // last ask for" itself.
+  async pickSkinImage(target) {
+    try {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectMany: false, openLabel: 'Use as background',
+        filters: { Images: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'] },
+      });
+      if (!picked || !picked[0]) return;
+      const file = picked[0].fsPath;
+      const stat = await fs.promises.stat(file);
+      // The whole thing round-trips through webview postMessage and globalState; a multi-megabyte
+      // photo makes both sluggish, so cap it rather than silently stalling the panel.
+      if (stat.size > 6 * 1024 * 1024) {
+        this.post({ type: 'skinImageError', target, text: 'That image is over 6MB — pick something smaller, or a more reasonably-sized meme.' });
+        return;
+      }
+      const ext = path.extname(file).slice(1).toLowerCase();
+      const mime = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+        webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml' }[ext] || 'application/octet-stream';
+      const data = await fs.promises.readFile(file);
+      this.post({ type: 'skinImageResult', target, dataUri: `data:${mime};base64,${data.toString('base64')}` });
+    } catch (e) {
+      this.post({ type: 'skinImageError', target, text: e.message });
     }
   }
 }
@@ -1363,6 +1540,9 @@ function supportsSecondarySidebar(version) {
 
 function activate(context) {
   extensionContext = context;
+  if (context.globalState && context.globalState.setKeysForSync) {
+    context.globalState.setKeysForSync([UPDATE_CLICKS_KEY]);
+  }
   if (context.secrets && context.secrets.get) {
     secretReady = Promise.resolve(context.secrets.get(SECRET_KEY))
       .then((key) => { secretApiKey = key || null; }).catch(() => {});
@@ -1388,7 +1568,6 @@ function activate(context) {
   );
   reg('flintSwarm.askSelection', cmdAsk);
   reg('flintSwarm.queueTask', cmdQueue);
-  reg('flintSwarm.studySelection', cmdStudy);
   reg('flintSwarm.startGrind', () => startGrind());
   reg('flintSwarm.stopGrind', () => stopGrind());
   reg('flintSwarm.showPanel', () => panel.reveal());
@@ -1420,6 +1599,10 @@ function activate(context) {
     await panel.reveal();
     panel.post({ type: 'tab', tab: 'help' });
   });
+  reg('flintSwarm.showCustomize', async () => {
+    await panel.reveal();
+    panel.post({ type: 'tab', tab: 'skin' });
+  });
   // While a daemon runs there is something new to show every few seconds — the round it is on,
   // the model, how long the turn has taken. When nothing runs, once a minute is plenty.
   let timer = null;
@@ -1448,4 +1631,5 @@ function deactivate() {
 module.exports = { activate, deactivate,
   _test: { parseLines, innermost, flintRoot, where, bridgeJson, bridgeLast, PRESETS,
     idleFor, supportsSecondarySidebar, showActivity, providerChoices, provState, chosenBackend,
-    providerArgs, promptForApiKey, maybePromptForApiKey } };
+    providerArgs, promptForApiKey, maybePromptForApiKey, updateVersion,
+    updateClicks, installExtensionUpdate, MAX_UPDATE_CLICKS, UPDATE_CLICKS_KEY } };

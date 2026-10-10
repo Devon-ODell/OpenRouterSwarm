@@ -255,19 +255,18 @@ refuse re-add.
 
 ### Measurement loop (`saber`) and recursive decomposition bench (`vector`)
 
-```sh
-.venv/bin/python swarm/saber.py --models dots-studio/dots-3-note-preview:free,openrouter:openai/gpt-5-mini
-.venv/bin/python swarm/saber.py --trend [--runs 10]
-.venv/bin/python swarm/vector_runner.py run --task 2 --model dots-studio/dots-3-note-preview:free
-.venv/bin/python swarm/vector_runner.py trend --n 12
-.venv/bin/python swarm/vector_runner.py apply <lesson-slug>     # fold a measured lesson into live PLANNER/DECOMPOSER prompts
-.venv/bin/python swarm/vector_runner.py loop [--tasks 1,2,3] [--gap 60]   # self-reinforcing loop (or ./start-vector-loop.command)
-```
+This tooling — and the consensus-of-agents benchmark — has been split out into its own
+repository (`swarm-measurement-lab`, a sibling checkout) since it is research/tuning
+infrastructure, not something the swarm itself needs to run. It is not present in this
+checkout. The packet doctrine it already produced is what the rest of this document teaches:
+`focused` beats `default` beats `broad`, every acceptance criterion must be runnable, and a
+packet is small and single-objective. You do not need the bench itself to apply that — just
+the rule.
 
-The vector bench is how the harness itself discovers what makes a packet good:
-it runs one task in BROAD / DEFAULT / FOCUSED form and measures
-`focus_gain`. Your task-writing should internalize its conclusions — for a
-given task, `vector trend` is the dataset on what spec intensity pays off.
+If you are working in `swarm-measurement-lab` directly, its own README covers `vector.py`,
+`vector_runner.py`, `saber.py`, and `bench_swarm.py`; `vector_runner.py apply <lesson-slug>`
+still writes its result as a file you copy into this checkout's live planner/decomposer
+prompts by hand — the two repos do not share state automatically.
 
 ### Single-agent mode (`flint.py` — not the swarm)
 
@@ -322,18 +321,11 @@ things. In practice that means:
 
 ## strudel.nvim (the editor/workstation plugin)
 
-`OpenRouterSwarm/strudel-nvim/` is a separate Neovim plugin — the livecoding
-rig this swarm's music repos feed. It is **not** part of the swarm harness and
-has its **own** operating manual:
-
-> **`strudel-nvim/AGENTS.md`** — install state, headless test commands,
-> known OpenRouter/WezTerm sharp edges, and the `strudel.agent` mental model.
-> Read it before touching anything under `strudel-nvim/`.
-
-Highlights: the plugin is symlinked into `~/.config/nvim` (no build step);
-tests are headless (`.venv` not required); `:StrudelCheck` needs
-`OPENROUTER_API_KEY` from `OpenRouterSwarm/.env`; WezTerm config validation
-uses `/Applications/WezTerm.app/Contents/MacOS/wezterm-gui`.
+Split out into its own repository (`strudel-nvim`, a sibling checkout) — it is a standalone
+Neovim livecoding plugin with no Python dependency on this harness, built once as a one-off
+task. It is not present in this checkout and is **not** part of the swarm. Its own `AGENTS.md`
+(now that repo's root doc) still covers install state, headless test commands, and known
+OpenRouter/WezTerm sharp edges, unchanged by the move.
 
 ## Golden rules (tldr)
 

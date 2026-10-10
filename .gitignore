@@ -14,9 +14,4 @@ cursor-extension/flint-root.txt
 cursor-extension/*.vsix
 swarm/config.json
 swarm/configs/
-swarm/saber_history.sqlite
-# vector benchmark state (recursive decomposition ledger + loop artifacts)
-swarm/vector_state/
 *.command
-# generated TTS narration (regenerable via video/tts_make.py; GitHub rejects the mp3 binaries on push)
-video/audio/

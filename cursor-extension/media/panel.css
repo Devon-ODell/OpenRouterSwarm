@@ -19,6 +19,20 @@
   --surface-raised: color-mix(in srgb, var(--vscode-editor-background) 96%, var(--vscode-foreground) 4%);
   --accent: var(--vscode-focusBorder, #6b8afd);
   --success: var(--vscode-testing-iconPassed, #3fb950);
+  /* Not var(--vscode-input-background, ...fallback) — some webview hosts (confirmed: Cursor)
+     *define* that token as an empty string rather than omitting it, so var()'s fallback never
+     engages (fallback only fires when a property is undefined, not when it's defined-but-empty);
+     the whole `background` declaration then silently drops and the composer goes transparent,
+     with the scrolled thread content showing straight through it. --surface and
+     --vscode-foreground are already proven to render correctly elsewhere in this same panel
+     (the sidebar background, every label), so build the input tokens from those directly instead
+     of gambling on --vscode-input-* at all. */
+  --field-bg: var(--surface-raised);
+  --field-fg: var(--vscode-foreground, #cccccc);
+  /* Composer outline while an ask is in flight: gray/default = idle, red = a model is composing
+     text, light blue = a model is actively calling a tool (read_file/study/bash) against the repo. */
+  --state-thinking: var(--vscode-charts-red, var(--vscode-errorForeground, #f14c4c));
+  --state-running: #58a6ff;
 }
 
 * { box-sizing: border-box; }
@@ -27,7 +41,9 @@ html, body { min-height: 100%; }
 body {
   margin: 0;
   padding: 0 var(--sp-3) var(--sp-4);
-  font-family: var(--vscode-font-family);
+  /* Helvetica by default, not whatever the editor happens to be set to — "match Cursor's editor
+     font" is still one dropdown away (Settings > Appearance) for anyone who wants that back. */
+  font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
   font-size: var(--vscode-font-size);
   color: var(--vscode-foreground);
   background: var(--vscode-sideBar-background);
@@ -56,14 +72,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .status-dot { width: 6px; height: 6px; margin-left: 1px; border-radius: 50%; background: var(--vscode-descriptionForeground); opacity: .65; }
 .status-dot.running { background: var(--success); opacity: 1; box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 18%, transparent); }
 .header-actions { display: flex; gap: 2px; }
-.status-deck { margin: 0 0 var(--sp-2); border: 1px solid var(--hairline); border-radius: var(--r-lg); background: var(--surface-raised); }
+.update-button { min-height: 24px; padding: 2px 7px; border: 1px solid var(--hairline); color: var(--vscode-foreground); background: var(--surface); font-size: 9px; font-weight: 650; white-space: nowrap; }
+.update-button:hover:not(:disabled) { border-color: var(--accent); background: var(--ghost-hover); }
+.status-deck { margin: 0 0 var(--sp-2); border: 1px solid var(--hairline); border-radius: var(--r-lg); background: var(--surface-raised); transition: background 160ms ease, border-color 160ms ease, opacity 160ms ease; }
 .status-deck summary { display: flex; justify-content: space-between; align-items: center; padding: 7px 9px; cursor: pointer; list-style: none; color: var(--vscode-descriptionForeground); font-size: 11px; user-select: none; }
 .status-deck summary::-webkit-details-marker { display: none; }
 .status-deck[open] .chevron { transform: rotate(180deg); }
+.status-deck:not([open]) { border-color: transparent; background: transparent; opacity: .68; }
+.status-deck:not([open]):hover, .status-deck:not([open]):focus-within { border-color: var(--hairline); background: var(--surface-raised); opacity: 1; }
 .chevron { transition: transform 140ms ease; }
-#status { padding: 2px 10px 7px; line-height: 1.55; font-size: 11px; }
+#status { display: block; max-height: 440px; padding: 2px 10px 7px; overflow: hidden; opacity: 1; line-height: 1.55; font-size: 11px; transition: max-height 170ms ease, padding 170ms ease, opacity 120ms ease; }
 #status .ok, .ok { color: var(--success); }
-.run-controls { padding: 0 8px 8px; }
+.run-controls { display: flex; max-height: 80px; padding: 0 8px 8px; overflow: hidden; opacity: 1; transition: max-height 170ms ease, padding 170ms ease, margin 170ms ease, opacity 120ms ease; }
+.status-deck:not([open]) > #status, .status-deck:not([open]) > .run-controls { visibility: hidden; max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; margin-bottom: 0; opacity: 0; pointer-events: none; transition: max-height 170ms ease, padding 170ms ease, margin 170ms ease, opacity 120ms ease, visibility 0s linear 170ms; }
 
 #tabs { display: flex; gap: 0; margin: 0 calc(-1 * var(--sp-3)); padding: 0 var(--sp-3); border-bottom: 1px solid var(--hairline); overflow-x: auto; scrollbar-width: none; }
 #tabs::-webkit-scrollbar { display: none; }
@@ -84,7 +105,7 @@ button.icon:hover:not(:disabled) { background: var(--ghost-hover); }
 .tool-button { padding: 3px 0; color: var(--vscode-descriptionForeground); background: transparent; font-size: 11px; }
 .tool-button:hover:not(:disabled) { color: var(--vscode-foreground); background: transparent; }
 .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
-input, textarea, select { color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--edge); border-radius: var(--r-md); }
+input, textarea, select { color: var(--field-fg); background: var(--field-bg); border: 1px solid var(--edge); border-radius: var(--r-md); }
 input, select { min-height: 29px; padding: 4px 7px; }
 textarea { width: 100%; min-height: 64px; padding: var(--sp-2); resize: vertical; }
 select { min-width: 0; cursor: pointer; }
@@ -96,7 +117,6 @@ select { min-width: 0; cursor: pointer; }
 
 /* conversation ------------------------------------------------------------ */
 #pane-ask { display: flex; flex-direction: column; min-height: calc(100vh - 150px); }
-#recent { margin: var(--sp-1) 0; color: var(--vscode-descriptionForeground); font-family: var(--mono); font-size: var(--mono-sm); }
 #threads { flex: 1; }
 .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 265px; padding: 28px 10px 20px; text-align: center; }
 .empty-mark { display: grid; place-items: center; width: 38px; height: 38px; margin-bottom: 13px; border: 1px solid var(--hairline); border-radius: 12px; background: var(--surface); font-size: 17px; }
@@ -106,8 +126,14 @@ select { min-width: 0; cursor: pointer; }
 .prompt-chip { padding: 7px 8px; border: 1px solid var(--hairline); color: var(--vscode-foreground); background: var(--surface-raised); font-size: 11px; text-align: left; }
 .prompt-chip:hover { border-color: var(--edge); background: var(--list-hover); }
 
-.composer { position: sticky; bottom: 8px; z-index: 8; margin: 12px 0 4px; padding: 5px 7px 7px; border: 1px solid var(--edge); border-radius: var(--r-xl); background: var(--vscode-input-background); box-shadow: 0 8px 28px #0002; }
+.composer { position: sticky; bottom: 8px; z-index: 8; margin: 12px 0 4px; padding: 5px 7px 7px; border: 1px solid var(--edge); border-radius: var(--r-xl); background: var(--field-bg); box-shadow: 0 8px 28px #0002; }
+#threads:has(.empty-state) + .composer { position: relative; bottom: auto; }
 .composer:focus-within { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 1px color-mix(in srgb, var(--vscode-focusBorder) 25%, transparent), 0 8px 28px #0002; }
+.composer { transition: border-color 200ms ease, box-shadow 200ms ease; }
+/* These come after :focus-within so an in-flight ask always wins over a plain focus ring —
+   equal specificity, later rule wins. */
+.composer.state-thinking { border-color: var(--state-thinking); box-shadow: 0 0 0 1px color-mix(in srgb, var(--state-thinking) 30%, transparent), 0 8px 28px #0002; }
+.composer.state-running { border-color: var(--state-running); box-shadow: 0 0 0 1px color-mix(in srgb, var(--state-running) 30%, transparent), 0 8px 28px #0002; }
 .composer textarea { min-height: 52px; max-height: 220px; padding: 8px 5px 2px; border: 0; outline: 0; background: transparent; resize: none; line-height: 1.45; }
 .context-row { display: flex; padding: 1px 3px 5px; }
 .context-pill { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border: 1px solid var(--hairline); border-radius: 999px; color: var(--vscode-descriptionForeground); font-size: 10px; cursor: pointer; }
@@ -128,6 +154,19 @@ select { min-width: 0; cursor: pointer; }
 .card { padding: var(--sp-3); margin: var(--sp-2) 0; border: 1px solid var(--hairline); border-radius: var(--r-lg); background: var(--surface-raised); }
 .card.synthesis { border-color: color-mix(in srgb, var(--accent) 65%, var(--hairline)); box-shadow: inset 2px 0 0 var(--accent); }
 .card.failed { opacity: .72; }
+/* While an ask is running, the thread shows this single line instead of a stack of per-model
+   pending cards; it's replaced by the merged answer (or, failing that, the individual cards)
+   once the thread is done. */
+.thinking-line { padding: var(--sp-2) 2px; color: var(--vscode-descriptionForeground); font-size: 12px; font-style: italic; animation: thinking-pulse 1.8s ease-in-out infinite; }
+@keyframes thinking-pulse { 0%, 100% { opacity: .4; } 50% { opacity: 1; } }
+/* The individual free-model answers behind the merged one — collapsed by default so the thread
+   reads as one clean response, but still reachable for the per-model 👍/👎 vote. */
+.other-answers { margin-top: var(--sp-2); }
+.other-answers summary { padding: 4px 2px; color: var(--vscode-descriptionForeground); font-size: 10px; cursor: pointer; list-style: none; }
+.other-answers summary::-webkit-details-marker { display: none; }
+.other-answers summary::before { content: '▸ '; }
+.other-answers[open] summary::before { content: '▾ '; }
+.other-answers summary:hover { color: var(--vscode-foreground); }
 .meta { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; color: var(--vscode-descriptionForeground); font-size: 10px; }
 .meta b { color: var(--vscode-foreground); }
 .meta.err { color: var(--vscode-errorForeground); }
@@ -177,10 +216,23 @@ a.file:hover { text-decoration: underline; }
 .eyebrow { color: var(--vscode-descriptionForeground); font-size: 9px; font-weight: 650; letter-spacing: .12em; }
 .settings-card { padding: 12px; margin-bottom: 8px; border: 1px solid var(--hairline); border-radius: var(--r-lg); background: var(--surface-raised); }
 .settings-card h3 { margin: 0 0 5px; font-size: 12px; }
+/* A settings-card that's also a <details>: collapsed by default so paid-fallback config (off
+   by default, and not something most people ever need to touch) doesn't clutter first-run
+   setup, while its current state still shows on the closed summary line. */
+.advanced-card { padding: 0; }
+.advanced-card summary { display: flex; align-items: center; padding: 12px; cursor: pointer; list-style: none; }
+.advanced-card summary::-webkit-details-marker { display: none; }
+.advanced-card summary::before { content: '▸ '; color: var(--vscode-descriptionForeground); font-size: 10px; }
+.advanced-card[open] summary::before { content: '▾ '; }
+.advanced-card summary h3 { display: flex; flex: 1; align-items: center; gap: 8px; margin: 0; }
+.advanced-card > :not(summary) { padding: 0 12px; }
+.advanced-card > p.setting-help { margin-top: 10px; }
+.advanced-card > #costWarning:empty { padding: 0; }
+.advanced-card > *:last-child { padding-bottom: 12px; }
 .setting-help { margin: 0 0 10px; color: var(--vscode-descriptionForeground); font-size: 10px; line-height: 1.45; }
 .setting-title { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
 .field { display: grid; gap: 4px; margin-top: 9px; color: var(--vscode-descriptionForeground); font-size: 10px; }
-.field input, .field select { width: 100%; color: var(--vscode-input-foreground); }
+.field input, .field select { width: 100%; color: var(--field-fg); }
 .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 8px; }
 .switch-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--hairline); cursor: pointer; }
 .switch-row:first-of-type { margin-top: 10px; }
@@ -189,6 +241,17 @@ a.file:hover { text-decoration: underline; }
 .switch-row input { width: 16px; min-height: auto; accent-color: var(--accent); }
 .state-pill { flex: 0 0 auto; padding: 2px 6px; border-radius: 999px; color: var(--vscode-descriptionForeground); background: var(--ghost-hover); font-size: 9px; }
 .state-pill.good { color: var(--success); background: color-mix(in srgb, var(--success) 12%, transparent); }
+.policy-row, .budget-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--hairline); }
+.policy-row { cursor: pointer; }
+.policy-row > span, .budget-row > div { display: grid; flex: 1; min-width: 0; gap: 2px; }
+.policy-row small, .budget-row small { color: var(--vscode-descriptionForeground); font-size: 9px; line-height: 1.35; }
+.policy-row select { flex: 0 1 142px; max-width: 48%; }
+.cost-note { min-height: 0; color: var(--vscode-descriptionForeground); font-size: 9px; line-height: 1.4; }
+.cost-note:not(:empty) { padding: 7px 8px; margin-top: 3px; border-radius: var(--r-md); background: color-mix(in srgb, var(--vscode-editorWarning-foreground, #d29922) 9%, transparent); }
+.cost-line { display: inline; }
+.cost-shield { color: var(--success); }
+.inline-link { min-height: auto; padding: 0 2px; color: var(--vscode-textLink-foreground); background: transparent; font-size: inherit; text-decoration: none; }
+.inline-link:hover:not(:disabled) { color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground)); background: transparent; text-decoration: underline; }
 .settings-save { position: sticky; bottom: 6px; display: flex; justify-content: flex-end; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--hairline); border-radius: var(--r-lg); background: color-mix(in srgb, var(--vscode-sideBar-background) 92%, transparent); backdrop-filter: blur(10px); }
 .settings-save span { flex: 1; font-size: 10px; }
 
@@ -203,22 +266,75 @@ a.file:hover { text-decoration: underline; }
 .guide dt { font-weight: 650; }
 .guide dd { margin: 0; color: var(--vscode-descriptionForeground); line-height: 1.45; }
 
-/* spend and activity ------------------------------------------------------ */
+/* spend ------------------------------------------------------------------- */
 .meter { display: inline-block; width: 46px; height: 5px; margin-right: var(--sp-1); overflow: hidden; border-radius: 999px; background: var(--code-bg); vertical-align: middle; }
 .meter-fill { display: block; height: 100%; border-radius: 999px; background: var(--success); }
 .meter-fill.full { background: var(--vscode-errorForeground); }
-.quiet { display: flex; align-items: center; gap: var(--sp-1); margin-top: var(--sp-1); font-family: var(--mono); font-size: var(--mono-sm); }
-.quiet.warn { color: var(--vscode-editorWarning-foreground, #d29922); }
 
 @media (max-width: 270px) {
   body { padding-inline: var(--sp-2); }
   #tabs { margin-inline: calc(-1 * var(--sp-2)); padding-inline: var(--sp-2); }
   .tab { padding-inline: 7px; }
   .field-grid, .prompt-grid { grid-template-columns: 1fr; }
+  .policy-row { align-items: stretch; flex-direction: column; gap: 6px; }
+  .policy-row select { max-width: none; width: 100%; }
   .model-controls select { max-width: 102px; }
   .run-controls button { flex: 1 1 44%; }
+}
+
+@media (max-height: 620px) {
+  .empty-state { min-height: 190px; padding: 12px 10px 8px; }
+  .empty-mark { margin-bottom: 7px; }
+  .empty-state p { margin: 5px auto 9px; line-height: 1.35; }
+  .prompt-grid { gap: 4px; }
+  .prompt-chip { padding: 5px 7px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation-duration: .001ms !important; }
 }
+
+/* customization ("dress it up") --------------------------------------------- */
+/* #skinBackdrop/#skinScanlines are styled live by a nonce'd <style> tag panel.js injects at
+   runtime (CSP's style-src has no 'unsafe-inline', so dynamic values can't go through a plain
+   style="" attribute); these two rules are just the inert defaults before any skin is applied. */
+#skinBackdrop { position: fixed; inset: -40px; z-index: -1; pointer-events: none; background-position: center; opacity: 0; }
+/* These two sit inside .app-header and .composer, which are already position:sticky — that's
+   enough of a containing block for position:absolute, so no extra positioning rule is needed on
+   the parents. border-radius:inherit means the composer's rounded corners also clip its image. */
+#skinHeaderLayer, #skinComposerLayer { position: absolute; inset: 0; z-index: -1; pointer-events: none; background-position: center; border-radius: inherit; opacity: 0; }
+#skinScanlines { position: fixed; inset: 0; z-index: 9999; pointer-events: none; opacity: 0; mix-blend-mode: overlay;
+  background: repeating-linear-gradient(to bottom, rgba(0,0,0,.14) 0px, rgba(0,0,0,.14) 1px, transparent 1px, transparent 3px); }
+body.fx-crt #skinScanlines { opacity: .55; }
+body.fx-glow .tab.active::after, body.fx-glow .send, body.fx-glow .composer:focus-within,
+body.fx-glow button:not(.secondary):not(.icon):not(:disabled) {
+  box-shadow: 0 0 10px 1px color-mix(in srgb, var(--accent) 65%, transparent);
+}
+body.fx-glow .brand-mark { box-shadow: 0 0 8px 1px color-mix(in srgb, var(--accent) 55%, transparent); }
+
+.marquee { overflow: hidden; max-height: 0; white-space: nowrap; transition: max-height 160ms ease; border-bottom: 1px solid transparent; }
+body.fx-marquee .marquee { max-height: 20px; border-bottom-color: var(--hairline); }
+.marquee span { display: inline-block; padding: 3px 0 3px 100%; font-size: 10px; font-weight: 700; letter-spacing: .03em;
+  color: var(--accent); animation: skin-marquee 14s linear infinite; }
+@keyframes skin-marquee { from { transform: translateX(0); } to { transform: translateX(-100%); } }
+
+.confetti-canvas { position: fixed; inset: 0; z-index: 10000; pointer-events: none; }
+
+.row .grow { flex: 1; min-width: 120px; }
+.skin-presets { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.skin-swatch { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; padding: 8px; text-align: left; border: 1px solid var(--hairline); border-radius: var(--r-lg); background: var(--surface-raised); }
+.skin-swatch:hover { border-color: var(--edge); background: var(--list-hover); }
+.skin-swatch .sw-preview { width: 100%; height: 26px; border-radius: 6px; }
+.skin-swatch .sw-name { font-size: 11px; font-weight: 650; }
+.skin-swatch .sw-desc { font-size: 9px; color: var(--vscode-descriptionForeground); line-height: 1.3; }
+.sw-winamp .sw-preview { background: linear-gradient(135deg, #1a1033, #2de2c2); }
+.sw-vapor .sw-preview { background: linear-gradient(135deg, #2a0a4a, #ff6ec7 70%, #ffd37a); }
+.sw-fine .sw-preview { background: linear-gradient(135deg, #ff8a3d, #c23b22); }
+.sw-crt .sw-preview { background: linear-gradient(135deg, #001a00, #00ff6a); }
+.sw-comic .sw-preview { background: linear-gradient(135deg, #fff176, #ffca28); }
+.sw-myspace .sw-preview { background: linear-gradient(135deg, #ff1f8f, #120014); }
+
+.color-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 10px; }
+.color-field { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 9px; color: var(--vscode-descriptionForeground); font-size: 10px; }
+.color-field input[type="color"] { width: 34px; min-height: 26px; height: 26px; padding: 2px; cursor: pointer; }
+input[type="range"] { width: 100%; accent-color: var(--accent); }

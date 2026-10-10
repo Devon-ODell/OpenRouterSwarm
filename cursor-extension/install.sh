@@ -15,7 +15,12 @@ elif command -v cursor >/dev/null 2>&1; then
 fi
 if command -v code >/dev/null 2>&1; then code --install-extension flint-swarm.vsix --force && installed=1; fi
 if [ "$installed" = 1 ]; then
-  echo "Installed. In Cursor run 'Developer: Reload Window', then open Flint in the secondary sidebar (or activity bar on older versions)."
+  echo "Installed. Fully quit Cursor and open it again, then look for Flint in the secondary sidebar (or activity bar on older versions)."
+  echo "Optional shortcut: Cmd+Shift+P (Ctrl+Shift+P on Windows/Linux), type 'Developer: Reload Window', and press Enter."
 else
   echo "Packaged $(pwd)/flint-swarm.vsix; install it with 'Extensions: Install from VSIX...'."
+  if [ "${FLINT_REQUIRE_INSTALL:-0}" = 1 ]; then
+    echo "The in-extension update button requires a Cursor or VS Code CLI that can install the package." >&2
+    exit 3
+  fi
 fi

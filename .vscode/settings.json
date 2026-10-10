@@ -1,0 +1,15 @@
+{
+    "flintSwarm.models": 3,
+    "flintSwarm.stepsPerModel": 8,
+    "flintSwarm.timeoutSeconds": 300,
+    "flintSwarm.synthesize": true,
+    "flintSwarm.useStudy": true,
+    "flintSwarm.paidFallback": "off",
+    "flintSwarm.flintPath": "",
+    "flintSwarm.python": "",
+    "flintSwarm.providerState": {
+        "backend": "openrouter",
+        "model": null,
+        "customUrl": ""
+    }
+}

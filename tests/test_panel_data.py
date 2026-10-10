@@ -351,6 +351,16 @@ class BridgeSurfaceTests(unittest.TestCase):
         self.assertIn("now", out[0])
         self.assertIn("health", out[0])
         self.assertEqual(out[0]["health"]["attempts"], 0)
+        self.assertIs(out[0]["daemon_paid_configured"], False)
+
+    def test_status_says_when_the_daemon_paid_fallback_is_fully_configured(self):
+        config = json.loads(self.default.read_text())
+        config.update({"allow_paid": True, "paid_models": ["example/paid"],
+                       "monthly_usd": 5})
+        self.default.write_text(json.dumps(config))
+        rc, out = self.run_bridge("status", "--repo", str(self.repo))
+        self.assertEqual(rc, 0)
+        self.assertIs(out[0]["daemon_paid_configured"], True)
 
     def test_landed_and_parked_answer_on_an_empty_repository(self):
         for name in ("landed", "parked"):
