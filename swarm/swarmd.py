@@ -158,7 +158,7 @@ RELOADABLE = frozenset({
     "max_queue", "max_depth", "inject_corpus", "allow_paid", "study", "tick", "max_diff",
     "validation_commands", "test_cmd", "keep_worktrees", "scope_gate", "idle_improvement", "auto_plan",
     "idle_improvement_cooldown", "max_review_formats", "task_request_cap", "run_request_cap",
-    "max_role_calls"})
+    "max_role_calls", "shutdown_on_quota_exhausted"})
 # Changing these under a running daemon would strand worktrees, state or threads.
 RESTART_ONLY = frozenset({"repo", "trunk", "workers", "sandbox_write", "base_branch", "python",
                           "goal_file", "roadmap_file"})
@@ -446,6 +446,46 @@ def can_take_a_turn(c, budget):
     if budget.check()[0]:
         return True
     return bool(budget.paid_would_help() and paid_stand_in(c, None))
+
+
+def quota_mode(c):
+    """shutdown_on_quota_exhausted as one of 'shutdown' (default), 'wait', or 'paid'.
+
+    A bare boolean is still accepted: true -> shutdown, false -> wait, matching this
+    setting before it had a third option."""
+    v = c.get("shutdown_on_quota_exhausted", True)
+    if isinstance(v, bool):
+        return "shutdown" if v else "wait"
+    v = str(v).strip().lower()
+    return v if v in ("shutdown", "wait", "paid") else "shutdown"
+
+
+def quota_exhausted(c, budget):
+    """True when the configured mode says to give up and stop the daemon, right now.
+
+    The owner window is excluded on purpose: it is a scheduled quiet period the owner
+    asked for, not the free tier running dry, and it ends on its own on a known clock.
+
+    'wait' never gives up on its own — it waits for the daily reset, as this setting
+    behaved before it had a third option.
+
+    'paid' never gives up either, as long as this repo has any paid model configured
+    at all: an empty wallet or a busy provider can clear on their own — a live config
+    edit topping up the budget, a rate limit lifting — so it keeps retrying rather
+    than needing a restart. It only gives up when there is no paid model to ever route
+    to, which no amount of waiting can fix.
+
+    'shutdown' (the default) gives up the moment free is out and paid can't help this
+    instant."""
+    ok, _, why = budget.check()
+    if ok or "owner window" in why:
+        return False
+    mode = quota_mode(c)
+    if mode == "wait":
+        return False
+    if mode == "paid":
+        return not paid_pool(c)
+    return not (budget.paid_would_help() and paid_stand_in(c, None))
 
 
 def trunk_name(c):
@@ -947,7 +987,6 @@ class Queue:
               + 10 * independent_of_failed_root
               - estimated_requests
               - 20 * harness_failures
-              - 30 * prior_task_failures
         """
         now = now if now is not None else time.time()
         priority = 0
@@ -964,10 +1003,9 @@ class Queue:
             score += 10.0
         score -= estimate_requests(r)
         score -= 20.0 * max(0, int(r.get("harness_failures") or 0))
-        score -= 30.0 * max(0, int(r.get("prior_task_failures") or 0))
         return score
 
-    def claim(self):
+    def claim(self, requests_left=None):
         with self.locked():
             rows, now = _read(self.path), time.time()
             complete = {r["id"] for r in _read(self.done) if r.get("status") == "done"}
@@ -978,6 +1016,15 @@ class Queue:
                      and set(r.get("depends_on", [])).issubset(complete)]
             if not ready:
                 return None
+            # Once what's left of the run's request cap can no longer afford a brand-new
+            # task, only pick among tasks that already have a sunk-cost attempt. A run
+            # that keeps starting 0-request tasks right up to the cap is how five tasks
+            # died at 0 requests each while a half-finished check sat waiting its turn.
+            if requests_left is not None:
+                fresh = [r for r in ready if not r.get("attempts")]
+                started = [r for r in ready if r.get("attempts")]
+                if started and fresh and requests_left < min(estimate_requests(r) for r in fresh):
+                    ready = started
             # Priority is dominant; the EV formula ranks within it (work order §9).
             # `must_run_first` (a person, or a dependency the operator insists on) floats
             # to the top of its priority band regardless of cost.
@@ -1996,6 +2043,18 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
                 if alt:
                     model = alt
                     break
+            # Free and gone, with no usable fallback for the configured mode: by default
+            # the swarm stops here rather than idling for hours until the allowance
+            # resets. Set shutdown_on_quota_exhausted to "wait" or "paid" to keep the
+            # daemon up instead — "paid" keeps retrying a paid model every cycle below.
+            if quota_exhausted(c, budget):
+                log(f"{role}: free allowance exhausted ({why}) with no usable fallback — "
+                    "shutting down (set shutdown_on_quota_exhausted to \"wait\" or \"paid\" "
+                    "to keep the daemon up instead)", worker)
+                journal("quota_exhausted_shutdown", role=role, worker=worker, reason=why,
+                        mode=quota_mode(c))
+                shutdown()
+                raise Stopped("free allowance exhausted; shutting down")
             # The allowance can be hours from resetting; saying so once a quarter hour is enough,
             # and the worker records that it is waiting rather than working.
             waiting(worker, f"waiting for the allowance: {why}")
@@ -3932,7 +3991,9 @@ class Worker(threading.Thread):
             # Between tasks, never inside one: an edited config reaches this run without a
             # restart, and a restart is what killed 54 attempts in this window.
             watch_config(self.c, self.budget)
-            task = self.q.claim()
+            run_cap = max(0, int(self.c.get("run_request_cap") or 0))
+            requests_left = max(0, run_cap - int(_run.get("requests_started", 0))) if run_cap else None
+            task = self.q.claim(requests_left=requests_left)
             if not task:
                 self.doing, self.state = None, IDLE
                 self.clock.enter(IDLE)
@@ -4673,7 +4734,8 @@ KNOWN_KEYS = frozenset({
     "restart_on_change", "restart_min_interval", "role_models",
     "scope_gate", "idle_improvement", "idle_improvement_cooldown", "max_review_formats",
     "task_request_cap", "run_request_cap", "max_role_calls",
-    "keep_attempts", "execution_class", "auto_plan", "prov", "_comment"})
+    "keep_attempts", "execution_class", "auto_plan", "prov", "shutdown_on_quota_exhausted",
+    "_comment"})
 # Seconds a round of tool use really takes on these models, from the studio's own turns.
 SECONDS_PER_ROUND = 47
 
@@ -5235,6 +5297,17 @@ def run_daemon(c, max_tasks=None, hours=None):
                     continue
                 log(f"finished {tally.n} task(s); stopping")
                 break
+            # The free allowance can run out with the queue empty and nothing in flight — no
+            # worker ever calls flint() to notice, so the gate that stops a running turn
+            # (above, in flint()) never fires. Catch that here too, once a tick, so a swarm
+            # that starts already out of free requests doesn't just idle until midnight.
+            if not tally.drain.is_set() and quota_exhausted(c, budget):
+                log("free allowance exhausted with no usable fallback — finishing any "
+                    "task(s) in flight, then stopping (set shutdown_on_quota_exhausted to "
+                    "\"wait\" or \"paid\" to keep the daemon up instead)")
+                journal("quota_exhausted_shutdown", reason=budget.check()[2], mode=quota_mode(c))
+                drain(tally)
+                continue
             # An editor that autosaves must not be able to thrash the daemon.
             if (not restart_for and c.get("restart_on_change", True)
                     and time.time() - last_restart > c.get("restart_min_interval", 300)):

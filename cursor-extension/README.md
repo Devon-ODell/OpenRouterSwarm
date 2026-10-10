@@ -1,6 +1,8 @@
 # Flint Swarm for Cursor
 
-Point the flint swarm at the code you are working on without leaving the editor.
+Point the flint swarm at the code you are working on without leaving the editor. Version 0.5
+adds a Codex-style conversation surface, an inline provider/model picker, responsive queue and
+change views, workspace settings, encrypted key storage, and an in-extension setup guide.
 
 In the Queue tab, use **×** to dismiss one split/parked task or **Clear all abandoned**
 to dismiss the whole collection, including rows beyond the first 20 displayed.
@@ -16,13 +18,11 @@ After updating the extension, run **Developer: Reload Window** to load the contr
   function or class under the cursor is used. 👍/👎 on an answer makes that model more or less
   likely to be picked next time.
 
-  **Picking a provider/model.** Ask now opens with a provider dropdown: the local servers
-  (Ollama, LM Studio, MLX, llama.cpp, or any custom OpenAI-compatible URL) come first, then
-  OpenRouter. A local choice lists the models that server actually has pulled (fetched from
-  its `/v1/models`), so you can answer a question entirely from your own machine with no
-  OpenRouter key and no request budget consumed. Custom endpoints are remembered in
-  `~/.flint/providers.json` and reappear next session; the panel header shows which backend
-  the next ask will use.
+  **Picking a provider/model.** The composer has provider and model controls beside the send
+  button, so asking does not interrupt you with a second dialog. OpenRouter shows the configured
+  free pool; Ollama, LM Studio, MLX and llama.cpp show the models their running server reports
+  from `/v1/models`. A custom OpenAI-compatible URL and model id work too. The choice is saved
+  for this workspace, so another project can use a different backend.
 - **Queue a swarm task** for the selection. The task carries the file, the lines and your
   acceptance criterion; the swarm implements it on `swarm/trunk`, tests it, has another model
   review it, and lands it only if everything passes.
@@ -63,17 +63,27 @@ exactly that case — a fixed pot of the credits on your OpenRouter account, **$
 - The swarm daemon is unaffected: it still runs on free models only and cannot reach your credits.
   The budget is the extension's alone.
 
-## Install
+## Install on a laptop
+
+You need Cursor, Git, Python 3, and the current Node.js LTS. On Windows, use WSL with Ubuntu for
+the terminal steps. Then run:
 
 ```sh
-./setup.sh                      # first time: venv, API key, tests, then the extension
+git clone https://github.com/Devon-ODell/OpenRouterSwarm.git
+cd OpenRouterSwarm
+./setup.sh                      # venv, tests, commands, then the extension
 cursor-extension/install.sh     # later: re-package and reinstall only the extension
 ```
 
 Then reload Cursor with *Developer: Reload Window*. The extension talks to `swarm/bridge.py` in
 the checkout it was installed from. To use another checkout, set **Flint Swarm: Flint Path**.
+The complete plain-English walkthrough lives in the sidebar's **Help** page, including what each
+button does, how to move to a second laptop, and where cloud requests and Git changes go.
 
 ## Settings
+
+Open the sidebar's **Settings** page to edit these values for the current workspace. This uses
+Cursor's workspace configuration rather than changing another project's defaults.
 
 | setting | default | meaning |
 |---|---|---|
@@ -88,12 +98,13 @@ the checkout it was installed from. To use another checkout, set **Flint Swarm: 
 
 ## The OpenRouter API key
 
-On a fresh Cursor start, if no key is configured and the last-chosen backend is the cloud
-one, the extension asks for your OpenRouter key once (`sk-or-…`) and stores it in the flint
-checkout's `.env` (mode 0600) via `bridge.py set-key`. You can also set it any time with the
-**Flint Swarm: Set the OpenRouter API Key…** command or the 🔑 button in the sidebar header.
-Local-only setups (Ollama, LM Studio, …) never need a key, so the prompt stays silent for
-them. The palette command re-prompts on demand even after a fresh-start skip.
+On a fresh Cursor start, if no key is configured and the last-chosen backend is the cloud one,
+the extension asks for your OpenRouter key once (`sk-or-…`). Keys saved from the extension are
+kept in Cursor/VS Code SecretStorage (the operating system's encrypted credential store) and are
+passed only to the local bridge child process. They do not travel through workspace settings or
+Git. You can replace or forget the saved key from **Settings**, or use **Flint Swarm: Set the
+OpenRouter API Key…**. Existing installations with a key in the checkout `.env` remain compatible.
+Local-only setups (Ollama, LM Studio, …) do not need an OpenRouter key.
 
 ## Phase 2/3 additions (cost, doctor, routing, undo, extensions)
 

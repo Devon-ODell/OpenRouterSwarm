@@ -161,6 +161,9 @@ test('the webview has a nonce CSP and no inline handlers', () => {
   assert.strictEqual(html.split(`nonce="${nonce}"`).length - 1, 2);
   assert.ok(html.includes("default-src 'none'"));
   assert.ok(!/\son\w+=/.test(html));
+  assert.ok(html.includes('id="providerSelect"') && html.includes('id="modelSelect"'), 'the composer owns model selection');
+  assert.ok(html.includes('id="pane-settings"') && html.includes('id="pane-help"'), 'settings and zero-to-hero help are first-class pages');
+  assert.ok(html.includes('type="password"') && !html.includes('value="sk-'), 'the key field never embeds a secret');
   provider.post({ type: 'status', data: {} });
   assert.strictEqual(posted.length, 0, 'messages wait for the ready handshake');
 });
@@ -227,6 +230,27 @@ const QUEUE_STATUS = {
       origin: 'planner', not_before: 0, created: 12, acceptance: [], depends_on: ['t1'], blocks: [], detail: '' },
   ],
 };
+
+test('the settings page exposes project models and encrypted-key state', () => {
+  const { els, send } = panelHarness;
+  send({ type: 'info', data: { api_key: true, models: ['alpha/code:free', 'beta/code:free'] } });
+  send({ type: 'settings', data: {
+    values: { models: 4, stepsPerModel: 10, timeoutSeconds: 420, paidFallback: 'off',
+      synthesize: true, useStudy: false, flintPath: '/opt/flint', python: '' },
+    providerState: { backend: 'openrouter', model: 'beta/code:free' },
+    providers: [{ id: 'ollama', label: 'Ollama', running: true,
+      models: [{ id: 'qwen-coder:7b', name: 'qwen-coder:7b' }] }],
+    keyConfigured: true, keyStorage: 'Cursor encrypted secret storage', project: 'demo',
+  } });
+  send({ type: 'tab', tab: 'settings' });
+  assert.ok(els.providerSelect.text().includes('OpenRouter') && els.providerSelect.text().includes('Ollama'));
+  assert.ok(els.modelSelect.text().includes('alpha/code:free') && els.modelSelect.text().includes('beta/code:free'));
+  assert.strictEqual(els.settingModels.value, 4);
+  assert.strictEqual(els.settingStudy.checked, false);
+  assert.strictEqual(els.keyStatus.textContent, 'Configured');
+  assert.strictEqual(els.clearKey.disabled, false);
+  send({ type: 'tab', tab: 'ask' });
+});
 
 /** A click whose target only has to answer closest(), which is all the handler asks it. */
 const hit = (map) => ({ target: { closest: (sel) => map[sel] || null } });
@@ -337,6 +361,8 @@ test('the stylesheet is built on one spacing and radius scale', () => {
   // the input-border fallback chain, so a theme setting only one still shows an edge
   assert.ok(/--edge:.*inlineChatInput-border.*input-border.*widget-border/.test(css));
   assert.ok(css.includes('.meter-fill') && css.includes('.quiet.warn'));
+  assert.ok(css.includes('.composer') && css.includes('.settings-card') && css.includes('@media (max-width: 270px)'),
+    'the polished composer, settings and narrow sidebar layout are styled');
 });
 
 test('the row controls are revealed by hover and by keyboard focus', () => {
@@ -418,8 +444,8 @@ test('the fresh-start API-key prompt validates and surfaces a saved key', async 
   vscode.__inputAnswer = undefined;
   const skipped = await prompt('test');
   assert.strictEqual(skipped, false);
-  // A valid-looking key trips the validateInput regex and would be sent to the bridge,
-  // which writes the checkout .env — so feed an obviously bad one to prove the gate.
+  // A valid-looking key would be stored in SecretStorage (or the compatibility bridge in
+  // this offline shim), so feed an obviously bad one to prove the client-side gate.
   vscode.__inputAnswer = 'not-a-key';
   const bad = await prompt('test');
   assert.strictEqual(bad, false);   // rejected client-side before any bridge call

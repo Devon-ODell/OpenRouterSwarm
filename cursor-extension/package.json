@@ -2,7 +2,7 @@
   "name": "flint-swarm",
   "displayName": "Flint Swarm",
   "description": "Point a swarm of free OpenRouter coding models at the code you are working on: parallel answers with a merged verdict, a queue you can edit, and MIT OpenCourseWare lookups.",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "publisher": "devon-odell",
   "license": "UNLICENSED",
   "private": true,
@@ -128,6 +128,11 @@
         "category": "Flint Swarm"
       },
       {
+        "command": "flintSwarm.setQuotaMode",
+        "title": "Set What Happens When the Free Allowance Runs Out",
+        "category": "Flint Swarm"
+      },
+      {
         "command": "flintSwarm.showEvidence",
         "title": "Show What Happened on a Swarm Task",
         "category": "Flint Swarm"
@@ -136,6 +141,18 @@
         "command": "flintSwarm.setApiKey",
         "title": "Set the OpenRouter API Key…",
         "category": "Flint Swarm"
+      },
+      {
+        "command": "flintSwarm.showSettings",
+        "title": "Open Flint Swarm Settings",
+        "category": "Flint Swarm",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "flintSwarm.showHelp",
+        "title": "Open Flint Swarm Setup Guide",
+        "category": "Flint Swarm",
+        "icon": "$(question)"
       }
     ],
     "menus": {
@@ -168,6 +185,16 @@
           "command": "flintSwarm.refresh",
           "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
           "group": "navigation@2"
+        },
+        {
+          "command": "flintSwarm.showSettings",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
+          "group": "navigation@3"
+        },
+        {
+          "command": "flintSwarm.showHelp",
+          "when": "view == flintSwarm.panel || view == flintSwarm.panelSecondary",
+          "group": "navigation@4"
         }
       ]
     },
@@ -185,7 +212,7 @@
         "flintSwarm.flintPath": {
           "type": "string",
           "default": "",
-          "description": "Folder that contains flint.py and swarm/ (your LingAI-Trader checkout). Leave empty to use the folder recorded at install time."
+          "description": "Folder that contains flint.py and swarm/. Leave empty to use the folder recorded when this extension was installed."
         },
         "flintSwarm.python": {
           "type": "string",

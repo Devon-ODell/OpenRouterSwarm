@@ -21,7 +21,12 @@ let panel = null;
 let statusItem = null;
 let lastEditor = null;
 let lastInfo = 0;
+let extensionContext = null;
+let secretApiKey = null;
+let secretReady = Promise.resolve();
+let modelProvidersCache = [];
 const running = new Set();
+const SECRET_KEY = 'flintSwarm.openRouterApiKey';
 
 // ---------------------------------------------------------------- locating flint
 
@@ -64,7 +69,8 @@ function runBridge(args, opts = {}) {
   }
   return new Promise((resolve, reject) => {
     const child = cp.spawn(pythonFor(root), [path.join(root, 'swarm', 'bridge.py'), ...args],
-      { cwd: root, env: Object.assign({}, process.env, { PYTHONUNBUFFERED: '1' }) });
+      { cwd: root, env: Object.assign({}, process.env,
+        secretApiKey ? { PYTHONUNBUFFERED: '1', OPENROUTER_API_KEY: secretApiKey } : { PYTHONUNBUFFERED: '1' }) });
     running.add(child);
     const events = [];
     let buf = '', stderr = '';
@@ -166,10 +172,13 @@ function where(ctx) {
 function provState() { return vscode.workspace.getConfiguration('flintSwarm').get('providerState') || {}; }
 
 /** Persist the provider/model pick across restarts, so a local setup does not need re-picking. */
-function saveProvState(backend, model) {
+function saveProvState(backend, model, customUrl) {
   const c = cfg();
   const prev = provState();
-  return c.update('providerState', { ...prev, backend, model }, vscode.ConfigurationTarget.Global);
+  const target = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length
+    ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+  return c.update('providerState', { ...prev, backend, model,
+    ...(customUrl != null ? { customUrl: String(customUrl).trim() } : {}) }, target);
 }
 
 /** The last chosen backend, or 'openrouter' when nothing was picked. */
@@ -259,23 +268,46 @@ function providerArgs(prov) {
   return args;
 }
 
-async function ask(question, ctx) {
+/** Resolve the compact provider/model controls in the sidebar without opening another picker. */
+async function providerFromPanel(choice) {
+  const backend = (choice && choice.backend) || 'openrouter';
+  if (backend === 'openrouter') return { backend, label: 'OpenRouter', local: false, baseUrl: null };
+  if (backend === '__custom__') {
+    const url = String(choice.customUrl || '').trim().replace(/\/$/, '');
+    if (!/^https?:\/\//.test(url)) throw new Error('The custom model endpoint must start with http:// or https://.');
+    return { backend: 'custom:' + url, label: url, local: true, baseUrl: url };
+  }
+  const known = providerChoices().find((p) => p.id === backend && p.local);
+  if (!known) throw new Error(`Unknown model provider: ${backend}`);
+  const info = await bridgeJson(['local-models']);
+  const found = (info.providers || []).find((p) => p.id === backend);
+  if (!found || !found.running) throw new Error(`${known.label.replace(/^\$\([^)]*\)\s*/, '')} is not running.`);
+  return { backend, label: found.label || known.label, local: true, baseUrl: found.baseUrl };
+}
+
+async function ask(question, ctx, choice = null) {
   const repo = (ctx && ctx.repo) || repoFor(currentEditor() && currentEditor().document.uri);
   if (!repo) { vscode.window.showWarningMessage('Open a folder or file first; the swarm answers about a repository.'); return; }
   // The provider/model picker is the Phase 1 headline: a backend dropdown (local servers
   // first), then — for a local backend — the server's own model list from /models, then a
   // custom endpoint prompt. The pick is persisted so a local setup stays put between sessions.
-  const prov = await pickProviderModel();
+  let prov;
+  try { prov = choice ? await providerFromPanel(choice) : await pickProviderModel(); }
+  catch (e) { vscode.window.showErrorMessage(`Flint Swarm: ${e.message}`); return; }
   if (!prov) return;
   let model = null;
-  if (prov.local) {
+  if (choice) {
+    model = choice.model && choice.model !== '__auto__' ? choice.model : null;
+    if (prov.local && !model) { vscode.window.showWarningMessage('Choose a model from the local provider before asking.'); return; }
+  } else if (prov.local) {
     const picked = await pickLocalModel(prov);
     if (!picked) return;
     model = picked.id || picked.name;
   } else {
     model = (provState().model || null);   // the last cloud model asked with, if any
   }
-  await saveProvState(prov.backend, model);
+  await saveProvState(prov.backend.startsWith('custom:') ? '__custom__' : prov.backend, model,
+    choice && choice.customUrl);
   const id = crypto.randomBytes(6).toString('hex');
   panel.post({ type: 'askStart', id, question, where: where(ctx), repo, provider: prov.label });
   await panel.reveal();
@@ -408,6 +440,47 @@ async function cmdTogglePaid() {
     ['off', 'auto', 'always'].map((v) => ({ label: v === now ? `$(check) ${v}` : v, value: v, description: PAID_LABEL[v] })),
     { placeHolder: `Paid requests are currently "${now}"` });
   if (pick) await togglePaid(pick.value);
+}
+
+const QUOTA_MODE_ORDER = ['shutdown', 'wait', 'paid'];
+const QUOTA_MODE_LABEL = {
+  shutdown: "Stop the daemon once free is out and paid can't help.",
+  wait: 'Idle until the free allowance resets.',
+  paid: 'Never stop while a paid model is configured — keep retrying it instead.',
+};
+
+/** Flip the repo daemon's quota-exhaustion failsafe, via the bridge (it lives in that
+ * repo's own tuned config, not an extension setting). */
+async function setQuotaMode(repo, mode) {
+  const res = await bridgeJson(['quota-mode', '--repo', repo, '--set', mode]);
+  if (res && res.ok === false) {
+    vscode.window.showWarningMessage(`Flint swarm: ${res.error}`);
+    return null;
+  }
+  vscode.window.setStatusBarMessage(`$(sync) Swarm: on quota exhaustion → "${mode}"`, 5000);
+  lastInfo = 0;
+  refreshStatus();
+  return mode;
+}
+
+async function cycleQuotaMode(repo, from) {
+  const now = QUOTA_MODE_ORDER.includes(from) ? from : 'shutdown';
+  const next = QUOTA_MODE_ORDER[(QUOTA_MODE_ORDER.indexOf(now) + 1) % QUOTA_MODE_ORDER.length];
+  return setQuotaMode(repo, next);
+}
+
+async function cmdSetQuotaMode() {
+  const repo = repoFor(currentEditor() && currentEditor().document.uri);
+  if (!repo) {
+    vscode.window.showWarningMessage('Flint swarm: open a file in the target repository first.');
+    return;
+  }
+  const s = await bridgeJson(['status', '--repo', repo]).catch(() => null);
+  const now = (s && s.quota_mode) || 'shutdown';
+  const pick = await vscode.window.showQuickPick(
+    QUOTA_MODE_ORDER.map((v) => ({ label: v === now ? `$(check) ${v}` : v, value: v, description: QUOTA_MODE_LABEL[v] })),
+    { placeHolder: `On quota exhaustion, this repo is currently set to "${now}"` });
+  if (pick) await setQuotaMode(repo, pick.value);
 }
 
 /** What happened on a task: the attempt bundles the daemon recorded, newest first. */
@@ -918,7 +991,31 @@ async function showActivity(repo, fetch) {
 // A local-only setup (Ollama, LM Studio, …) never triggers this: local asks need no key.
 let keyPrompted = false;
 
-/** Ask for an OpenRouter API key and store it via the bridge (writes checkout .env, 0600). */
+function validApiKey(key) { return /^sk-(or-)?[A-Za-z0-9_-]+$/.test(String(key || '').trim()); }
+
+/** Keep the key in Cursor/VS Code SecretStorage. It is exposed only to bridge child processes. */
+async function storeApiKey(key) {
+  key = String(key || '').trim();
+  if (!validApiKey(key)) throw new Error('An OpenRouter key starts with sk-or-.');
+  if (extensionContext && extensionContext.secrets && extensionContext.secrets.store) {
+    await extensionContext.secrets.store(SECRET_KEY, key);
+    secretApiKey = key;
+    return { ok: true, storage: 'Cursor encrypted secret storage' };
+  }
+  // Compatibility for older hosts and the offline test shim.
+  const res = await bridgeJson(['set-key', '--key', key]);
+  if (!res || !res.ok) throw new Error((res && res.error) || 'could not save the key');
+  return { ok: true, storage: res.path || 'the flint .env' };
+}
+
+async function clearStoredApiKey() {
+  if (extensionContext && extensionContext.secrets && extensionContext.secrets.delete) {
+    await extensionContext.secrets.delete(SECRET_KEY);
+  }
+  secretApiKey = null;
+}
+
+/** Ask for an OpenRouter API key and store it in the editor's encrypted keychain. */
 async function promptForApiKey(message) {
   if (keyPrompted || !flintRoot()) return false;
   keyPrompted = true;
@@ -931,12 +1028,9 @@ async function promptForApiKey(message) {
   });
   if (!key) return false;
   try {
-    const res = await bridgeJson(['set-key', '--key', key.trim()]);
-    if (res && res.ok) {
-      vscode.window.showInformationMessage('OpenRouter API key saved to ' + (res.path || 'the flint .env'));
-      return true;
-    }
-    vscode.window.showErrorMessage((res && res.error) || 'could not save the key');
+    const res = await storeApiKey(key);
+    vscode.window.showInformationMessage('OpenRouter API key saved in ' + res.storage + '.');
+    return true;
   } catch (e) {
     vscode.window.showErrorMessage('Flint Swarm: ' + e.message);
   }
@@ -945,12 +1039,64 @@ async function promptForApiKey(message) {
 
 async function maybePromptForApiKey() {
   if (keyPrompted) return;
+  await secretReady;
+  if (secretApiKey) return;
   // Only cloud asks need the key; a local-only pick (ollama, lm-studio, …) is fine without it.
   if (chosenBackend() !== 'openrouter') return;
   let info = null;
   try { info = await bridgeJson(['info']); } catch { /* no bridge, no prompt */ return; }
   if (info && info.api_key) return;               // already configured
   await promptForApiKey();
+}
+
+const SETTING_KEYS = ['models', 'stepsPerModel', 'synthesize', 'useStudy', 'timeoutSeconds',
+  'paidFallback', 'flintPath', 'python'];
+
+async function settingsData(probeLocals = false) {
+  const c = cfg();
+  const values = Object.fromEntries(SETTING_KEYS.map((k) => [k, c.get(k)]));
+  let providers = [];
+  if (probeLocals) {
+    const local = await bridgeJson(['local-models']).catch(() => ({ providers: [] }));
+    modelProvidersCache = local.providers || [];
+  }
+  providers = modelProvidersCache;
+  return {
+    values,
+    providerState: provState(),
+    providers,
+    keyConfigured: !!secretApiKey,
+    keyStorage: secretApiKey ? 'Cursor encrypted secret storage' : null,
+    project: path.basename(repoFor(currentEditor() && currentEditor().document.uri) || 'this workspace'),
+  };
+}
+
+async function sendSettings(probeLocals = false) {
+  panel.post({ type: 'settings', data: await settingsData(probeLocals) });
+}
+
+async function saveProjectSettings(values) {
+  const c = cfg();
+  const target = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length
+    ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+  const clean = {
+    models: Math.max(1, Math.min(6, Number(values.models) || 3)),
+    stepsPerModel: Math.max(2, Math.min(20, Number(values.stepsPerModel) || 8)),
+    timeoutSeconds: Math.max(60, Math.min(1800, Number(values.timeoutSeconds) || 300)),
+    synthesize: !!values.synthesize,
+    useStudy: !!values.useStudy,
+    paidFallback: ['off', 'auto', 'always'].includes(values.paidFallback) ? values.paidFallback : 'off',
+    flintPath: String(values.flintPath || '').trim(),
+    python: String(values.python || '').trim(),
+  };
+  for (const [key, value] of Object.entries(clean)) {
+    await c.update(key, value, target);
+  }
+  if (values.backend) await saveProvState(values.backend, values.model === '__auto__' ? null : values.model, values.customUrl);
+  panel.post({ type: 'settingsSaved', text: `Saved for ${path.basename(panelRepo({}) || 'this project')}.` });
+  await sendSettings(false);
+  lastInfo = 0;
+  refreshStatus();
 }
 
 let refreshing = null;
@@ -1032,22 +1178,37 @@ class SwarmPanel {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="stylesheet" href="${uri('panel.css')}"></head>
 <body>
-<div id="status"></div>
-<div class="row"><button id="start" class="secondary">Start swarm</button><button id="stop" class="secondary" title="Kill the turn in flight">Stop now</button><button id="drain" class="secondary" title="Finish the task in flight, then stop">Stop after this task</button><button id="restart" class="secondary" title="Drain, then start again on the same config">Restart</button><button id="report" class="secondary">Report</button></div>
-<nav id="tabs" role="tablist">
-  <button class="tab" id="tab-ask" data-tab="ask" role="tab" aria-selected="true">Swarm</button>
+<header class="app-header">
+  <div class="brand"><span class="brand-mark" aria-hidden="true">✦</span><span>Flint</span><span id="runState" class="status-dot" title="Swarm status"></span></div>
+  <div class="header-actions"><button class="icon tab-jump" data-tab="help" title="Setup guide" aria-label="Setup guide">?</button><button class="icon tab-jump" data-tab="settings" title="Settings" aria-label="Settings">⚙</button></div>
+</header>
+<details id="statusDeck" class="status-deck">
+  <summary><span>Project &amp; swarm status</span><span class="chevron">⌄</span></summary>
+  <div id="status"></div>
+  <div class="row run-controls"><button id="start">Start swarm</button><button id="stop" class="secondary" title="Kill the turn in flight">Stop now</button><button id="drain" class="secondary" title="Finish the task in flight, then stop">Stop after task</button><button id="restart" class="secondary" title="Drain, then start again on the same config">Restart</button><button id="report" class="secondary">Report</button></div>
+</details>
+<nav id="tabs" role="tablist" aria-label="Flint sections">
+  <button class="tab" id="tab-ask" data-tab="ask" role="tab" aria-selected="true">Chat</button>
   <button class="tab" id="tab-queue" data-tab="queue" role="tab" aria-selected="false">Queue<span id="qcount" class="badge" hidden></span></button>
-  <button class="tab" id="tab-landed" data-tab="landed" role="tab" aria-selected="false">Landed</button>
+  <button class="tab" id="tab-landed" data-tab="landed" role="tab" aria-selected="false">Changes</button>
+  <button class="tab" id="tab-settings" data-tab="settings" role="tab" aria-selected="false">Settings</button>
+  <button class="tab" id="tab-help" data-tab="help" role="tab" aria-selected="false">Help</button>
 </nav>
 <div id="notice" class="notice"></div>
 <section id="pane-ask" role="tabpanel">
   <div id="recent"></div>
-  <form id="askForm">
-    <textarea id="question" placeholder="Ask the swarm about the code you're on… (⌘/Ctrl+Enter)"></textarea>
-    <label><input type="checkbox" id="withCode" checked> Include my selection (or the function under the cursor)</label>
-    <div class="row"><button type="submit">Ask the swarm</button><button id="queue" type="button" class="secondary">Queue as task</button><button id="lookup" type="button" class="secondary">MIT lookup</button></div>
-  </form>
   <section id="threads"></section>
+  <form id="askForm" class="composer">
+    <textarea id="question" rows="2" placeholder="Ask Flint to explain, review, or improve your code…"></textarea>
+    <div class="context-row"><label class="context-pill"><input type="checkbox" id="withCode" checked><span aria-hidden="true">＋</span> Current selection</label></div>
+    <div class="composer-footer">
+      <div class="model-controls"><select id="providerSelect" aria-label="Model provider" title="Model provider"><option value="openrouter">OpenRouter</option></select><select id="modelSelect" aria-label="Model" title="Model"><option value="__auto__">Auto</option></select></div>
+      <button type="submit" id="send" class="send" title="Send (Ctrl/⌘+Enter)" aria-label="Send">↑</button>
+    </div>
+    <input id="customEndpoint" class="custom-endpoint" type="url" placeholder="http://localhost:1234/v1" aria-label="Custom OpenAI-compatible endpoint" hidden>
+    <input id="customModel" class="custom-endpoint" type="text" placeholder="Model id reported by that endpoint" aria-label="Custom endpoint model id" hidden>
+    <div class="composer-tools"><button id="queue" type="button" class="tool-button">Queue as task</button><button id="lookup" type="button" class="tool-button">Search MIT notes</button></div>
+  </form>
 </section>
 <section id="pane-queue" role="tabpanel" hidden>
   <div id="queueHead"></div>
@@ -1060,6 +1221,41 @@ class SwarmPanel {
   <div id="landedHead"></div>
   <div id="landedList"></div>
 </section>
+<section id="pane-settings" class="page" role="tabpanel" hidden>
+  <div class="page-heading"><span class="eyebrow">PROJECT PREFERENCES</span><h2>Settings</h2><p>These choices apply to this workspace only. Another project can use a different model, budget, or runtime.</p></div>
+  <form id="settingsForm">
+    <section class="settings-card"><h3>Model &amp; provider</h3><p class="setting-help">Choose where answers run. “Auto” lets Flint route across the configured free model pool.</p>
+      <label class="field"><span>Provider</span><select id="settingProvider"><option value="openrouter">OpenRouter cloud</option><option value="ollama">Ollama</option><option value="lm-studio">LM Studio</option><option value="mlx">MLX</option><option value="llamacpp">llama.cpp</option><option value="__custom__">Custom endpoint</option></select></label>
+      <label class="field" id="settingModelField"><span>Default model</span><select id="settingModel"><option value="__auto__">Auto — best available</option></select></label>
+      <div class="custom-setting" id="customSetting" hidden><label class="field"><span>Custom endpoint</span><input id="settingCustomEndpoint" type="url" placeholder="http://localhost:1234/v1"></label><label class="field"><span>Model id</span><input id="settingCustomModel" type="text" placeholder="e.g. qwen2.5-coder"></label></div>
+    </section>
+    <section class="settings-card"><div class="setting-title"><div><h3>OpenRouter key</h3><p class="setting-help">Stored in Cursor’s encrypted SecretStorage and passed only to the local bridge process.</p></div><span id="keyStatus" class="state-pill">Not set</span></div>
+      <label class="field"><span>API key</span><input id="apiKey" type="password" autocomplete="off" placeholder="sk-or-…"></label>
+      <div class="row"><button id="saveKey" type="button">Save key securely</button><button id="clearKey" type="button" class="secondary">Forget saved key</button></div>
+    </section>
+    <section class="settings-card"><h3>Answer behavior</h3>
+      <div class="field-grid"><label class="field"><span>Parallel models</span><input id="settingModels" type="number" min="1" max="6"></label><label class="field"><span>Tool rounds per model</span><input id="settingSteps" type="number" min="2" max="20"></label><label class="field"><span>Timeout (seconds)</span><input id="settingTimeout" type="number" min="60" max="1800"></label><label class="field"><span>Paid fallback</span><select id="settingPaid"><option value="off">Off — free only</option><option value="auto">Auto — rescue only</option><option value="always">Always — paid first</option></select></label></div>
+      <label class="switch-row"><span><b>Merge the answers</b><small>Ask one more model to check and synthesize the result.</small></span><input id="settingSynthesize" type="checkbox"></label>
+      <label class="switch-row"><span><b>MIT study tools</b><small>Let models search the local OpenCourseWare corpus.</small></span><input id="settingStudy" type="checkbox"></label>
+    </section>
+    <section class="settings-card"><h3>Local installation</h3><label class="field"><span>Flint folder</span><input id="settingPath" type="text" placeholder="Auto-detect"></label><label class="field"><span>Python interpreter</span><input id="settingPython" type="text" placeholder=".venv/bin/python"></label></section>
+    <div class="settings-save"><span id="settingsFeedback" class="dim"></span><button type="submit">Save project settings</button></div>
+  </form>
+</section>
+<section id="pane-help" class="page guide" role="tabpanel" hidden>
+  <div class="page-heading"><span class="eyebrow">ZERO TO WORKING</span><h2>Put Flint on any laptop</h2><p>No jargon, no cloud lock-in, and no mystery spending. You own the checkout, the key, and every commit.</p></div>
+  <div class="guide-callout"><b>The short version</b><span>Install four ordinary tools, clone the repository, run one setup command, paste one API key, and reload Cursor.</span></div>
+  <ol class="steps">
+    <li><span class="step-number">1</span><div><h3>Install the basics</h3><p>Install <b>Cursor</b>, <b>Git</b>, <b>Python 3</b>, and the current <b>Node.js LTS</b>. On Windows, install <b>WSL with Ubuntu</b> and do the terminal steps inside Ubuntu. These are tools on your laptop—not subscriptions to Flint.</p></div></li>
+    <li><span class="step-number">2</span><div><h3>Get an OpenRouter key</h3><p>Create your own OpenRouter account, make an API key, and copy it. A key is a password for models. Do not email it, paste it into source code, or commit it to Git.</p></div></li>
+    <li><span class="step-number">3</span><div><h3>Download and install Flint</h3><p>Open a terminal, then run these commands one line at a time:</p><pre><code>git clone https://github.com/Devon-ODell/OpenRouterSwarm.git&#10;cd OpenRouterSwarm&#10;./setup.sh</code></pre><p>The setup creates an isolated Python environment, runs the checks, packages the extension, and installs it into Cursor when Cursor’s command-line tool is available.</p></div></li>
+    <li><span class="step-number">4</span><div><h3>Reload Cursor</h3><p>In Cursor, open the Command Palette, run <b>Developer: Reload Window</b>, then open the Flint star in the sidebar. Open this Settings page and save your OpenRouter key.</p></div></li>
+    <li><span class="step-number">5</span><div><h3>Use it on a project</h3><p>Open a Git project in Cursor. Put the cursor inside a function—or select exact lines—then ask a question below. Use <b>Queue as task</b> when you want tested work prepared on <code>swarm/trunk</code>. Flint never merges that branch into your main branch unless you do it.</p></div></li>
+  </ol>
+  <section class="settings-card"><h3>Moving to another laptop</h3><p>Repeat steps 1–4 on the new machine. Clone your project separately, open it in Cursor, and choose its project settings here. Keys are deliberately not copied with Git; save the key once on each laptop.</p></section>
+  <section class="settings-card"><h3>What the buttons mean</h3><dl><dt>Ask</dt><dd>Read-only advice about the code in front of you.</dd><dt>Queue as task</dt><dd>Tested implementation work in a separate worktree.</dd><dt>Start swarm</dt><dd>Begin taking queued work until you stop it.</dd><dt>Changes</dt><dd>Commits that passed tests and adversarial review.</dd></dl></section>
+  <section class="settings-card"><h3>Your control, plainly stated</h3><p>Cloud requests go only to the provider you choose. Local providers keep prompts on your own machine. Paid fallback is off unless you enable it, and its cap is visible. The daemon works in its own Git worktrees; you decide whether accepted commits ever reach <code>main</code>.</p></section>
+</section>
 <script nonce="${nonce}" src="${uri('render.js')}"></script>
 <script nonce="${nonce}" src="${uri('panel.js')}"></script>
 </body></html>`;
@@ -1071,8 +1267,10 @@ class SwarmPanel {
       for (const q of this.queue.splice(0)) this.view.webview.postMessage(q);
       lastInfo = 0;
       refreshStatus();
+      sendSettings(true).catch((e) => this.post({ type: 'settingsError', text: e.message }));
     } else if (m.type === 'ask') {
-      await ask(m.question, m.withCode ? await codeContext(currentEditor()) : null);
+      await ask(m.question, m.withCode ? await codeContext(currentEditor()) : null,
+        { backend: m.backend, model: m.model, customUrl: m.customUrl });
     } else if (m.type === 'queue') {
       await queueTask(m.title, m.withCode ? await codeContext(currentEditor()) : null);
     } else if (m.type === 'study') {
@@ -1108,6 +1306,9 @@ class SwarmPanel {
       await showReport();
     } else if (m.type === 'togglePaid') {
       await togglePaid(m.to);
+    } else if (m.type === 'cycleQuotaMode') {
+      const repo = m.repo || repoFor(currentEditor() && currentEditor().document.uri);
+      if (repo) await cycleQuotaMode(repo, m.from);
     } else if (m.type === 'evidence') {
       await showEvidence(m);
     } else if (m.type === 'queueGet') {
@@ -1124,9 +1325,26 @@ class SwarmPanel {
       await setBudget();
     } else if (m.type === 'setApiKey') {
       keyPrompted = false;
-      await promptForApiKey('OpenRouter API key (sk-or-...) — stored in the flint checkout .env, mode 0600');
+      await promptForApiKey('OpenRouter API key (sk-or-...) — stored in Cursor encrypted SecretStorage');
       lastInfo = 0;
       await refreshStatus();
+    } else if (m.type === 'settingsSave') {
+      try { await saveProjectSettings(m.values || {}); }
+      catch (e) { panel.post({ type: 'settingsError', text: e.message }); }
+    } else if (m.type === 'settingsKeySave') {
+      try {
+        const res = await storeApiKey(m.key);
+        panel.post({ type: 'keySaved', storage: res.storage });
+        lastInfo = 0;
+        await refreshStatus();
+      } catch (e) { panel.post({ type: 'settingsError', text: e.message }); }
+    } else if (m.type === 'settingsKeyClear') {
+      await clearStoredApiKey();
+      panel.post({ type: 'keyCleared' });
+      lastInfo = 0;
+      await refreshStatus();
+    } else if (m.type === 'settingsRefresh') {
+      await sendSettings(true);
     } else if (m.type === 'refresh') {
       await refreshStatus();
     }
@@ -1144,6 +1362,11 @@ function supportsSecondarySidebar(version) {
 }
 
 function activate(context) {
+  extensionContext = context;
+  if (context.secrets && context.secrets.get) {
+    secretReady = Promise.resolve(context.secrets.get(SECRET_KEY))
+      .then((key) => { secretApiKey = key || null; }).catch(() => {});
+  }
   panel = new SwarmPanel(context);
   if (!supportsSecondarySidebar(vscode.version)) {
     vscode.commands.executeCommand('setContext', 'flintSwarm:doesNotSupportSecondarySidebar', true);
@@ -1170,6 +1393,7 @@ function activate(context) {
   reg('flintSwarm.stopGrind', () => stopGrind());
   reg('flintSwarm.showPanel', () => panel.reveal());
   reg('flintSwarm.togglePaid', cmdTogglePaid);
+  reg('flintSwarm.setQuotaMode', cmdSetQuotaMode);
   reg('flintSwarm.showEvidence', async () => {
     const repo = repoFor(currentEditor() && currentEditor().document.uri);
     const id = await vscode.window.showInputBox({ prompt: 'Swarm task id', placeHolder: 't1a2b3c4d5e6' });
@@ -1183,9 +1407,18 @@ function activate(context) {
   reg('flintSwarm.refresh', () => { lastInfo = 0; return refreshStatus(); });
   reg('flintSwarm.setApiKey', async () => {
     keyPrompted = false;   // the palette command may re-prompt even after a fresh-start skip
-    await promptForApiKey('OpenRouter API key (sk-or-...) — stored in the flint checkout .env (mode 0600)');
+    await promptForApiKey('OpenRouter API key (sk-or-...) — stored in Cursor encrypted SecretStorage');
     lastInfo = 0;
     return refreshStatus();
+  });
+  reg('flintSwarm.showSettings', async () => {
+    await panel.reveal();
+    panel.post({ type: 'tab', tab: 'settings' });
+    return sendSettings(true);
+  });
+  reg('flintSwarm.showHelp', async () => {
+    await panel.reveal();
+    panel.post({ type: 'tab', tab: 'help' });
   });
   // While a daemon runs there is something new to show every few seconds — the round it is on,
   // the model, how long the turn has taken. When nothing runs, once a minute is plenty.

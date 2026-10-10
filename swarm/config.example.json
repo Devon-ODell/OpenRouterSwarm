@@ -63,6 +63,7 @@
   },
   "inject_corpus": true,
   "tick": 90,
+  "shutdown_on_quota_exhausted": "shutdown",
   "restart_on_change": true,
   "restart_min_interval": 300,
   "allowance_recheck": 300,

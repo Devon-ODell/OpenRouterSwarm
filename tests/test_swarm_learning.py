@@ -747,6 +747,95 @@ class QueueEditTests(SwarmBase):
         self.assertIsNone(q.release(t["id"], True, "finished after it was removed"))
 
 
+class BudgetSchedulingTests(SwarmBase):
+    def test_claim_prefers_started_work_once_the_run_cap_is_thin(self):
+        """A run that's nearly out of its request cap must finish a sunk-cost task
+        rather than open a fresh one at 0 requests spent — directly the bug that let
+        five tasks die at 0 requests each while a half-finished check waited its turn."""
+        q = swarmd.Queue()
+        fresh = q.add("Fresh")
+        started = q.add("Started")
+        rows = swarmd._read(q.path)
+        for r in rows:
+            if r["id"] == started["id"]:
+                r["attempts"] = 1
+        swarmd._write(q.path, rows)
+        self.assertEqual(swarmd.estimate_requests(fresh), 35)   # default "feature" estimate
+
+        claimed = q.claim(requests_left=10)                     # can't afford a fresh task
+        self.assertEqual(claimed["id"], started["id"])
+
+    def test_claim_still_returns_fresh_work_when_nothing_is_started(self):
+        q = swarmd.Queue()
+        fresh = q.add("Only fresh task")
+        claimed = q.claim(requests_left=10)
+        self.assertEqual(claimed["id"], fresh["id"])
+
+    def test_claim_ignores_the_cap_when_requests_left_is_not_given(self):
+        q = swarmd.Queue()
+        fresh = q.add("Fresh")
+        started = q.add("Started")
+        rows = swarmd._read(q.path)
+        for r in rows:
+            if r["id"] == started["id"]:
+                r["attempts"] = 1
+        swarmd._write(q.path, rows)
+        claimed = q.claim()                                      # no run_request_cap configured
+        self.assertEqual(claimed["id"], fresh["id"])              # normal priority/age ordering
+
+
+class SelectionScoreTests(unittest.TestCase):
+    def test_prior_task_failures_is_dead_and_does_nothing(self):
+        """Grepped nowhere else in swarm/: no writer ever sets this field, so the -30
+        penalty the docstring once promised was permanently inert. Removed rather than
+        wired up, per the ranked fix list — confirm it truly has no effect any more."""
+        plain = swarmd.Queue.selection_score({"priority": 1})
+        self.assertEqual(swarmd.Queue.selection_score({"priority": 1, "prior_task_failures": 9}), plain)
+        self.assertNotIn("prior_task_failures", swarmd.Queue.selection_score.__doc__)
+
+
+class ReviewParsingTests(unittest.TestCase):
+    """parse_review's structural gate, exercised directly against the exact shape of
+    review the swarm itself rejected on 2026-10-09 (t573d909dbcfb, review-02-invalid.txt):
+    well-formed JSON, correctly evidenced, carrying one finding with nothing to anchor a
+    path/line to."""
+
+    ACCEPTANCE = [{"id": "C1", "text": "..."}]
+
+    def review(self, **findings_kw):
+        body = {
+            "verdict": "request_changes",
+            "summary": "needs work",
+            "checks": [{"criterion": "C1", "passed": False, "evidence": "see findings"}],
+            "findings": [{
+                "severity": "major",
+                "issue": "No evidence of corpus audit before the check went live.",
+                "verification": "Check for a commit auditing the corpus.",
+                **findings_kw,
+            }],
+        }
+        return workflow.parse_review(json.dumps(body), "deadbeef1234", self.ACCEPTANCE)
+
+    def test_a_finding_with_no_path_or_line_is_accepted(self):
+        review = self.review(path="", line=0)
+        self.assertEqual(review["findings"][0]["path"], "")
+
+    def test_a_finding_that_omits_path_and_line_entirely_is_accepted(self):
+        self.review()                                            # neither key present at all
+
+    def test_a_finding_with_a_path_but_no_line_is_still_rejected(self):
+        with self.assertRaisesRegex(ValueError, "finding line must be a positive integer"):
+            self.review(path="spike/grade-lib.mjs")
+
+    def test_a_finding_with_a_line_but_no_path_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "a finding with a line needs a path"):
+            self.review(line=5)
+
+    def test_a_finding_with_a_real_path_still_needs_a_real_line(self):
+        with self.assertRaisesRegex(ValueError, "finding line must be a positive integer"):
+            self.review(path="spike/grade-lib.mjs", line=0)
+
+
 class GuardTests(SwarmBase):
     def test_paid_models_are_dropped_or_refused(self):
         self.assertEqual(swarmd.pool({"models": ["a:free", "openai/gpt-x"]}), ["a:free"])
@@ -774,6 +863,80 @@ class GuardTests(SwarmBase):
                     return False
             with self.subTest(rc=rc), patch.object(swarmd, "process", Fake), self.assertRaises(exc):
                 swarmd.flint("x", self.root, {"python": "python3"}, "implementer", "w0", budget, 1, "a:free")
+
+    def test_quota_exhausted_is_true_only_when_nothing_can_stand_in(self):
+        budget = Mock()
+        budget.check.return_value = (True, 0, "within budget")
+        self.assertFalse(swarmd.quota_exhausted({}, budget))          # allowance still fine
+
+        budget.check.return_value = (False, 900, "owner window until 20:00 local")
+        self.assertFalse(swarmd.quota_exhausted({}, budget))          # scheduled, not exhausted
+
+        budget.check.return_value = (False, 60, "day's allowance spent (50/50, 10 held in reserve)")
+        budget.paid_would_help.return_value = True
+        with patch.object(swarmd, "paid_stand_in", return_value="openai/gpt-x"):
+            self.assertFalse(swarmd.quota_exhausted({}, budget))      # a paid model can run it
+        with patch.object(swarmd, "paid_stand_in", return_value=None):
+            self.assertTrue(swarmd.quota_exhausted({}, budget))       # genuinely out of road
+
+        budget.paid_would_help.return_value = False
+        self.assertTrue(swarmd.quota_exhausted({}, budget))
+
+    def test_quota_mode_reads_the_tri_state_setting(self):
+        self.assertEqual(swarmd.quota_mode({}), "shutdown")                        # default
+        self.assertEqual(swarmd.quota_mode({"shutdown_on_quota_exhausted": True}), "shutdown")
+        self.assertEqual(swarmd.quota_mode({"shutdown_on_quota_exhausted": False}), "wait")
+        self.assertEqual(swarmd.quota_mode({"shutdown_on_quota_exhausted": "wait"}), "wait")
+        self.assertEqual(swarmd.quota_mode({"shutdown_on_quota_exhausted": "PAID"}), "paid")
+        self.assertEqual(swarmd.quota_mode({"shutdown_on_quota_exhausted": "nonsense"}), "shutdown")
+
+    def test_paid_mode_never_gives_up_while_a_paid_model_is_configured(self):
+        """'paid' mode tolerates an empty wallet or a busy provider — either can clear on
+        its own (a live config edit, a rate limit lifting) — and only gives up when there
+        is no paid model to ever route to, which no amount of waiting can fix."""
+        budget = Mock()
+        budget.check.return_value = (False, 60, "day's allowance spent (50/50, 10 held in reserve)")
+        c = {"shutdown_on_quota_exhausted": "paid"}
+        with patch.object(swarmd, "paid_pool", return_value=["openai/gpt-x"]):
+            self.assertFalse(swarmd.quota_exhausted(c, budget))    # wallet empty right now, keep trying
+        with patch.object(swarmd, "paid_pool", return_value=[]):
+            self.assertTrue(swarmd.quota_exhausted(c, budget))     # no paid model ever configured
+
+    def test_quota_exhausted_shuts_the_daemon_down_by_default(self):
+        budget = Mock(cap=10, reserve=1)
+        budget.check.return_value = (False, 60, "day's allowance spent (50/50, 10 held in reserve)")
+        budget.paid_would_help.return_value = False
+        self.addCleanup(swarmd._stop.clear)
+        with self.assertRaisesRegex(swarmd.Stopped, "free allowance exhausted"):
+            swarmd.flint("x", self.root, {"python": "python3"}, "implementer", "w0", budget, 1, "a:free")
+        self.assertTrue(swarmd._stop.is_set())
+
+    def test_shutdown_on_quota_exhausted_false_waits_instead(self):
+        budget = Mock(cap=10, reserve=1)
+        budget.check.return_value = (False, 0.01, "day's allowance spent (50/50, 10 held in reserve)")
+        budget.paid_would_help.return_value = False
+        c = {"python": "python3", "shutdown_on_quota_exhausted": False}
+
+        def stop_after_a_wait(_seconds):
+            swarmd._stop.set()
+        self.addCleanup(swarmd._stop.clear)
+        with patch.object(swarmd._stop, "wait", side_effect=stop_after_a_wait), \
+                self.assertRaisesRegex(swarmd.Stopped, "swarm is stopping"):
+            swarmd.flint("x", self.root, c, "implementer", "w0", budget, 1, "a:free")
+
+    def test_shutdown_on_quota_exhausted_paid_keeps_retrying_instead_of_shutting_down(self):
+        budget = Mock(cap=10, reserve=1)
+        budget.check.return_value = (False, 0.01, "day's allowance spent (50/50, 10 held in reserve)")
+        budget.paid_would_help.return_value = False     # a plain "shutdown"-mode check would give up
+        c = {"python": "python3", "shutdown_on_quota_exhausted": "paid"}
+
+        def stop_after_a_wait(_seconds):
+            swarmd._stop.set()
+        self.addCleanup(swarmd._stop.clear)
+        with patch.object(swarmd, "paid_pool", return_value=["openai/gpt-x"]), \
+                patch.object(swarmd._stop, "wait", side_effect=stop_after_a_wait), \
+                self.assertRaisesRegex(swarmd.Stopped, "swarm is stopping"):
+            swarmd.flint("x", self.root, c, "implementer", "w0", budget, 1, "a:free")
 
     def test_a_folder_of_projects_is_tested_one_level_down(self):
         """The layout that stopped a real run: an umbrella folder holding several projects."""

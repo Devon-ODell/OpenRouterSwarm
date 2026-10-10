@@ -1,5 +1,5 @@
 // Webview script for the Flint Swarm sidebar. Talks to extension.js by postMessage only.
-// Two tabs: the swarm conversation, and the queue — where a task can be edited or dropped.
+// Codex-shaped conversation surface plus queue, change history, project settings and setup guide.
 (function () {
   'use strict';
   const vscode = acquireVsCodeApi();
@@ -8,6 +8,7 @@
   const threads = saved.threads || [];          // [{id, kind, question, where, repo, cards:{}, order:[], done}]
   let status = saved.status || null, info = saved.info || null;
   let landed = saved.landed || null, parked = saved.parked || null;
+  let settings = saved.settings || null;
   let tab = saved.tab || 'ask';
   const open = new Set();                       // queue rows expanded to show their detail
   let editing = null;                           // {id, task} while a task is being rewritten
@@ -15,7 +16,7 @@
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
-  const save = () => vscode.setState({ threads: threads.slice(-20), status, info, tab, landed, parked });
+  const save = () => vscode.setState({ threads: threads.slice(-20), status, info, tab, landed, parked, settings });
   // Cents are the unit that matters under a dollar: the first few questions cost fractions of one.
   const money = (n) => '$' + Number(n || 0).toFixed(Math.abs(Number(n) || 0) < 1 ? 4 : 2);
 
@@ -121,6 +122,14 @@
         always: 'ON from the first request' }[paid] || paid;
       bits.push(`<span class="${paid === 'off' ? 'ok' : 'warn'}">paid requests: <b>${R.esc(paidWord)}</b></span>`
         + ` <button class="icon" id="paidToggle" title="${paid === 'off' ? 'Allow paid models as a rescue' : 'Switch paid requests off'}">${paid === 'off' ? '🔒' : '⏻'}</button>`);
+      // What the daemon does once the free allowance runs out and no turn can start:
+      // stop (default), idle until the reset, or keep retrying a paid model forever.
+      const quota = status.quota_mode || 'shutdown';
+      const quotaWord = { shutdown: 'stop the daemon', wait: 'wait for the daily reset',
+        paid: 'fall back to paid, never stop' }[quota] || quota;
+      const quotaEmoji = { shutdown: '🛑', wait: '⏳', paid: '💳' }[quota] || '🛑';
+      bits.push(`<span class="${quota === 'shutdown' ? 'ok' : 'warn'}">on quota exhaustion: <b>${R.esc(quotaWord)}</b></span>`
+        + ` <button class="icon" id="quotaModeToggle" title="Click to cycle shutdown → wait → paid">${quotaEmoji}</button>`);
       // The provider/model the developer's ask will use (local picks stay off OpenRouter).
       const prov = status.ask_provider || 'openrouter';
       const provLabel = prov === 'openrouter' ? 'OpenRouter' : prov;
@@ -129,7 +138,7 @@
       // The key gate from the fresh-start prompt: cloud asks need a key, local ones do not.
       if (prov === 'openrouter' && info && info.api_key === false) {
         bits.push(`<span class="err">no OpenRouter API key set</span> `
-          + `<button class="icon" id="setkey" title="Set the OpenRouter API key (stored in the checkout .env, 0600)">🔑</button>`);
+          + `<button class="icon" id="setkey" title="Set the OpenRouter API key in Cursor encrypted SecretStorage">🔑</button>`);
       }
       const w = status.wallet;
       if (w) {
@@ -192,12 +201,85 @@
     const badge = $('qcount');
     badge.textContent = n ? String(n) : '';
     badge.hidden = !n;
+    const dot = $('runState');
+    if (dot) {
+      dot.className = 'status-dot ' + (running ? 'running' : 'stopped');
+      dot.setAttribute('title', running ? 'Swarm running' : 'Swarm stopped');
+    }
+  }
+
+  // ---------------------------------------------------------------- model controls + settings
+
+  function modelRows(provider) {
+    if (provider === 'openrouter') return ((info && info.models) || []).map((id) => ({ id, name: id }));
+    const p = ((settings && settings.providers) || []).find((x) => x.id === provider);
+    return (p && p.models) || [];
+  }
+
+  function fillModels(select, provider, selected) {
+    if (!select) return;
+    const rows = modelRows(provider);
+    const auto = provider === 'openrouter' ? '<option value="__auto__">Auto · best available</option>' : '';
+    select.innerHTML = auto + rows.map((m) => `<option value="${R.esc(m.id)}">${R.esc(m.name || m.id)}</option>`).join('');
+    select.value = selected && rows.some((m) => m.id === selected) ? selected : (provider === 'openrouter' ? '__auto__' : (rows[0] && rows[0].id) || '');
+  }
+
+  function renderModelControls() {
+    const state = (settings && settings.providerState) || {};
+    const current = state.backend || (status && status.ask_provider) || 'openrouter';
+    const providers = [
+      { id: 'openrouter', label: 'OpenRouter' },
+      ...((settings && settings.providers) || []).map((p) => ({ id: p.id, label: p.label + (p.running ? '' : ' · offline') })),
+      { id: '__custom__', label: 'Custom endpoint' },
+    ];
+    const options = providers.filter((p, i, all) => all.findIndex((x) => x.id === p.id) === i)
+      .map((p) => `<option value="${R.esc(p.id)}">${R.esc(p.label)}</option>`).join('');
+    for (const id of ['providerSelect', 'settingProvider']) {
+      const node = $(id);
+      if (!node) continue;
+      node.innerHTML = options;
+      node.value = current;
+    }
+    fillModels($('modelSelect'), current, state.model);
+    fillModels($('settingModel'), current, state.model);
+    const custom = current === '__custom__';
+    $('modelSelect').hidden = custom;
+    $('settingModelField').hidden = custom;
+    $('customEndpoint').hidden = !custom;
+    $('customModel').hidden = !custom;
+    $('customSetting').hidden = !custom;
+    if (state.customUrl) {
+      $('customEndpoint').value = state.customUrl;
+      $('settingCustomEndpoint').value = state.customUrl;
+    }
+    if (custom && state.model) {
+      $('customModel').value = state.model;
+      $('settingCustomModel').value = state.model;
+    }
+  }
+
+  function renderSettings() {
+    if (!settings) return;
+    const v = settings.values || {};
+    $('settingModels').value = v.models == null ? 3 : v.models;
+    $('settingSteps').value = v.stepsPerModel == null ? 8 : v.stepsPerModel;
+    $('settingTimeout').value = v.timeoutSeconds == null ? 300 : v.timeoutSeconds;
+    $('settingPaid').value = v.paidFallback || 'off';
+    $('settingSynthesize').checked = v.synthesize !== false;
+    $('settingStudy').checked = v.useStudy !== false;
+    $('settingPath').value = v.flintPath || '';
+    $('settingPython').value = v.python || '';
+    const configured = settings.keyConfigured || !!(info && info.api_key);
+    $('keyStatus').textContent = configured ? 'Configured' : 'Not set';
+    $('keyStatus').className = 'state-pill ' + (configured ? 'good' : '');
+    $('clearKey').disabled = !settings.keyConfigured;
+    renderModelControls();
   }
 
   // ---------------------------------------------------------------- tabs
 
   function renderTab() {
-    for (const name of ['ask', 'queue', 'landed']) {
+    for (const name of ['ask', 'queue', 'landed', 'settings', 'help']) {
       $('pane-' + name).hidden = tab !== name;
       const t = $('tab-' + name);
       t.classList.toggle('active', tab === name);
@@ -205,6 +287,7 @@
     }
     if (tab === 'queue') { renderQueue(); renderParked(); }
     if (tab === 'landed') renderLanded();
+    if (tab === 'settings') { renderSettings(); vscode.postMessage({ type: 'settingsRefresh' }); }
   }
 
   function showTab(name) {
@@ -409,7 +492,7 @@
     const box = $('threads');
     box.innerHTML = '';
     for (const t of threads.slice().reverse()) box.appendChild(renderThread(t));
-    if (!threads.length) box.innerHTML = '<p class="dim">Select code (or just put the cursor in a function), then ask. Every answer comes from a different free model; one more model checks them against your code and merges them.</p>';
+    if (!threads.length) box.innerHTML = '<div class="empty-state"><span class="empty-mark">✦</span><h1>What are we building?</h1><p>Ask about the file you have open, select a few lines for a focused review, or describe the change you want.</p><div class="prompt-grid"><button class="prompt-chip" data-prompt="Find bugs in the code I have selected">Find a bug</button><button class="prompt-chip" data-prompt="Explain the code I have selected in plain English">Explain this code</button><button class="prompt-chip" data-prompt="What tests should this code have?">Plan tests</button><button class="prompt-chip" data-prompt="How could this code be simpler or faster?">Improve it</button></div></div>';
   }
 
   function thread(id) { return threads.find((t) => t.id === id); }
@@ -445,10 +528,15 @@
       if (editing && !status.queue.some((t) => t.id === editing.id)) editing = null;
       renderStatus();
       if (tab === 'queue') { renderQueue(); renderParked(); }
-    } else if (msg.type === 'info') { info = msg.data; renderStatus(); }
+    } else if (msg.type === 'info') { info = msg.data; renderStatus(); renderModelControls(); renderSettings(); }
+    else if (msg.type === 'settings') { settings = msg.data; renderSettings(); save(); }
+    else if (msg.type === 'settingsSaved') { $('settingsFeedback').className = 'dim'; $('settingsFeedback').textContent = msg.text || 'Saved.'; }
+    else if (msg.type === 'settingsError') { $('settingsFeedback').textContent = msg.text || 'Could not save settings.'; $('settingsFeedback').className = 'err'; }
+    else if (msg.type === 'keySaved') { settings = settings || {}; settings.keyConfigured = true; settings.keyStorage = msg.storage; $('apiKey').value = ''; $('settingsFeedback').className = 'dim'; $('settingsFeedback').textContent = `Key saved in ${msg.storage}.`; renderSettings(); }
+    else if (msg.type === 'keyCleared') { settings = settings || {}; settings.keyConfigured = false; $('settingsFeedback').className = 'dim'; $('settingsFeedback').textContent = 'The encrypted key was forgotten on this laptop.'; renderSettings(); }
     else if (msg.type === 'landed') { landed = msg.commits || []; save(); if (tab === 'landed') renderLanded(); }
     else if (msg.type === 'parked') { parked = msg.parked || []; save(); if (tab === 'queue') renderParked(); }
-    else if (msg.type === 'tab') { tab = ['queue', 'landed'].includes(msg.tab) ? msg.tab : 'ask'; renderTab(); }
+    else if (msg.type === 'tab') { tab = ['queue', 'landed', 'settings', 'help'].includes(msg.tab) ? msg.tab : 'ask'; renderTab(); }
     else if (msg.type === 'queueTask') { editing = { id: msg.task.id, task: msg.task }; editError = null; showTab('queue'); renderQueue(); }
     else if (msg.type === 'queueSaved') { editing = null; editError = null; renderQueue(); }
     else if (msg.type === 'queueError') { editError = msg.error; renderQueue(); }
@@ -471,12 +559,21 @@
   document.addEventListener('click', (e) => {
     const tabBtn = e.target.closest('.tab');
     if (tabBtn) { showTab(tabBtn.dataset.tab); return; }
+    const jump = e.target.closest('.tab-jump');
+    if (jump) { showTab(jump.dataset.tab); return; }
+    const prompt = e.target.closest('.prompt-chip');
+    if (prompt) { $('question').value = prompt.dataset.prompt || ''; $('question').focus(); return; }
     if (e.target.closest('#board')) { vscode.postMessage({type:'board'}); return; }
     if (e.target.closest('#completed')) { vscode.postMessage({type:'completed'}); return; }
     if (e.target.closest('#activity')) { vscode.postMessage({ type: 'activity' }); return; }
     if (e.target.closest('#budget')) { vscode.postMessage({ type: 'budget' }); return; }
     if (e.target.closest('#setkey')) { vscode.postMessage({ type: 'setApiKey' }); return; }
     if (e.target.closest('#paidToggle')) { vscode.postMessage({ type: 'togglePaid' }); return; }
+    if (e.target.closest('#quotaModeToggle')) {
+      vscode.postMessage({ type: 'cycleQuotaMode', repo: status && status.repo,
+        from: (status && status.quota_mode) || 'shutdown' });
+      return;
+    }
     if (e.target.closest('#qclear')) {
       vscode.postMessage({ type: 'queueClear', repo: status && status.repo });
       return;
@@ -572,11 +669,50 @@
     e.preventDefault();
     const q = $('question').value.trim();
     if (!q) { $('question').focus(); return; }
-    vscode.postMessage({ type: 'ask', question: q, withCode: $('withCode').checked });
+    vscode.postMessage({ type: 'ask', question: q, withCode: $('withCode').checked,
+      backend: $('providerSelect').value || 'openrouter',
+      model: $('providerSelect').value === '__custom__' ? $('customModel').value.trim() : ($('modelSelect').value || '__auto__'),
+      customUrl: $('customEndpoint').value.trim() });
   });
   $('question').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $('askForm').requestSubmit(); }
   });
+  $('providerSelect').addEventListener('change', () => {
+    const provider = $('providerSelect').value;
+    fillModels($('modelSelect'), provider, null);
+    const custom = provider === '__custom__';
+    $('modelSelect').hidden = custom;
+    $('customEndpoint').hidden = !custom;
+    $('customModel').hidden = !custom;
+  });
+  $('settingProvider').addEventListener('change', () => {
+    const provider = $('settingProvider').value;
+    fillModels($('settingModel'), provider, null);
+    const custom = provider === '__custom__';
+    $('settingModelField').hidden = custom;
+    $('customSetting').hidden = !custom;
+  });
+  $('settingsForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    $('settingsFeedback').className = 'dim';
+    $('settingsFeedback').textContent = 'Saving…';
+    vscode.postMessage({ type: 'settingsSave', values: {
+      backend: $('settingProvider').value,
+      model: $('settingProvider').value === '__custom__' ? $('settingCustomModel').value.trim() : $('settingModel').value,
+      customUrl: $('settingCustomEndpoint').value.trim(), models: +$('settingModels').value,
+      stepsPerModel: +$('settingSteps').value, timeoutSeconds: +$('settingTimeout').value,
+      paidFallback: $('settingPaid').value, synthesize: $('settingSynthesize').checked,
+      useStudy: $('settingStudy').checked, flintPath: $('settingPath').value,
+      python: $('settingPython').value,
+    } });
+  });
+  $('saveKey').addEventListener('click', () => {
+    const key = $('apiKey').value.trim();
+    if (!key) { $('apiKey').focus(); return; }
+    $('settingsFeedback').textContent = 'Saving key securely…';
+    vscode.postMessage({ type: 'settingsKeySave', key });
+  });
+  $('clearKey').addEventListener('click', () => vscode.postMessage({ type: 'settingsKeyClear' }));
   $('queue').addEventListener('click', () => vscode.postMessage({ type: 'queue', title: $('question').value.trim(), withCode: $('withCode').checked }));
   $('lookup').addEventListener('click', () => vscode.postMessage({ type: 'study', query: $('question').value.trim(), withCode: $('withCode').checked }));
   $('start').addEventListener('click', () => vscode.postMessage({ type: 'start' }));

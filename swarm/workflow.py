@@ -180,14 +180,22 @@ def parse_review(text, tree, acceptance):
     for finding in findings:
         if not isinstance(finding, dict) or finding.get("severity") not in ("blocker", "major", "minor"):
             raise ValueError("each finding needs a severity")
-        for field in ("path", "issue", "verification"):
+        for field in ("issue", "verification"):
             if not isinstance(finding.get(field), str) or not finding[field].strip():
                 raise ValueError(f"each finding needs {field}")
-        path = Path(finding["path"])
-        if path.is_absolute() or ".." in path.parts:
-            raise ValueError("finding paths must stay relative to the repository")
-        if type(finding.get("line")) is not int or finding["line"] < 1:
-            raise ValueError("finding line must be a positive integer")
+        # A real defect is not always one file and line — "no corpus audit was done
+        # before this check went live" has nothing to point a line number at. path and
+        # line are required together, as a pair, or omitted together; a finding is never
+        # rejected just for being about the change as a whole rather than one spot in it.
+        path_val, line_val = finding.get("path"), finding.get("line")
+        if path_val or line_val:
+            if not isinstance(path_val, str) or not path_val.strip():
+                raise ValueError("a finding with a line needs a path")
+            path = Path(path_val)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("finding paths must stay relative to the repository")
+            if type(line_val) is not int or line_val < 1:
+                raise ValueError("finding line must be a positive integer")
     blockers = any(f["severity"] in ("blocker", "major") for f in findings)
     acceptance_gap = any(
         "acceptance criter" in f["issue"].lower()

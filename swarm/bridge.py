@@ -24,6 +24,7 @@ Every command prints JSON. `ask` streams one JSON object per line as models fini
     bridge.py report   --repo PATH [--hours 24]
     bridge.py vote     --model M --useful 1|0
     bridge.py wallet   [--cap 5] [--reset] [--enable | --disable] [--account]
+    bridge.py quota-mode --repo PATH [--set shutdown|wait|paid]
     bridge.py local-models   [--probe]
     bridge.py grind-cmd --repo PATH [--goal G] [--test-cmd T] [--hours H]
     bridge.py stop     --repo PATH [--drain] | --all
@@ -726,6 +727,26 @@ def cmd_wallet(a):
     return 0
 
 
+def cmd_quota_mode(a):
+    """Read or set a repo's quota-exhaustion failsafe (shutdown / wait / paid).
+
+    Written into that repo's own tuned file in swarm/configs/, never the shared
+    default: a repo with no tuned file yet has nothing of its own to set this on,
+    and writing into config.json would leak one repo's choice into every other
+    repo that falls back to the default (the exact config_mismatch hazard this
+    harness already warns about elsewhere)."""
+    c = config_for(a.repo)
+    if a.set:
+        if not swarmd.per_repo_config(c["repo"]).is_file():
+            emit({"ok": False, "error": f"no tuned config for {c['repo']} yet — run "
+                                        "`swarm init` on it first, then set this"})
+            return 2
+        c["shutdown_on_quota_exhausted"] = a.set
+        swarmd.save_cfg(c)
+    emit({"ok": True, "mode": swarmd.quota_mode(c), "config": str(swarmd.CONFIG)})
+    return 0
+
+
 def _local_models(base_url, timeout=2):
     """Models a local OpenAI-compatible server reports at GET /v1/models.
 
@@ -841,6 +862,7 @@ def cmd_status(a):
           "config_path": str(swarmd.CONFIG), "config_kind": swarmd.config_kind(),
           "config_warnings": swarmd.config_warnings(c),
           "config_tuned_available": str(tuned) if tuned.is_file() else None,
+          "quota_mode": swarmd.quota_mode(c),
           "trunk": swarmd.trunk_name(c), "trunk_ahead": int(ahead) if str(ahead or "").isdigit() else None,
           # A roadmap run whose packets are all held looks exactly like an idle one from the
           # queue alone. The report says which packet is held, why, and what releases it.
@@ -1345,6 +1367,13 @@ def main(argv=None):
     s.add_argument("--disable", action="store_true")
     s.add_argument("--account", action="store_true", help="also ask OpenRouter about the account's credits")
     s.set_defaults(fn=cmd_wallet)
+    s = sub.add_parser("quota-mode", help="read or set a repo's quota-exhaustion failsafe")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--set", choices=["shutdown", "wait", "paid"],
+                   help="shutdown (default): stop the daemon once free is out and paid can't "
+                        "help. wait: idle until the daily reset. paid: never stop while any "
+                        "paid model is configured, retrying it instead of giving up.")
+    s.set_defaults(fn=cmd_quota_mode)
     s = sub.add_parser("local-models", help="list local servers' models for the editor's provider dropdown")
     s.add_argument("--probe", action="store_true",
                    help="probe every local provider even when it looks quiet (default: probe only)")
