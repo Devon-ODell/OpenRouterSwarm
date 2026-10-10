@@ -72,7 +72,12 @@ def extract(path):
         if ext in CAPTION_EXT:
             return _strip_captions(raw)
         return raw
-    except Exception:
+    except Exception as e:
+        try:
+            from swarm import swallow
+            swallow.record("corpus_index._extract_text", e)
+        except Exception:
+            pass
         return ""
 
 

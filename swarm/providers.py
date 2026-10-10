@@ -296,7 +296,12 @@ def _detail(name, info):
             from urllib.request import urlopen as _u
             with _u(base.rstrip("/") + "/models", timeout=1):
                 return f"{base} · running"
-        except Exception:
+        except Exception as e:
+            try:
+                from swarm import swallow
+                swallow.record(f"providers._detail[{name}]", e)
+            except Exception:
+                pass
             return f"{base} · start with `ollama serve`"
         return f"{base}"
     return info.get("command", base)

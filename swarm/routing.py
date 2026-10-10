@@ -42,11 +42,16 @@ def _resolve_local(model):
     try:
         from swarm import providers
         return bool(providers.resolve(model, default="ollama").get("local"))
-    except Exception:
+    except Exception as e:
         try:
             import providers
             return bool(providers.resolve(model, default="ollama").get("local"))
-        except Exception:
+        except Exception as e2:
+            try:
+                from swarm import swallow
+                swallow.record("routing._resolve_local", e2)
+            except Exception:
+                pass
             return False
 
 

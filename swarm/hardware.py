@@ -45,7 +45,12 @@ def _ram_gb():
 def _cpu_count():
     try:
         return os.cpu_count() or None
-    except Exception:
+    except Exception as e:
+        try:
+            from swarm import swallow
+            swallow.record("hardware._cpu_count", e)
+        except Exception:
+            pass
         return None
 
 

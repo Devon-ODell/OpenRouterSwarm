@@ -39,6 +39,7 @@ from learn import (Ledger, format_playbook, is_breakthrough, json_array,  # noqa
                    FAULTY, CRIME, BREAKTHROUGH_WEIGHT, PENALTY_WEIGHT)
 from workflow import Attempt, STRATEGIES, REVIEW, REPAIR, contract, criteria, parse_review, failure_signature  # noqa: E501
 import sandbox                          # noqa: E402
+import swallow                          # noqa: E402
 from workflow import validate_scope, path_allowed
 
 CONFIG = Path(os.environ.get("FLINT_SWARM_CONFIG") or HERE / "config.json").expanduser()
@@ -5837,6 +5838,11 @@ def cmd_status(a):
     print(f"queue    {len(pend)} pending ({claimed} claimed)")
     print(f"trunk    {ahead} commit(s) ahead of {c.get('base_branch', 'main')}")
     print(f"landed   {landed} done, {parked} parked")
+    sw = swallow.summary()
+    if sw:
+        last = sw[0]
+        print(f"exceptions {sum(g['count'] for g in sw)} swallowed (latest: {last['site']} — "
+              f"see `swarm exceptions`)")
     if errs:
         last = errs[-1]
         print(f"⚠ last error ({last.get('iso', '?')}): {str(last.get('tb') or last.get('note') or '')[:120]}")
@@ -6088,6 +6094,29 @@ def cmd_wake(a):
     print(f"woke {len(rows)} model(s): {', '.join(m for m, _, _ in rows)}" if rows else "no model is resting")
 
 
+def cmd_exceptions(a):
+    """Surface exceptions the harness chose to swallow: the quiet fallbacks in support
+    modules (recorded by swarm/swallow.py) plus the daemon's journaled task errors.
+
+    The recorder file is the daemon's own bookkeeping (swarm/state/swallowed.jsonl);
+    the journal is the existing `journal("error", ...)` stream. Together they turn
+    "worked yesterday, not today, and nothing in any log said why" into a table.
+    """
+    _setup()
+    groups = swallow.summary()
+    journal_errs = [t for t in _read(STATE / "journal.jsonl") if t.get("event") == "error"]
+    print(f"swallowed-exception recorder: {sum(g['count'] for g in groups)} recorded"
+          f" across {len(groups)} site(s)" if groups else "no swallowed exceptions recorded")
+    for g in groups:
+        print(f"  {g['count']:>3}×  {g['site']:<40} last {g['last_iso']}  {g['last_msg'][:80]}")
+    if journal_errs:
+        print(f"\ndaemon journal: {len(journal_errs)} error event(s) in {STATE / 'journal.jsonl'}")
+        for t in journal_errs[-8:]:
+            print(f"  {t.get('iso', '?')}  {t.get('kind', '') or t.get('id', '')}: "
+                  f"{str(t.get('err') or '')[:90]}")
+    return 0
+
+
 def cmd_models(a):
     live = free_tool_models()
     c = load_cfg()
@@ -6172,6 +6201,9 @@ def main():
     m = sub.add_parser("models", help="list free tool-capable models; --write sets the pool")
     m.add_argument("--write", action="store_true")
     m.set_defaults(fn=cmd_models)
+    ex = sub.add_parser("exceptions",
+                        help="show exceptions the harness swallowed (swallow.py recorder + journal errors)")
+    ex.set_defaults(fn=cmd_exceptions)
     a = ap.parse_args()
     a.fn(a)
 
