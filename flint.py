@@ -1861,6 +1861,29 @@ def run_unattended(goal, model, hours=8, test_command=None):
     return run_nonstop(goal, os.getcwd(), model, STATE_DIR, hours, test_command)
 
 
+def run_headless(prompt, model, *, yolo=False, read_only=False, provider=None, checkpoint=None):
+    """Run one headless flint turn and return the answer text.
+
+    This is the engine the swarm drives: `flint --prompt-file` is a thin CLI over it,
+    and the daemon spawns that CLI per turn (see swarmd.flint). Raising the typed
+    exceptions below is the contract — the CLI maps them to exit codes and the daemon
+    reads those codes back, so a turn that hits the daily cap, a rate limit or a dead
+    provider is distinguishable from a crash.
+    """
+    agent = Agent(model, yolo=yolo, headless=True, read_only=read_only, provider=provider)
+    agent.checkpoint_path = checkpoint
+    if agent.read_only:
+        print("flint: read-only mode; use --yolo to allow edits and shell commands.", file=sys.stderr)
+    try:
+        return agent.turn(prompt)
+    finally:
+        agent.save_checkpoint()
+        if agent.wallet:
+            print(f"cost: ${agent.spend_usd:.4f} this turn, "
+                  f"${agent.wallet.spent():.4f} of ${agent.wallet.cap:.2f} allowance",
+                  file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description="flint — a tiny terminal coding agent on OpenRouter")
     ap.add_argument("-p", "--prompt", help="run one task non-interactively and print the result")
@@ -1927,12 +1950,10 @@ def main():
         ap.error("--hours and --test-command require --nonstop or a 'run this nonstop' prompt")
 
     if a.prompt is not None:
-        agent = Agent(a.model, yolo=a.yolo, headless=True, read_only=a.read_only, provider=a.provider)
-        agent.checkpoint_path = a.checkpoint
-        if agent.read_only:
-            print("flint: read-only mode; use --yolo to allow edits and shell commands.", file=sys.stderr)
         try:
-            print(agent.turn(prompt))
+            answer = run_headless(prompt, a.model, yolo=a.yolo, read_only=a.read_only,
+                                  provider=a.provider, checkpoint=a.checkpoint)
+            print(answer)
         except KeyboardInterrupt:
             print("\nflint: interrupted; changes already made remain on disk.", file=sys.stderr)
             sys.exit(130)
@@ -1971,12 +1992,6 @@ def main():
         except Exception as e:
             print(f"flint: {type(e).__name__}: {e}", file=sys.stderr)
             sys.exit(1)
-        finally:
-            agent.save_checkpoint()
-            if agent.wallet:
-                print(f"cost: ${agent.spend_usd:.4f} this turn, "
-                      f"${agent.wallet.spent():.4f} of ${agent.wallet.cap:.2f} allowance",
-                      file=sys.stderr)
     else:
         repl(Agent(a.model, yolo=a.yolo, read_only=a.read_only, provider=a.provider))
 

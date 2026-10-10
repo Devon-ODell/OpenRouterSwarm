@@ -136,6 +136,34 @@ Net: after cleanup, **you should have ~4 branches: `main`, `swarm/trunk` (or tru
 
 ---
 
+## Progress log (executed 2026-10-10)
+
+**Done — item 3 (extension HTML):** moved the webview shell out of `extension.js` into
+`cursor-extension/media/panel.html` (commit `3335b90`). `html()` reads the file and resolves
+`${...}` host tokens at runtime; same CSP/nonce/pane layout; 32/32 extension tests pass.
+
+**Done — items 1 & 2 (trunk merge + prune):** `swarm/trunk` merged into `main` (`b6e5d29`),
+10 merged branches + 8 stale self-worktrees pruned (46 → 36 branches); 824 Python +
+32 extension tests green.
+
+**Done — item 4 (flint.py as engine):** extracted `flint.run_headless()` — the headless
+single-turn engine (Agent + turn + checkpoint + wallet accounting) — and made `main()` a
+thin CLI over it. The daemon's subprocess contract (prompt-file + exit codes) is unchanged;
+flint.py is now unambiguously a library with a CLI shim. (Investigation showed the daemon
+already imports flint for `spend_period`, `Throttle`, `fetch_key_info`; the missing piece
+was a formal library entry for the turn engine, now added.)
+
+**Done — item 5 (one swarm status):** `swarmd.cmd_status` is now human-first: a readable
+summary (daemon, budget, queue, trunk, last error) above the unchanged JSON machine
+contract, with the journal tail marking errors. `bridge.py status` (extension contract)
+untouched. 824 Python + 32 extension tests pass.
+
+**Still open (judgment calls, not automated):** config-snapshot archive
+(`swarm/configs/*.before-*`), the 6.3 GB of cross-repo worktrees, and collapsing the
+remaining overlapping commands (`report`/`activity` stay as distinct views for now).
+
+---
+
 *Review method: full branch audit (`git for-each-ref` + `rev-list` vs `main`), structural
 map of `swarmd.py`/`flint.py`/`extension.js`/`panel.js`, targeted reads of the hot paths
 (worker loop, budget pacing, git integration, webview CSP/renderer), config and test

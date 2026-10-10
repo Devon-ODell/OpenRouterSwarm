@@ -5812,6 +5812,35 @@ def cmd_status(a):
     done = _read(q.done)
     _, ahead = git(["rev-list", "--count", f"{c.get('base_branch', 'main')}..{trunk_name(c)}"], cwd=c["repo"])
     note = daemon_note()
+    journal_rows = _read(STATE / "journal.jsonl")[-12:]
+    errs = [t for t in journal_rows if t.get("event") == "error"]
+    claimed = sum(1 for t in pend if t.get("claimed"))
+    landed = sum(1 for t in done if t.get("status") == "done")
+    parked = sum(1 for t in done if t.get("status") == "parked")
+    remaining = spend_left(c)
+    # Human-first summary: the one glance that tells you what is happening. The JSON
+    # below is the machine contract (the extension and scripts parse it); this block
+    # is for the person at the terminal.
+    print(f"repo     {c['repo']}")
+    if note:
+        print(f"daemon   running (pid {note['pid']}, since "
+              f"{dt.datetime.fromtimestamp(note['started']).strftime('%H:%M')}, "
+              f"goal: {str(note.get('goal', ''))[:60] or '—'})")
+    else:
+        print("daemon   stopped")
+    if ok:
+        print(f"budget   free requests available today ({snap.get('status', 'ok')})")
+    else:
+        print(f"budget   blocked: {why} (resumes in ~{wait / 60:.0f}m)")
+    if remaining is not None:
+        print(f"spend    ${remaining:.4f} of ${spend_cap(c)} left this {spend_window(c)} window")
+    print(f"queue    {len(pend)} pending ({claimed} claimed)")
+    print(f"trunk    {ahead} commit(s) ahead of {c.get('base_branch', 'main')}")
+    print(f"landed   {landed} done, {parked} parked")
+    if errs:
+        last = errs[-1]
+        print(f"⚠ last error ({last.get('iso', '?')}): {str(last.get('tb') or last.get('note') or '')[:120]}")
+    print()
     print(json.dumps({
         "repo": c["repo"], "trunk": trunk_name(c), "trunk_ahead": ahead,
         "config_path": str(CONFIG), "config_kind": config_kind(),
@@ -5825,21 +5854,20 @@ def cmd_status(a):
         "spend": {"used_usd": round(spend_used(c), 6), "cap_usd": spend_cap(c),
                   "window": spend_window(c), "resets": spend_resets(c),
                   "shared": monthly(c), "ledger": str(spend_file(c)),
-                  "remaining_usd": (round(spend_left(c), 6) if spend_left(c) is not None else None),
+                  "remaining_usd": (round(remaining, 6) if remaining is not None else None),
                   "paid_fallback": paid_pool(c)},
         "pacing": {"allowed_now": ok, "wait_s": round(wait), "reason": why,
                    "allowance_recheck_s": allowance_recheck(c)},
-        "queue": {"pending": len(pend),
-                  "claimed": sum(1 for t in pend if t.get("claimed"))},
-        "landed": sum(1 for t in done if t.get("status") == "done"),
+        "queue": {"pending": len(pend), "claimed": claimed},
+        "landed": landed,
         "split": sum(1 for t in done if t.get("status") == "split"),
-        "parked": sum(1 for t in done if t.get("status") == "parked"),
+        "parked": parked,
         "promotion": promotion_state(c),
         "top_arms": Ledger(STATE / "learn.json").leaderboard()[:8],
         "resting": [{"model": m, "until": dt.datetime.fromtimestamp(u).isoformat(timespec="seconds"),
                      "reason": why} for m, u, why in Ledger(STATE / "learn.json").resting()],
     }, indent=2))
-    for t in _read(STATE / "journal.jsonl")[-8:]:
+    for t in journal_rows:
         print(f"  {t['iso']}  {t['event']:<8} {t.get('stage') or t.get('role') or ''} "
               f"{t.get('title') or t.get('model') or ''}")
 
