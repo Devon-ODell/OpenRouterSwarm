@@ -312,17 +312,17 @@ class StopVsRestartTests(RepoCase):
         self.assertFalse(swarmd._drain_reason["stop_requested"])
         self.assertEqual(swarmd._run.get("stop_reason"), "Source-change restart")
 
-    def test_a_stop_that_lands_while_restart_pending_is_not_a_restart(self):
-        # The run_daemon loop's exact guard: a drain that was asked to stop must
-        # clear restart_for instead of calling restart_into_new_code.
-        tally = swarmd.Tally()
-        swarmd._drain_reason["stop_requested"] = True
-        restart_for = ["swarm/swarmd.py"]
-        with patch.object(swarmd, "restart_into_new_code") as restart:
-            if restart_for and swarmd._drain_reason["stop_requested"]:
-                restart_for = []
-            self.assertEqual(restart_for, [])
-            restart.assert_not_called()
+    def test_stop_while_restart_pending_goes_through_the_real_loop(self):
+        # Invariant 8's guard lives in the run_daemon loop, so it is characterized
+        # there, not copied here: test_p0_gaps.RealDaemonLoopStopTests drives the
+        # real loop (a source change fires -> drain(tally, stop=False), then a stop
+        # lands mid-tick) and asserts restart_into_new_code is never called. This
+        # pointer keeps the invariant visible from the CLI contract file without
+        # re-implementing the loop's logic.
+        from tests.test_p0_gaps import RealDaemonLoopStopTests
+        self.assertTrue(any(
+            name.startswith("test_stop_that_lands_while_restart_pending")
+            for name in dir(RealDaemonLoopStopTests)))
 
 
 class CliReportJsonTests(RepoCase):
