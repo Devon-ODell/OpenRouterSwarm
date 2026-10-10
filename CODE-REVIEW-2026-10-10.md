@@ -158,6 +158,13 @@ summary (daemon, budget, queue, trunk, last error) above the unchanged JSON mach
 contract, with the journal tail marking errors. `bridge.py status` (extension contract)
 untouched. 824 Python + 32 extension tests pass.
 
+**Done — swallowed exceptions (review E1):** new `swarm/swallow.py` recorder (thread-safe,
+failure-proof, bounded 200 rows) + `swarm exceptions` command + `swarm status` summary
+line. Instrumented the genuinely-silent fallback sites (`routing._resolve_local`,
+`providers._detail`, `hardware._cpu_count`, `corpus_index` text extraction). Honest
+finding: most of the ~43 review sites were *already logged* intentional fallbacks, not
+silent bugs — documented in the module docstring. 828 Python tests pass (4 new).
+
 **Still open (judgment calls, not automated):** config-snapshot archive
 (`swarm/configs/*.before-*`), the 6.3 GB of cross-repo worktrees, and collapsing the
 remaining overlapping commands (`report`/`activity` stay as distinct views for now).
