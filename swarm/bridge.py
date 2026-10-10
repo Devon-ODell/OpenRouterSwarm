@@ -845,7 +845,7 @@ def _log_age():
 def cmd_status(a):
     c = config_for(a.repo)
     swarmd.use_repo(c)
-    q = swarmd.Queue()
+    q = swarmd.queue_for(c)
     pending = q.pending()
     done = swarmd._read(q.done)
     ahead = None

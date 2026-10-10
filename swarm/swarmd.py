@@ -2877,7 +2877,7 @@ def run_status(workers, c):
         if count > _progress_seen.get(str(path), 0):
             _progress_seen[str(path)] = count
             mark_progress(f"{name}: tool activity")
-    pending = Queue().pending()
+    pending = queue_for(c).pending()
     roots = list((read_roadmap() or {}).get("roots", [])) if c.get("roadmap_file") else []
     parked = [r for r in _read(STATE / "done.jsonl")
               if r.get("status") == "parked" and not r.get("dismissed_at")
@@ -2897,7 +2897,7 @@ def run_status(workers, c):
             states = [w.get("state") for w in workers]
             state = "Waiting" if all(s in (None, "idle", "allowance_blocked") for s in states) else "Running"
             reason = workers[0].get("doing") or workers[0].get("state") or "No ready assigned work"
-        elif roots or (pending and not Queue().ready()):
+        elif roots or (pending and not queue_for(c).ready()):
             state, reason = "Blocked", "Unmet dependencies or retry cooldown"
         # Wall-time buckets across live workers, banked by state (work order §13).
         buckets = {}
@@ -5808,7 +5808,7 @@ def cmd_status(a):
                owner_window=c.get("owner_window", ["00:00", "00:00"]))
     snap = b.snapshot()
     ok, wait, why = b.check()
-    q = Queue()
+    q = queue_for(c)
     pend = q.pending()
     done = _read(q.done)
     _, ahead = git(["rev-list", "--count", f"{c.get('base_branch', 'main')}..{trunk_name(c)}"], cwd=c["repo"])
