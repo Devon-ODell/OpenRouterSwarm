@@ -68,7 +68,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   backdrop-filter: blur(12px);
 }
 .brand { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
-.brand-mark { display: grid; place-items: center; width: 23px; height: 23px; border: 1px solid var(--hairline); border-radius: 7px; font-size: 12px; background: var(--surface); }
+.brand-mark { display: grid; place-items: center; width: 23px; height: 23px; border: 1px solid var(--hairline); border-radius: 7px; background: var(--surface); }
+.brand-mark img { width: 19px; height: 19px; image-rendering: pixelated; }
 .status-dot { width: 6px; height: 6px; margin-left: 1px; border-radius: 50%; background: var(--vscode-descriptionForeground); opacity: .65; }
 .status-dot.running { background: var(--success); opacity: 1; box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 18%, transparent); }
 .header-actions { display: flex; gap: 2px; }

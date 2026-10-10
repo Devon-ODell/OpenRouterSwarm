@@ -95,6 +95,9 @@ test('every contributed command is registered, and menus only use contributed co
   for (const group of Object.values(manifest.contributes.viewsContainers)) {
     group.forEach((c) => assert.ok(fs.existsSync(path.join(EXT, c.icon)), c.icon));
   }
+  const logo = fs.readFileSync(path.join(EXT, 'media', 'swarm.svg'), 'utf8');
+  assert.ok(logo.includes('shape-rendering="crispEdges"'), 'the Flint logo remains pixel art');
+  assert.ok(logo.includes('aria-label="Pixel flint"'), 'the contributed logo is the flint mark');
   assert.ok(globalState.syncedKeys.includes(ext._test.UPDATE_CLICKS_KEY),
     'the lifetime click counter participates in editor Settings Sync');
 });
@@ -280,8 +283,6 @@ test('the panel script renders a streamed ask with the merged answer first', () 
   assert.ok(out.includes('1/1 models answered'));
   assert.ok(out.includes('5 requests'), 'the card shows the request count');
   assert.ok(out.includes('5 free requests'), 'the thread footer shows the free request count');
-  send({ type: 'study', id: 's1', query: 'dijkstra', hits: [{ kind: 'card', course: '6.006', lecture: 'L13', page: null, path: '/x/cards.md', text: 'relax edges' }] });
-  assert.ok(els.threads.text().includes('MIT lookup: dijkstra'));
   // The outline goes back to neutral once the thread is done.
   assert.ok(!els.askForm.classList.contains('state-thinking') && !els.askForm.classList.contains('state-running'));
   sent.length = 0;

@@ -1,1 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2.2"/><circle cx="5" cy="17" r="2.2"/><circle cx="19" cy="17" r="2.2"/><circle cx="12" cy="13" r="1.6"/><path d="M12 7.2v4.2M10.7 14l-4 1.9M13.3 14l4 1.9M7.2 17h9.6"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-label="Pixel flint">
+  <!-- A small, high-contrast flint shard inspired by Minecraft's item sprite. -->
+  <path fill="#171717" d="M9 1h2v1h1v2h1v2h2v3h-1v1h-2v2h-2v2H8v1H4v-1H2v-1H1V9h1V8h2V6h2V4h2V2h1z"/>
+  <path fill="#4b4b4b" d="M9 2h2v2h1v2h2v2h-2v2h-2v2H8v2H4v-1H2V9h2V7h2V5h2V3h1z"/>
+  <path fill="#7d7d7d" d="M9 3h2v2h1v2h1v1h-2v2H9v2H7v1H4v-1H3V9h2V7h2V5h2z"/>
+  <path fill="#b8b8b8" d="M9 3h1v2H9v1H7v2H5V7h2V5h2zM5 9h2v2H5v1H4v-2h1z"/>
+  <path fill="#e3e3e3" d="M9 3h1v1H9zM7 5h2v1H7zM5 7h2v1H5z"/>
+  <path fill="#2a2a2a" d="M12 7h2v1h-1v1h-2v2H9v2H7v1H4v-1h3v-2h2V9h2z"/>
+</svg>

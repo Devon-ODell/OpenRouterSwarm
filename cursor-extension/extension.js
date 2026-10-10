@@ -1245,7 +1245,7 @@ class SwarmPanel {
 <div id="skinScanlines" aria-hidden="true"></div>
 <header class="app-header">
   <div id="skinHeaderLayer" aria-hidden="true"></div>
-  <div class="brand"><span class="brand-mark" aria-hidden="true">✦</span><span>Flint</span><span id="runState" class="status-dot" title="Swarm status"></span></div>
+  <div class="brand"><span class="brand-mark" aria-hidden="true"><img src="${uri('swarm.svg')}" alt=""></span><span>Flint</span><span id="runState" class="status-dot" title="Swarm status"></span></div>
   <div class="header-actions"><button id="updateVersion" class="update-button" type="button" title="0 total update clicks — install this checkout and restart Cursor">Update · 0.0.0</button><button class="icon tab-jump" data-tab="skin" title="Dress it up" aria-label="Customize appearance">🎨</button><button class="icon tab-jump" data-tab="help" title="Setup guide" aria-label="Setup guide">?</button><button class="icon tab-jump" data-tab="settings" title="Settings" aria-label="Settings">⚙</button></div>
 </header>
 <div id="skinMarquee" class="marquee" hidden><span id="skinMarqueeText"></span></div>
