@@ -78,6 +78,7 @@ from learn import Ledger  # noqa: E402
 # swarm/ is on sys.path (inserted above), so providers resolves as a plain module here;
 # flint.py imports it as `from swarm import providers` once the repo root is on its path.
 import providers  # noqa: E402
+from app import SwarmApplication  # noqa: E402
 
 CONSULT = HERE / "state" / "consult" / "learn.json"
 MAX_SELECTION = 12_000
@@ -105,6 +106,11 @@ def _kill_children(*_):
             except (ProcessLookupError, PermissionError):
                 pass
     os._exit(143)
+
+
+def app():
+    """The application facade over the daemon's currently selected repository."""
+    return SwarmApplication(swarmd)
 
 
 def config_for(repo=None):
@@ -139,7 +145,7 @@ def is_target(repo):
 
 def daemon_running():
     """True when a swarm daemon holds this repo's lock (swarmd.use_repo must have run)."""
-    lock = swarmd.STATE / "daemon.lock"
+    lock = app().state_dir / "daemon.lock"
     if not lock.exists():
         return False
     import fcntl
@@ -501,7 +507,7 @@ def cmd_info(a):
     if db.is_file():
         import corpus_index
         corpus = corpus_index.stats(db)
-    out = {"root": str(ROOT), "python": sys.executable, "config": str(swarmd.CONFIG),
+    out = {"root": str(ROOT), "python": sys.executable, "config": str(app().config_path),
            "config_kind": swarmd.config_kind(),
            "configured_repo": None if str(c.get("repo", "__")).startswith("__") else c.get("repo"),
            "models": swarmd.pool(c), "allow_paid": bool(c.get("allow_paid")), "corpus": corpus,
@@ -641,10 +647,10 @@ def cmd_parked(a):
     """Tasks the swarm gave up on, and whose failure each was."""
     c = config_for(a.repo)
     swarmd.use_repo(c)
-    last = {j["id"]: j for j in swarmd._read(swarmd.STATE / "journal.jsonl")
+    last = {j["id"]: j for j in app().read_jsonl(app().state_dir / "journal.jsonl")
             if j["event"] == "task"}
     rows = []
-    for d in reversed(swarmd._read(swarmd.STATE / "done.jsonl")):
+    for d in reversed(app().read_jsonl(app().state_dir / "done.jsonl")):
         if d.get("status") not in ("parked", "split") or d.get("dismissed_at"):
             continue
         j = last.get(d["id"], {})
@@ -660,7 +666,7 @@ def cmd_parked(a):
                 j["stage"], raw, edited=j.get("edit_calls")) if j.get("stage") else None),
             "why": swarmd.reportable(raw)[:400],
             "handoff": next((str(p / "HANDOFF.md") for p in
-                             sorted((swarmd.STATE / "attempts").glob(f"{d['id']}-*"), reverse=True)
+                             sorted((app().state_dir / "attempts").glob(f"{d['id']}-*"), reverse=True)
                              if (p / "HANDOFF.md").is_file()), None)})
     emit({"ok": True, "repo": c["repo"], "total": len(rows), "parked": rows[:a.limit or 20]})
     return 0
@@ -724,7 +730,7 @@ def cmd_wallet(a):
     purse = wallet_for(c)
     if a.reset and purse:
         purse.reset()
-    out = {"ok": True, "enabled": bool(purse), "config": str(swarmd.CONFIG),
+    out = {"ok": True, "enabled": bool(purse), "config": str(app().config_path),
            "wallet": purse.snapshot() if purse else
                      {"cap": 0.0, "spent": wallet.Wallet(cap=0).spent(), "remaining": 0.0},
            "paid_models": paid_models(c, 3) if purse else []}
@@ -753,7 +759,7 @@ def cmd_quota_mode(a):
             return 2
         c["shutdown_on_quota_exhausted"] = a.set
         swarmd.save_cfg(c)
-    emit({"ok": True, "mode": swarmd.quota_mode(c), "config": str(swarmd.CONFIG)})
+    emit({"ok": True, "mode": swarmd.quota_mode(c), "config": str(app().config_path)})
     return 0
 
 
@@ -840,7 +846,7 @@ def _log_age():
 
     Silence is the only symptom a hung turn has, so the sidebar shows it next to the
     status rather than making someone open the log to find out."""
-    path = swarmd.LOGS / f"{dt.date.today()}.log"
+    path = app().log_path(dt.date.today())
     try:
         return round(max(0.0, time.time() - path.stat().st_mtime), 1)
     except OSError:
@@ -852,24 +858,24 @@ def cmd_status(a):
     swarmd.use_repo(c)
     q = swarmd.queue_for(c)
     pending = q.pending()
-    done = swarmd._read(q.done)
+    done = app().read_jsonl(q.done)
     ahead = None
     if subprocess.run(["git", "-C", c["repo"], "rev-parse", "--verify", "-q", f"refs/heads/{swarmd.trunk_name(c)}"],
                       capture_output=True).returncode == 0:
         _, ahead = swarmd.git(["rev-list", "--count", f"{c.get('base_branch', 'main')}..{swarmd.trunk_name(c)}"], cwd=c["repo"])
     import experiment
-    exp = experiment.summary(swarmd.STATE / "journal.jsonl")
+    exp = experiment.summary(app().state_dir / "journal.jsonl")
     budget = swarmd.Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                            owner_window=c.get("owner_window", ["00:00", "00:00"])).snapshot()
     tuned = swarmd.per_repo_config(c["repo"])
     try:
-        run = json.loads((swarmd.STATE / "run.json").read_text())
+        run = json.loads((app().state_dir / "run.json").read_text())
     except (OSError, ValueError):
         run = None
     emit({"repo": c["repo"], "is_target": is_target(c["repo"]), "daemon_running": daemon_running(),
           "now": swarmd.read_now(), "health": swarmd.health(24),
           "run": run,
-          "config_path": str(swarmd.CONFIG), "config_kind": swarmd.config_kind(),
+          "config_path": str(app().config_path), "config_kind": swarmd.config_kind(),
           "config_warnings": swarmd.config_warnings(c),
           "config_tuned_available": str(tuned) if tuned.is_file() else None,
           "quota_mode": swarmd.quota_mode(c),
@@ -895,7 +901,7 @@ def cmd_status(a):
                     "shared": swarmd.monthly(c)},
           "stale_seconds": _log_age(),
           "wallet": (lambda w: w.snapshot() if w else None)(wallet_for(c)),
-          "recent": [_journal_line(j) for j in swarmd._read(swarmd.STATE / "journal.jsonl")[-12:]]})
+          "recent": [_journal_line(j) for j in app().read_jsonl(app().state_dir / "journal.jsonl")[-12:]]})
     return 0
 
 
@@ -917,7 +923,7 @@ def cmd_task(a):
     q = swarmd.Queue(c.get("max_depth", 1), c.get("max_queue", 20))
     if a.preview:
         pending = q.pending()
-        seen = {r["title"].strip().lower() for r in pending + swarmd._read(q.done)}
+        seen = {r["title"].strip().lower() for r in pending + app().read_jsonl(q.done)}
         emit({"ok": True, "preview": True, "repo": c["repo"], "task": draft, "where": where,
               "scope_gap": gap, "duplicate": draft["title"].lower() in seen,
               "queued": len(pending), "max_queue": c.get("max_queue", 20),
@@ -1196,7 +1202,7 @@ def cmd_activity(a):
     c = config_for(a.repo)
     swarmd.use_repo(c)
     day = a.day or dt.date.today().isoformat()
-    path = swarmd.LOGS / f"{day}.log"
+    path = app().log_path(day)
     out = {"repo": c["repo"], "day": day, "path": str(path), "exists": path.exists(),
            "daemon_running": daemon_running(), "lines": [], "offset": 0, "stale_seconds": None}
     if not path.exists():
