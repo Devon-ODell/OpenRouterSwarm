@@ -1,0 +1,46 @@
+{
+  "tasks": {
+    "ir-validator": {
+      "id": "t8f534e27a14d",
+      "wave": 1,
+      "backlog": "ir-schema-v1",
+      "queued_at": 1791747755.853009,
+      "harness": "2812f9d"
+    },
+    "determinism-trace": {
+      "id": "tecd4b3f26215",
+      "wave": 1,
+      "backlog": "deterministic-input-traces",
+      "queued_at": 1791747755.868684,
+      "harness": "2812f9d"
+    },
+    "hit-arbitration-table": {
+      "id": "t2eede859fa24",
+      "wave": 1,
+      "backlog": "incoming-hit-arbitration",
+      "queued_at": 1791747755.882655,
+      "harness": "2812f9d"
+    },
+    "evidence-fingerprint": {
+      "id": "tce1353d548e0",
+      "wave": 1,
+      "backlog": "runtime-evidence-capture",
+      "queued_at": 1791747755.896914,
+      "harness": "2812f9d"
+    },
+    "host-stamina-pool": {
+      "id": "t76a32b90af3a",
+      "wave": 1,
+      "backlog": "skyrim-stamina-authority",
+      "queued_at": 1791747755.910937,
+      "harness": "2812f9d"
+    },
+    "stamina-spent-report": {
+      "id": "t40eb13efcf88",
+      "wave": 1,
+      "backlog": "skyrim-stamina-authority",
+      "queued_at": 1791747755.925545,
+      "harness": "2812f9d"
+    }
+  }
+}
