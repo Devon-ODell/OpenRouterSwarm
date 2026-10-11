@@ -80,6 +80,7 @@ class AttemptDeps:
     checked_out_at: Callable   # = checked_out_at
     trunk_locked: Callable     # = trunk_locked
     count_study: Callable      # = count_study
+    bank_deferred_work: Callable  # = bank_deferred_work
     count_usd: Callable        # = count_usd
     forget_worker: Callable    # = forget_worker
     paid_pool: Callable        # = paid_pool
@@ -803,6 +804,7 @@ class AttemptRunner:
         w.task, w.stage, w.wt = task, "error", None
         w.doing, w.started = "starting", time.time()
         w.evidence, w.role_calls, w.gate_count = None, 0, 0
+        w.attempt_requests = 0
         # Provisioning belongs to the lifetime of this fresh worktree, not to each gate.
         # Candidate repair cycles and a rebase reuse the same installed dependencies.
         w.worktree_provisioned = False
@@ -832,8 +834,17 @@ class AttemptRunner:
             w.stage, note = "request_budget", str(exc)
         except ModelPoolExhausted as exc:
             w.stage, note = "model_pool_exhausted", str(exc)
-        except (CapReached, ProviderDown, NoCredits):
+        except (CapReached, ProviderDown, NoCredits) as exc:
             w.stage = "deferred"
+            # The attempt may have spent requests before the provider or the allowance stopped
+            # it. Bank them before re-raising: the worker's release charges them to the task, so
+            # task_request_cap sees them, and the journal row lets a scorecard count the attempt.
+            # Skipping this left a task 16 requests deep reporting requests_spent: 0.
+            w.attempt_requests = d.count_requests(w.name, reset=True)
+            d.journal("attempt_deferred", id=task["id"], title=task["title"],
+                      reason=type(exc).__name__, model=getattr(exc, "model", None) or w.last_model,
+                      role=w.last_role, requests=w.attempt_requests,
+                      edit_calls=d.count_edits(w.name))
             raise
         finally:
             if w.evidence:
@@ -843,6 +854,15 @@ class AttemptRunner:
             except Exception as exc:
                 # Preserve the outcome and artifact if shutdown/Git prevents cleanup.
                 d.log(f"cleanup deferred for {w.branch}: {exc}", w.name)
+            if w.stage == "deferred" and w.evidence:
+                # Cleanup has committed the edits to the attempt's branch; offer them to the
+                # task's next claim now rather than only after a daemon restart.
+                try:
+                    lines = d.bank_deferred_work(c, w.evidence.path, w.evidence.data)
+                    if lines:
+                        d.log(f"{task['id']}: {lines} lines of work kept for the retry", w.name)
+                except Exception as exc:
+                    d.log(f"could not keep the deferred work for a retry: {exc}", w.name)
         w.attempt_requests = info["requests"] = d.count_requests(w.name, reset=True)
         w.failure_class = ("task" if w.stage == "accepted" else
                            failure_class(w.stage, note, edited=info.get("edit_calls")))

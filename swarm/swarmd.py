@@ -959,19 +959,45 @@ def find_interrupted(c, q):
         task = row.get("task") or {}
         if row.get("finished") or task.get("id") not in pending:
             continue
-        diff = retained_diff(c, row)
-        if not diff:
+        entry = resume_entry(c, path.parent, row)
+        if entry is None:
             continue
-        patch = path.parent / "retained.patch"
-        patch.write_text(diff)
         # The newest interrupted attempt for a task wins; attempts sort by name, not by time.
         if found.get(task["id"], {}).get("started", 0) <= row.get("started", 0):
-            found[task["id"]] = {
-                "attempt": row.get("id"), "branch": row.get("branch"),
-                "base_commit": row.get("base_commit"), "patch": str(patch),
-                "implementer": row.get("implementer") or row.get("active_model"),
-                "started": row.get("started", 0), "lines": diff.count("\n") + 1}
+            found[task["id"]] = entry
     return found
+
+
+def resume_entry(c, attempt_dir, row):
+    """The resume record for one attempt's retained work, with its patch written, or None."""
+    diff = retained_diff(c, row)
+    if not diff:
+        return None
+    patch = Path(attempt_dir) / "retained.patch"
+    patch.write_text(diff)
+    return {"attempt": row.get("id"), "branch": row.get("branch"),
+            "base_commit": row.get("base_commit"), "patch": str(patch),
+            "implementer": row.get("implementer") or row.get("active_model"),
+            "started": row.get("started", 0), "lines": diff.count("\n") + 1}
+
+
+def bank_deferred_work(c, attempt_dir, row):
+    """Make a deferred attempt's work resumable by the task's next claim, in this run.
+
+    A provider outage or the allowance stops an attempt after cleanup has committed its edits
+    to the attempt's branch, and finish() marks it finished, so find_interrupted (which runs
+    only at startup, and skips finished attempts) never offered that work back: every retry
+    started from nothing. Returns the number of lines banked, or 0."""
+    task_id = (row.get("task") or {}).get("id")
+    entry = resume_entry(c, attempt_dir, row) if task_id else None
+    if entry is None:
+        return 0
+    rows = load_resume()
+    if rows.get(task_id, {}).get("started", 0) <= entry["started"]:
+        rows[task_id] = entry
+        save_resume(rows)
+        journal("resume_available", tasks=[task_id], attempts=[entry["attempt"]], reason="deferred")
+    return entry["lines"]
 
 
 def note_interrupted(c, q):
@@ -1245,6 +1271,7 @@ def _attempt_deps():
         baseline_key=baseline_key, context_pack=context_pack, count_edits=count_edits,
         kin_text=kin_text, mark_progress=mark_progress, mit_arm=mit_arm, study=study,
         checked_out_at=checked_out_at, trunk_locked=trunk_locked,
+        bank_deferred_work=bank_deferred_work,
         count_study=count_study, count_usd=count_usd, forget_worker=forget_worker,
         paid_pool=paid_pool, spend_left=spend_left, ensure_trunk=ensure_trunk,
         wt_root=wt_root, take_resume=take_resume,

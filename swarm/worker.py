@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from budget import Budget
-from metrics import BucketClock, IDLE, WALL_BUCKETS
+from metrics import ALLOWANCE_BLOCKED, BucketClock, IDLE, PROVIDER_BACKOFF, WALL_BUCKETS
 from runtime_context import ConfigSnapshot
 
 try:  # one class identity with the daemon's turn errors
@@ -87,6 +87,15 @@ class Worker(threading.Thread):
         self.state = state
         self.clock.enter(state)
 
+    def backing_off(self, state, why):
+        """The task is deferred and this worker is asleep until a model or the allowance is back.
+
+        Without this the last turn's "implementer with <model>" stayed as `doing` through the
+        wait, so progress lines said the worker was on a model that was not running, and the
+        wait was banked as model time."""
+        self.doing = why
+        self.publish(state)
+
     # -- helpers -----------------------------------------------------------
 
     def _attempt_config(self, c=None):
@@ -136,6 +145,7 @@ class Worker(threading.Thread):
             run_cap = max(0, int(self.c.get("run_request_cap") or 0))
             requests_left = max(0, run_cap - int(d.run.get("requests_started", 0))) if run_cap else None
             task = self.q.claim(requests_left=requests_left)
+            self.attempt_requests = 0
             if not task:
                 self.doing, self.state = None, IDLE
                 self.clock.enter(IDLE)
@@ -187,16 +197,17 @@ class Worker(threading.Thread):
             except CapReached:
                 d.log("quota/window pause — deferring task", self.name)
                 self.q.release(task["id"], False, "quota/window pause", defer=60,
-                               failure_class="harness")
+                               failure_class="harness", requests=self.attempt_requests)
                 # 22 of these in one day, ten minutes each, while the local count read
                 # 1025/1000 and OpenRouter reported fewer requests used. Ask before sleeping,
                 # and sleep no longer than the interval at which the next ask is due.
                 if d.recheck_allowance(c, attempt_budget):
                     continue
+                self.backing_off(ALLOWANCE_BLOCKED, "waiting for the free allowance")
                 self.stop.wait(min(600, d.allowance_recheck(c) or 600))
             except ProviderDown as e:
                 self.q.release(task["id"], False, f"provider unavailable: {str(e)[:200]}", defer=30,
-                               failure_class="harness")
+                               failure_class="harness", requests=self.attempt_requests)
                 if self.pick(c=c) is None:
                     # No model can take a turn. Sleep until the first one is back, not blindly.
                     _, until = d.next_wake(self.ledger, c)
@@ -205,10 +216,11 @@ class Worker(threading.Thread):
                 else:
                     wait = 30
                     d.log(f"no other model could take over from {e.model}; task deferred, next try in 30s", self.name)
+                self.backing_off(PROVIDER_BACKOFF, f"waiting for a model (next try in {wait:.0f}s)")
                 self.stop.wait(wait)
             except NoCredits as e:
                 d.log(f"out of credits: {e}", self.name)
-                self.q.release(task["id"], False, "no credits")
+                self.q.release(task["id"], False, "no credits", requests=self.attempt_requests)
                 self.stop.set()
             except Exception as e:
                 if self.stop.is_set():
