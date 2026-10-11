@@ -7,8 +7,15 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import random
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 
 def pool(c, role=None, *, default_model):
@@ -327,3 +334,245 @@ def count_requests(turns, worker, n=0, reset=False, *, run, run_lock):
             with run_lock:
                 run["requests_started"] = run.get("requests_started", 0) + n
         return turns.request_calls[worker]
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    """What one finished flint turn produced."""
+    text: str          # the role's answer, stripped
+    model: str         # the model the turn actually ran on (a paid stand-in may have taken it)
+    rc: int
+    requests: int      # request starts the turn made
+    usd: float         # what OpenRouter charged for it
+    log: Path
+
+
+@dataclass(frozen=True)
+class TurnDeps:
+    """Every daemon service a turn uses, injected so this module reads no globals."""
+    pool: Callable
+    default_model: str
+    turns: Any                 # TurnBook
+    stop: Any                  # threading.Event
+    route_to_paid: Callable
+    recheck_allowance: Callable
+    quota_exhausted: Callable
+    quota_mode: Callable
+    shutdown: Callable
+    log: Callable
+    journal: Callable
+    waiting: Callable
+    worker_publish: Callable
+    allowance_blocked: Any     # = ALLOWANCE_BLOCKED
+    held: dict                 # = _held
+    read_only_roles: Any       # = READ_ONLY_ROLES
+    no_corpus: str             # = NO_CORPUS
+    spend_file: Callable
+    spend_cap: Callable
+    spend_reset_day: Callable
+    logs: Path                 # = LOGS
+    root: Path                 # = ROOT
+    sandboxed: Callable
+    turn_timeout: Callable
+    process: Callable
+    kill_group: Callable
+    count_requests: Callable
+    count_study: Callable
+    count_edits: Callable
+    read_charges: Callable
+    request_log: Callable      # = RequestLog class
+
+
+class AgentTurnRunner:
+    """One headless flint turn behind the subprocess boundary: pacing, env, prompt file,
+    sidecars, timeouts and exit-code translation."""
+
+    def __init__(self, deps: TurnDeps):
+        self.deps = deps
+
+    def run(self, prompt, cwd, c, role, worker, budget, max_steps, model=None) -> TurnResult:
+        d = self.deps
+        model = model or (d.pool(c) or [d.default_model])[0]
+        d.turns.ran_on.pop(worker, None)
+        whole_turn = max(1, int(max_steps or 1))
+        try:
+            while True:
+                if d.stop.is_set():
+                    raise Stopped("swarm is stopping")
+                ok, wait, why = budget.check()
+                if ok:
+                    # Starting is not finishing. 21 turns paused part-way on the budget (exit 6) and
+                    # everything they had done to that point was thrown away, so a turn whose rounds do
+                    # not all fit goes to a paid model now rather than halfway through. If no paid model
+                    # is reachable it still runs: a short turn may finish, and idling until midnight is
+                    # certainly worse.
+                    if not budget.check(need=whole_turn)[0]:
+                        d.route_to_paid(c, role, worker, model,
+                                      f"only part of a {whole_turn}-round turn fits the free allowance")
+                        model = d.turns.ran_on.get(worker, model)
+                    break
+                # The local count only climbs until midnight. Before paying for this turn or waiting
+                # on it, ask OpenRouter whether the free requests are really gone.
+                if d.recheck_allowance(c, budget):
+                    continue
+                # Free capacity is gone. If this swarm has a dollar budget left, the turn runs on a
+                # paid model rather than idling until midnight; `paid_stand_in` returns None once the
+                # budget is spent, and during the owner's window no paid model is reached for at all.
+                if budget.paid_would_help():
+                    alt = d.route_to_paid(c, role, worker, model, why)
+                    if alt:
+                        model = alt
+                        break
+                # Free and gone, with no usable fallback for the configured mode: by default
+                # the swarm stops here rather than idling for hours until the allowance
+                # resets. Set shutdown_on_quota_exhausted to "wait" or "paid" to keep the
+                # daemon up instead — "paid" keeps retrying a paid model every cycle below.
+                if d.quota_exhausted(c, budget):
+                    d.log(f"{role}: free allowance exhausted ({why}) with no usable fallback — "
+                        "shutting down (set shutdown_on_quota_exhausted to \"wait\" or \"paid\" "
+                        "to keep the daemon up instead)", worker)
+                    d.journal("quota_exhausted_shutdown", role=role, worker=worker, reason=why,
+                            mode=d.quota_mode(c))
+                    d.shutdown()
+                    raise Stopped("free allowance exhausted; shutting down")
+                # The allowance can be hours from resetting; saying so once a quarter hour is enough,
+                # and the worker records that it is waiting rather than working.
+                d.waiting(worker, f"waiting for the allowance: {why}")
+                d.worker_publish(worker, d.allowance_blocked)
+                if time.time() - d.held.get(worker, 0) > 900:
+                    d.held[worker] = time.time()
+                    d.log(f"{role}: holding {wait/60:.0f}m — {why}", worker)
+                d.stop.wait(max(1, min(wait, 60)))
+        finally:
+            # Whatever ends the wait — a stop, a cap, a provider going away — the worker is
+            # no longer holding for the allowance. Leaving the note behind made `now.json`
+            # report a reason from a turn that had already finished, and the panel's idle
+            # line kept quoting it while the swarm was demonstrably working.
+            d.held.pop(worker, None)
+            d.waiting(worker, None)
+
+        env = dict(os.environ)
+        env.pop("FLINT_ALLOWED_PATHS", None)
+        if c.get("_allowed_paths"):
+            env["FLINT_ALLOWED_PATHS"] = json.dumps(c["_allowed_paths"])
+        env["FLINT_MAX_STEPS"] = str(max_steps)
+        # The suite the model is told to leave passing takes 105s in the studio, and flint's bash
+        # tool cut off at 120s — 15 seconds from killing the run it was asked to make.
+        env["FLINT_BASH_TIMEOUT"] = str(int(c.get("test_timeout", 900)))
+        if role not in d.read_only_roles:
+            # This role's product is a diff, so flint offers it one edit-only round before the
+            # tool-free one and applies edits it writes as reply text. Without that, a turn spent
+            # reading is thrown away whole and scored against the model as "no change".
+            env["FLINT_FINAL_EDIT"] = "1"
+        if not env.get("OPENROUTER_API_KEY"):
+            env.pop("OPENROUTER_API_KEY", None)
+        if c.get("study") is False:
+            env["FLINT_CORPUS_DB"] = d.no_corpus
+        elif c.get("corpus_db"):
+            env["FLINT_CORPUS_DB"] = str(Path(c["corpus_db"]).expanduser())
+        env["FLINT_SWARM_BUDGET"] = json.dumps(dict(
+            cap=budget.cap, reserve=budget.reserve, owner_window=c.get("owner_window", ["00:00", "00:00"])))
+        # Shared when the budget is monthly, per-repository when it is daily. flint charges real
+        # costs here and refuses a paid request the remaining budget can no longer cover.
+        env["FLINT_SPEND_FILE"] = str(d.spend_file(c))
+        # flint knows what OpenRouter charged; this is how that number gets back here.
+        charge_file = d.logs / f"{worker}-{role}-{time.time_ns()}.charges.jsonl"
+        env["FLINT_CHARGE_FILE"] = str(charge_file)
+        # flint records every HTTP request attempt (including provider retries) here, before it
+        # is made, so a SIGKILLed turn still leaves an exact count (work order §1). The daemon
+        # reads this after the turn; it never has to parse human log lines for the number.
+        request_file = d.logs / f"{worker}-{role}-{time.time_ns()}.requests.jsonl"
+        env["FLINT_REQUEST_FILE"] = str(request_file)
+        local_count_before = d.count_requests(worker)
+        if d.spend_cap(c) is not None:
+            env["FLINT_SPEND_CAP"] = str(d.spend_cap(c))
+        if d.spend_reset_day(c) is not None:
+            env["FLINT_SPEND_RESET_DAY"] = str(d.spend_reset_day(c))
+        # The prompt is 10-25 KB. In argv it shows up in `ps`, in every exception's str() and in
+        # any crash report, so it goes to a file the attempt is keeping anyway.
+        prompt_file = d.logs / f"{worker}-{role}-{time.time_ns()}.prompt.txt"
+        prompt_file.write_text(prompt)
+        cmd = [c.get("python", sys.executable), str(d.root / "flint.py"),
+               "--prompt-file", str(prompt_file), "-C", str(cwd), "-m", model,
+               "--read-only" if role in d.read_only_roles else "--yolo"]
+        cmd = d.sandboxed(cmd, cwd, c)
+        timeout = d.turn_timeout(c, role)
+        d.log(f"{role}: asking {model} (up to {max_steps} rounds; timeout {timeout}s)", worker)
+        t0 = time.time()
+        # Keep progress/errors separate from the role's machine-readable answer.
+        logfile = d.logs / f"{worker}-{role}-{time.time_ns()}.log"
+        expired = False
+        d.turns.active_turns[worker] = f"{role} with {model}"
+        d.turns.turn_logs[worker] = logfile
+        try:
+            with open(logfile, "w") as err:
+                with d.process(cmd, stdout=subprocess.PIPE, stderr=err,
+                             text=True, env=env) as p:
+                    try:
+                        out, _ = p.communicate(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        d.kill_group(p)
+                        out, _ = p.communicate()
+                        expired = True
+                    except BaseException:
+                        d.kill_group(p)
+                        p.communicate()
+                        raise
+        finally:
+            d.turns.active_turns.pop(worker, None)
+            d.turns.turn_logs.pop(worker, None)
+        progress = logfile.read_text(errors="replace")
+        studied = len(re.findall(r"^tool: study$", progress, re.M))
+        rounds = len(re.findall(r"^round \d+/\d+: requesting ", progress, re.M))
+        provider_retries = len(re.findall(r"provider failed mid-reply — retry \d+/\d+", progress))
+        # The sidecar is the source of truth for request starts; the log-line counts are a
+        # cross-check that must agree. If the sidecar is missing (an older flint, or a swept
+        # log dir) the human-log count is the fallback, and the journal says which was used.
+        sidecar_rows, sidecar_total = d.request_log(request_file).read()
+        requests_started = sidecar_total if sidecar_total else (rounds + provider_retries)
+        d.count_requests(worker, requests_started)
+        d.count_study(worker, studied)
+        d.count_edits(worker, len(re.findall(r"^tool: (?:edit_file|write_file)$", progress, re.M)))
+        usd = d.read_charges(charge_file, role, worker, model)
+        d.journal("turn", role=role, worker=worker, model=model, rc=p.returncode,
+                secs=round(time.time() - t0), chars=len(out), log=str(logfile), study_calls=studied,
+                requests_started=requests_started, tool_rounds=rounds,
+                provider_retries=provider_retries,
+                local_count_before=local_count_before,
+                local_count_after=d.count_requests(worker),
+                request_sidecar=request_file.name,
+                sidecar_total=sidecar_total, usd=usd)
+        d.request_log(request_file).clear()
+        error = progress[-1200:]
+        with open(logfile, "a") as f:  # keep the answer beside the progress for later review
+            f.write(f"\n--- answer from {model} (exit {p.returncode}) ---\n{out}\n")
+        # Ctrl-C kills the turn's process, which would otherwise look like a crashed model and
+        # cost it twice the usual penalty weight. Stopping the run is not the model's doing.
+        if d.stop.is_set() and p.returncode != 0:
+            raise Stopped(f"{role} turn on {model} was stopped with the run")
+        if expired:
+            d.journal("agent_timeout", role=role, worker=worker, model=model,
+                    timeout=timeout, secs=round(time.time() - t0), log=str(logfile))
+            raise AgentTimeout(role, model, timeout, logfile)
+        if p.returncode in (3, 6):
+            raise CapReached(error)
+        if p.returncode == 4:
+            raise NoCredits(error)
+        if p.returncode == 5:
+            raise StepLimit(error)
+        if p.returncode == 11:
+            # The turn spent 70% of its rounds without editing (work order §2). It is not a
+            # model failure in the scoring sense — the harness let it explore — but it is a
+            # strong signal for the task/model circuit breaker: same model, same role, same
+            # no-edit exhaustion should not immediately repeat.
+            raise ExplorationExhausted(error)
+        if p.returncode == 7:
+            raise ProviderDown(model, error)
+        if p.returncode == 8:
+            raise ProviderBusy(model, error)
+        if p.returncode == 9:
+            raise ModelGone(model, error)
+        if p.returncode != 0:
+            raise ModelError(f"{role} turn failed (rc={p.returncode}); log: {logfile}\n{error}")
+        return TurnResult(text=out.strip(), model=model, rc=p.returncode,
+                          requests=requests_started, usd=usd, log=logfile)
