@@ -117,6 +117,9 @@ def _run_in(wt, chosen, python):
 
 
 def main(argv):
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    print(f"=== mutate_invariants {time.strftime('%Y-%m-%d %H:%M:%S')} at {head}", flush=True)
     rows = run(argv)
     bad = [r for r in rows if r[2] != "killed"]
     print("\n" + "\n".join(f"{mid:5} {verdict:14} {what}\n      {detail}"
