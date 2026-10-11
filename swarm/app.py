@@ -7,18 +7,35 @@ repository selected with `use_repo` is always the one answered for.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 
 class SwarmApplication:
-    def __init__(self, daemon):
+    def __init__(self, daemon, c=None):
         self._daemon = daemon
+        self._c = c          # the config for_repo() selected; operations act on it, never re-read
 
     @classmethod
     def for_repo(cls, repo, *, daemon):
-        """Select `repo` on the daemon (its queue, state, logs and config) and front it."""
-        daemon.use_repo(daemon.load_cfg(repo))
-        return cls(daemon)
+        """Select `repo` on the daemon (its queue, state, logs and config) and front it.
+
+        An untuned repository falls back to the default config, which names some other
+        repository, so the config is pointed at `repo` before anything is selected — the same
+        override the bridge's config_for applies."""
+        c = daemon.load_cfg(repo)
+        if repo:
+            resolved = str(Path(repo).expanduser().resolve())
+            if c.get("repo") != resolved:
+                c = dict(c, repo=resolved)
+        daemon.use_repo(c)
+        return cls(daemon, c)
+
+    def _config(self):
+        if self._c is None:
+            raise RuntimeError("this SwarmApplication fronts paths only; build it with for_repo() "
+                               "to run operations on a repository")
+        return self._c
 
     # -- paths ----------------------------------------------------------
     @property
@@ -49,18 +66,24 @@ class SwarmApplication:
         return self.read_jsonl(self.state_dir / "done.jsonl")
 
     # -- operations -----------------------------------------------------
-    def status(self, workers=(), c=None):
-        return self._daemon.run_status(list(workers), c if c is not None else self._daemon.cfg())
+    # Starting and stopping a daemon are not here on purpose: the lifecycle takes the
+    # repository's lock, installs signal handlers and runs for the whole shift, so it must own
+    # its process. `swarmd.py run|grind|stop` (and the bridge's grind-cmd/stop) are its entry
+    # points.
+
+    def status(self):
+        """The selected repository's last run record and now-line, read without writing.
+
+        The daemon's own run_status() also rewrites run.json from this process's run state,
+        which from any process but the daemon's would clobber the live record."""
+        try:
+            run = json.loads((self.state_dir / "run.json").read_text())
+        except (OSError, ValueError):
+            run = None
+        return {"run": run, "now": self._daemon.read_now()}
 
     def add_task(self, title, detail="", kind="feature", **fields):
-        c = self._daemon.cfg()
-        return self._daemon.queue_for(c).add(title, detail, kind, **fields)
+        return self._daemon.queue_for(self._config()).add(title, detail, kind, **fields)
 
     def report(self, hours=24):
-        return self._daemon.build_report(self._daemon.cfg(), hours)
-
-    def start(self, hours=None, max_tasks=None, awake=False):
-        return self._daemon.start(self._daemon.cfg(), hours, max_tasks, awake)
-
-    def stop(self, drain=False):
-        return self._daemon.cmd_stop(type("Args", (), {"repo": None, "drain": drain})())
+        return self._daemon.build_report(self._config(), hours)
