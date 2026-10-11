@@ -1566,9 +1566,10 @@ class Agent:
                          "implement the smallest verified slice with edit_file or write_file, "
                          "run the narrowest test that covers it, and give your final answer.")
 
-    EDIT_ONLY_MSG = ("Most of this turn's budget is gone. Only edit_file and write_file are "
-                     "available from here on; run the narrowest test that covers your change "
-                     "and finish. No more reading or searching.")
+    EDIT_ONLY_MSG = ("Most of this turn's budget is gone and no file has changed. This round "
+                     "offers only edit_file and write_file: write your change now. If nothing "
+                     "changes this round the turn stops here; once a file has changed, the other "
+                     "tools come back so you can run the narrowest test that covers it.")
 
     def _assistant_msg(self, content, calls):
         """The assistant message for a reply, with stable ids for the calls it made."""
@@ -1608,27 +1609,35 @@ class Agent:
                     result += f"\n\n[round {step + 1} of {MAX_STEPS}; {left} left]"
                 self.messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
                 self.save_checkpoint()
+            if edit_only and self.edits:
+                # The edit-only round did its job: give back reading and running so the model can
+                # check the change it just made.
+                edit_only, self.only_tools = False, None
             if self.headless and not self.edits:
-                if left == 3:
-                    self.messages.append({"role": "user", "content": self.NO_EDIT_YET})
-                elif explore_floor is not None:
-                    # Work order §2 (long budgets only): at 60% of the role budget stop
-                    # exploring and implement the smallest slice; at 80% drop read/search
-                    # tools so only edit tools remain; a turn with no edit by 70% is stopped
-                    # early as exploration_exhausted.
+                if explore_floor is None:
+                    if left == 3:
+                        self.messages.append({"role": "user", "content": self.NO_EDIT_YET})
+                elif edit_only:
+                    # The model was given a round with only the edit tools and still changed
+                    # nothing. Keep whatever it wrote; reading exhausted the turn, not a fault.
+                    raise ExplorationExhausted(
+                        f"Stopped after {step + 1} rounds with no edit, including a round that "
+                        "offered only the edit tools. Leave partial work to the normal gates.")
+                elif step + 1 >= explore_floor:
+                    # Work order §2 (long budgets only): no edit by 70% of the budget. The next
+                    # round offers only the edit tools; if that changes nothing, the turn stops.
+                    # This used to fire the edit-only switch and the stop in the same round, so
+                    # the model never got its edit-only round.
+                    edit_only = True
+                    self.only_tools = set(self.EDIT_TOOLS)
+                    self.messages.append({"role": "user", "content": self.EDIT_ONLY_MSG})
+                else:
                     if not explore_nudged and left <= max(1, int(MAX_STEPS * 0.4)):
+                        # At 60%: stop exploring and implement the smallest slice.
                         explore_nudged = True
                         self.messages.append({"role": "user", "content": self.EXPLORE_LIMIT_MSG})
-                    if not edit_only and left <= max(1, int(MAX_STEPS * 0.2)):
-                        edit_only = True
-                        self.only_tools = set(self.EDIT_TOOLS)
-                        self.messages.append({"role": "user", "content": self.EDIT_ONLY_MSG})
-                    if step + 1 >= explore_floor:
-                        # Keep whatever the model already wrote; the turn is over because
-                        # reading exhausted it, not because it failed.
-                        raise ExplorationExhausted(
-                            f"Stopped after {step + 1} rounds with no edit; the turn spent 70% of its "
-                            "budget exploring. Leave partial work to the normal gates.")
+                    elif left == 3:
+                        self.messages.append({"role": "user", "content": self.NO_EDIT_YET})
         else:
             content = self._final_answer()
         if self.last_prompt_tokens > CONTEXT_WARN_TOKENS:

@@ -219,8 +219,13 @@ def parse_scores(text):
         out["goal_item"] = 0
     out["why"] = str(d.get("why", ""))[:300]
     out["lesson"] = str(d.get("lesson", ""))[:300]
+    def strings(value, limit, width):
+        return [str(v).strip()[:width] for v in (value if isinstance(value, list) else [])
+                if isinstance(v, str) and v.strip()][:limit]
+
     out["follow_ups"] = [
-        {"title": f["title"].strip()[:120], "detail": str(f.get("detail", ""))[:800]}
+        {"title": f["title"].strip()[:120], "detail": str(f.get("detail", ""))[:800],
+         "acceptance": strings(f.get("acceptance"), 5, 300), "paths": strings(f.get("paths"), 8, 200)}
         for f in (d.get("follow_ups") or [])
         if isinstance(f, dict) and isinstance(f.get("title"), str) and f["title"].strip()][:2]
     return out

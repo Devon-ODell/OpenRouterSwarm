@@ -311,7 +311,7 @@ RELOADABLE = frozenset({
     "max_queue", "max_depth", "inject_corpus", "allow_paid", "study", "tick", "max_diff",
     "validation_commands", "test_cmd", "keep_worktrees", "scope_gate", "idle_improvement", "auto_plan",
     "idle_improvement_cooldown", "max_review_formats", "task_request_cap", "run_request_cap",
-    "max_role_calls", "shutdown_on_quota_exhausted"})
+    "max_role_calls", "shutdown_on_quota_exhausted", "follow_ups"})
 # Changing these under a running daemon would strand worktrees, state or threads.
 RESTART_ONLY = frozenset({"repo", "trunk", "workers", "sandbox_write", "base_branch", "python",
                           "goal_file", "roadmap_file"})
@@ -1412,7 +1412,7 @@ KNOWN_KEYS = frozenset({
     "scope_gate", "idle_improvement", "idle_improvement_cooldown", "max_review_formats",
     "task_request_cap", "run_request_cap", "max_role_calls",
     "keep_attempts", "execution_class", "auto_plan", "prov", "shutdown_on_quota_exhausted",
-    "_comment"})
+    "follow_ups", "_comment"})
 # Seconds a round of tool use really takes on these models, from the studio's own turns.
 SECONDS_PER_ROUND = 47
 

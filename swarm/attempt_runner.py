@@ -156,15 +156,30 @@ class AttemptRunner:
         c = w._attempt_config(c)
         if c.get("roadmap_file"):
             return  # Future packets are dispatched only by their recorded roadmap gates.
+        if c.get("follow_ups") is False:
+            return  # A fixed backlog (a benchmark) must not grow tasks of its own.
         if not scores or not (breakthrough or r >= 0.75):
             return
         if len(w.q.pending()) >= c.get("max_queue", 20):
             return
         for f in scores.get("follow_ups", [])[:2 if breakthrough else 1]:
-            t = w.q.add(f["title"], f["detail"], "feature", persona=task.get("persona"),
-                        planner_model=task.get("planner_model"), parent=task["id"],
-                        priority=2 if breakthrough else 0, origin="follow_up",
-                        depth=task.get("depth", 0))
+            if not f.get("acceptance"):
+                # The scope gate lets a task with no criteria through on purpose (a person may
+                # file one), so a judge's vague idea used to be queued with nothing to check.
+                d.journal("follow_up_skipped", parent=task["id"], title=f["title"],
+                          reason="no acceptance criteria")
+                continue
+            paths = [p if not p.endswith("/") and "." in Path(p).name else p.rstrip("/") + "/"
+                     for p in f.get("paths") or []]
+            meta = dict(persona=task.get("persona"), planner_model=task.get("planner_model"),
+                        parent=task["id"], priority=2 if breakthrough else 0, origin="follow_up",
+                        depth=task.get("depth", 0), acceptance=f["acceptance"],
+                        allowed_paths=paths or None)
+            try:
+                t = w.q.add(f["title"], f["detail"], "feature", **meta)
+            except ValueError:
+                meta["allowed_paths"] = None   # a malformed path list is not worth losing the idea
+                t = w.q.add(f["title"], f["detail"], "feature", **meta)
             if t:
                 d.log(f"follow-up queued: {t['title']}", w.name)
 

@@ -126,3 +126,41 @@ class DeferredWorkIsResumedTests(RepoCase):
         self.assertEqual(calls[0][1], "half written\n")
         self.assertNotIn(("implementer", False), calls)
         self.assertNotIn("t1", swarmd.load_resume())             # handed over once
+
+
+class FollowUpTests(RepoCase):
+    """11. A judge's follow-up was queued with no acceptance criteria and no file limits: the
+    judge's criteria were dropped on parse, and the scope gate admits criteria-less tasks."""
+
+    def follow(self, ideas, **cfg):
+        from swarm import attempt_runner
+        from tests.test_attempt_runner import build_deps
+        q = swarmd.Queue()
+        parent = q.add("Add a stdlib validator", "x", "feature", acceptance=["tools/x.py exists"])
+        w = swarmd.Worker(0, self.cfg(**cfg), q, budget=None, stop=threading.Event())
+        deps = build_deps()
+        runner = attempt_runner.AttemptRunner(w, deps)
+        runner.follow_up(parent, {"follow_ups": ideas}, 0.9, False, self.cfg(**cfg))
+        return [t for t in q.pending() if t.get("origin") == "follow_up"], deps
+
+    def test_criteria_and_paths_from_the_judge_are_kept(self):
+        from swarm import learn
+        scores = learn.parse_scores('{"impact": 5, "creativity": 4, "quality": 6, "follow_ups": ['
+                                    '{"title": "Wire the validator into verify", "detail": "d", '
+                                    '"acceptance": ["python3 tools/verify.py --profile local passes"], '
+                                    '"paths": ["tools/verify.py", "tools/tests"]}]}')
+        queued, _ = self.follow(scores["follow_ups"])
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["acceptance"], ["python3 tools/verify.py --profile local passes"])
+        self.assertEqual(queued[0]["allowed_paths"], ["tools/verify.py", "tools/tests/"])
+
+    def test_a_follow_up_without_criteria_is_not_queued(self):
+        queued, deps = self.follow([{"title": "Integrate it everywhere", "detail": "d",
+                                     "acceptance": [], "paths": []}])
+        self.assertEqual(queued, [])
+        self.assertIn("follow_up_skipped", [c.args[0] for c in deps.journal.call_args_list])
+
+    def test_a_fixed_backlog_can_turn_follow_ups_off(self):
+        queued, _ = self.follow([{"title": "Next", "detail": "d", "acceptance": ["a check"],
+                                  "paths": []}], follow_ups=False)
+        self.assertEqual(queued, [])

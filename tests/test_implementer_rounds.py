@@ -340,5 +340,58 @@ class ReadFilesTests(unittest.TestCase):
         self.assertIn("read_files", offered(a))
 
 
+class ExplorationLimitTests(unittest.TestCase):
+    """A long turn (10+ rounds) that has not edited by 70% of its budget gets one round with only
+    the edit tools before it is stopped. The switch and the stop used to fire in the same round,
+    so the model never got that round (seen in the 2026-10-11 SkyRing shift)."""
+
+    def run_turn(self, a, rounds=10, edit_when_offered=True):
+        rounds_offered = []
+
+        def complete():
+            tools = offered(a)
+            rounds_offered.append(tools)
+            if edit_when_offered and set(tools) == set(flint.Agent.EDIT_TOOLS) and not a.edits:
+                return "", [{"id": f"c{len(a.messages)}", "name": "write_file",
+                             "args": '{"path": "x", "content": "y"}'}]
+            if a.edits:
+                return "done", []
+            return "", [{"id": f"c{len(a.messages)}", "name": "read_file", "args": '{"path": "x"}'}]
+
+        def run_tool(c):
+            if c["function"]["name"] in flint.Agent.EDIT_TOOLS:
+                a.edits += 1
+                return "Wrote x."
+            return "file text"
+        a.complete, a.run_tool = complete, run_tool
+        a._final_answer = Mock(return_value="done")
+        with patch.object(flint, "MAX_STEPS", rounds), quiet():
+            out = a.turn("implement this")
+        return out, rounds_offered
+
+    def test_the_model_gets_its_edit_only_round_and_its_edit_is_kept(self):
+        a = agent(read_only=False)
+        out, offered_rounds = self.run_turn(a)
+        self.assertEqual(a.edits, 1)
+        self.assertIn(set(flint.Agent.EDIT_TOOLS), [set(r) for r in offered_rounds])
+        self.assertEqual(out, "done")
+
+    def test_reading_comes_back_once_the_edit_is_made(self):
+        a = agent(read_only=False)
+        self.run_turn(a)
+        self.assertIsNone(a.only_tools)
+
+    def test_a_model_that_still_does_not_edit_is_stopped_after_that_round(self):
+        a = agent(read_only=False)
+        with self.assertRaises(flint.ExplorationExhausted):
+            self.run_turn(a, edit_when_offered=False)
+        edit_only_messages = [m for m in a.messages if m["role"] == "user"
+                              and m["content"] == flint.Agent.EDIT_ONLY_MSG]
+        self.assertEqual(len(edit_only_messages), 1)
+        # The round after the switch really offered only the edit tools, and the turn ended there.
+        last_user = a.messages.index(edit_only_messages[0])
+        self.assertTrue(any(m["role"] == "assistant" for m in a.messages[last_user + 1:]))
+
+
 if __name__ == "__main__":
     unittest.main()

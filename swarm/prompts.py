@@ -193,10 +193,12 @@ this changes what the project can do; expect that for fewer than 1 in 10 changes
 
 Give one lesson: a general, actionable sentence that would help a future agent
 working in this repository (advice, not a summary of this change). Suggest up to
-two follow-up tasks this change makes possible, with acceptance criteria.
+two follow-up tasks this change makes possible. Each needs 1 to 5 acceptance criteria that
+can be checked by running a command or test, and the repository paths it may change; a
+follow-up without runnable criteria is not queued.
 
 You may read files to check your judgement. Output ONLY this JSON:
-{{"impact": 0, "creativity": 0, "quality": 0, "goal_item": 0, "breakthrough": false, "why": "one sentence", "lesson": "one sentence", "follow_ups": [{{"title": "...", "detail": "..."}}]}}"""
+{{"impact": 0, "creativity": 0, "quality": 0, "goal_item": 0, "breakthrough": false, "why": "one sentence", "lesson": "one sentence", "follow_ups": [{{"title": "...", "detail": "...", "acceptance": ["a runnable check"], "paths": ["path/to/file"]}}]}}"""
 
 
 PRIORITIES = """

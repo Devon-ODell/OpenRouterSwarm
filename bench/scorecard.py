@@ -51,9 +51,11 @@ def score(benchmark):
                                       "implementer": j.get("model")})
 
     def family(tid):
-        """The task and everything split from it."""
+        """The task and the pieces the decomposer split it into. A judge's follow-ups share the
+        root too, but they are new work, not this task's cost, so they are left out."""
         rows = list(done.values()) + list(pending.values())
-        return [tid] + [r["id"] for r in rows if r.get("root") == tid and r["id"] != tid]
+        return [tid] + [r["id"] for r in rows
+                        if r.get("root") == tid and r["id"] != tid and r.get("origin") == "split"]
 
     tasks, classes, models = [], collections.Counter(), collections.Counter()
     for ref, meta in book["tasks"].items():
