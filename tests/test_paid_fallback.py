@@ -844,7 +844,11 @@ class ResyncAllowanceTests(unittest.TestCase):
         self.openrouter(964)
         self.assertTrue(swarmd.resync_allowance({}, swarmd.Budget(cap=1000, reserve=0)))
         self.assertEqual(self.state()["count"], 964)
-        self.assertTrue(swarmd.Budget(cap=1000, reserve=0).check()[0], "free turns can run")
+        # No owner window: these tests assert allowance resync, not the 20:00-00:00
+        # default window, which would make check() False between 8pm and midnight.
+        self.assertTrue(swarmd.Budget(cap=1000, reserve=0,
+                                      owner_window=["00:00", "00:00"]).check()[0],
+                        "free turns can run")
         rows = self.journal()
         self.assertEqual([(r["used"], r["counted_before"], r["counted_after"]) for r in rows
                           if r["event"] == "allowance_resynced"], [(964, 1025, 964)])
@@ -854,7 +858,9 @@ class ResyncAllowanceTests(unittest.TestCase):
         self.openrouter(40)
         self.assertTrue(swarmd.resync_allowance({}, swarmd.Budget(cap=1000, reserve=0)))
         self.assertNotIn("blocked_until", self.state())
-        self.assertTrue(swarmd.Budget(cap=1000, reserve=0).check()[0])
+        # Same as above: no owner window, or this is red between 8pm and midnight.
+        self.assertTrue(swarmd.Budget(cap=1000, reserve=0,
+                                      owner_window=["00:00", "00:00"]).check()[0])
 
     def test_a_provider_not_at_the_limit_does_not_raise_the_local_count(self):
         # The provider counter can be higher than ours when other processes used the key.
