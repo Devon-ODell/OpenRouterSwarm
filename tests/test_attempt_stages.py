@@ -146,24 +146,241 @@ class AttemptStageTests(RepoCase):
         self.assertTrue(ok, note)
         self.assertEqual(w.stage, "accepted")
 
-    def test_the_frozen_stage_vocabulary_is_closed(self):
-        """The stages an attempt can exit with are a frozen, non-inventable set.
+    # The exact stage -> failure_class mapping, measured at b8fe88f (P0.1 hole 1).
+    # failure_class() ends in `return "task"`, so a plain assertIn is vacuous:
+    # every string classifies. Pinning the exact values is what guards invariant 7
+    # (a harness failure must never cost the task one of its two lives).
+    STAGE_CLASS = {
+        "accepted":              "task",       # never routed through failure_class in practice
+        "refused":               "harness",
+        "out_of_scope":          "task",
+        "baseline":              "harness",
+        "conflict":              "harness",
+        "rejected":              "task",
+        "tests_failed":          "task",
+        "weakened_tests":        "task",
+        "agent_timeout":         "harness",
+        "review_format_error":   "review_format",
+        "model_pool_exhausted":  "harness",
+        "exploration_exhausted": "harness",
+        "request_budget":        "harness",
+        "interrupted":           "harness",
+        "deferred":              "harness",
+    }
+    # The three note/edited-dependent stages are not in STAGE_CLASS; each needs
+    # both directions asserted explicitly.
+    NOTE_DEPENDENT = frozenset({"model_error", "review_error", "no_change"})
 
-        P0 pins the vocabulary from the work order's Contracts section; P9 turns it
-        into AttemptOutcome.stage and every consumer depends on the exact strings.
+    def test_the_frozen_stage_mapping_is_exact(self):
+        """failure_class per stage is the measured table, not a trivially-true assertIn.
+
+        P0 declares 18 stages. The mapping pins 15 of them exactly; the other three
+        depend on note/edited and are pinned in both directions below. A stage added
+        later must appear here or the keyset assertion fails.
         """
         stages = {"accepted", "refused", "out_of_scope", "baseline", "conflict",
                   "rejected", "tests_failed", "weakened_tests", "no_change",
                   "agent_timeout", "model_error", "review_error", "review_format_error",
                   "model_pool_exhausted", "exploration_exhausted", "request_budget",
                   "interrupted", "deferred"}
-        # Every stage maps to a failure_class via the pure function.
-        for stage in stages:
-            self.assertIn(swarmd.failure_class(stage),
-                          ("task", "model", "harness", "review_format"))
+        self.assertEqual(len(stages), 18)
+        # The mapping's keys are the vocabulary minus the three note-dependent stages.
+        self.assertEqual(set(self.STAGE_CLASS), stages - self.NOTE_DEPENDENT)
+        # An unknown stage string must be recognizable as unmapped: "banana" falls
+        # through failure_class()'s catch-all, but it is not a pinned stage.
+        self.assertNotIn("banana", self.STAGE_CLASS)
+        # Every pinned stage classifies exactly as measured.
+        for stage, cls in self.STAGE_CLASS.items():
+            self.assertEqual(swarmd.failure_class(stage), cls, stage)
+        # The note- and edited-dependent directions, asserted both ways.
+        self.assertEqual(swarmd.failure_class("model_error", ""), "model")
+        self.assertEqual(swarmd.failure_class("model_error", "connection reset"), "harness")
+        self.assertEqual(swarmd.failure_class("review_error", ""), "model")
+        self.assertEqual(swarmd.failure_class("review_error", "timed out"), "harness")
+        self.assertEqual(swarmd.failure_class("no_change", "", edited=None), "harness")
+        self.assertEqual(swarmd.failure_class("no_change", "", edited=3), "model")
         # The task stages are the ones that count against the task.
         self.assertEqual(swarmd.TASK_STAGES,
                          frozenset({"tests_failed", "rejected", "weakened_tests", "out_of_scope"}))
+
+
+class AttemptStageFaultTests(RepoCase):
+    """End-to-end drives of the failure stages of `_attempt` (P0.1 hole 2).
+
+    The happy path only exercises refused/out_of_scope/accepted. These force each
+    failure stage through the real repo + worktree + fake flint, asserting the
+    stage string and failure_class() on the real note the attempt produced.
+    """
+
+    def task(self, **kw):
+        return {"id": "t1", "title": "Add a settings screen",
+                "detail": "show the volume slider", "kind": "feature",
+                "origin": "human", "acceptance": ["the slider appears"], **kw}
+
+    def test_baseline_failure_spends_no_model_calls(self):
+        c = self.cfg(test_cmd="false")
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            raise AssertionError("flint must not be called when the baseline fails")
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "baseline")
+        self.assertEqual(w.role_calls, 0)      # no model call was spent
+        self.assertIn("baseline tests failed", note)
+        self.assertEqual(swarmd.failure_class(w.stage, note), "harness")
+
+    def test_tests_failed_when_the_candidate_fails_the_gate(self):
+        # test_cmd passes on the untouched checkout and fails once the
+        # implementer's file exists: the baseline gate is green, the candidate
+        # gate is red.
+        c = self.cfg(test_cmd="test ! -f feature.txt", max_repairs=0)
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                (cwd / "feature.txt").write_text("settings\n")
+                return "done"
+            return review(prompt)
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "tests_failed")
+        self.assertEqual(swarmd.failure_class(w.stage, note), "task")
+
+    def test_rejected_by_the_adversary(self):
+        c = self.cfg(max_repairs=0)
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                (cwd / "feature.txt").write_text("settings\n")
+                return "done"
+            if role == "adversary":
+                # The supervisor's verdict vocabulary is approve/request_changes;
+                # a request_changes verdict with a blocker finding is a rejection.
+                return review(prompt, "request_changes")
+            return "done"
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "rejected")
+        self.assertEqual(swarmd.failure_class(w.stage, note), "task")
+
+    def test_weakened_tests_is_refused_and_origin_gated(self):
+        """An implementer that guts an existing assertion is refused, and only a
+        person (human/cursor origin) may ever authorise test changes."""
+        c = self.cfg()
+        (self.repo / "tests").mkdir()
+        (self.repo / "tests" / "test_app.py").write_text(
+            "def test_baseline():\n    assert True\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "baseline")
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                (cwd / "tests" / "test_app.py").write_text(
+                    "def test_baseline():\n    pass\n")   # guts the assertion
+                return "done"
+            return review(prompt)
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "weakened_tests")
+        self.assertIn("assertion", note)
+        self.assertEqual(swarmd.failure_class(w.stage, note), "task")
+        # TEST_CHANGE_ORIGINS is what permits the exception: only a person may
+        # set allow_test_changes; the swarm's own tasks cannot.
+        self.assertEqual(swarmd.TEST_CHANGE_ORIGINS, frozenset({"human", "cursor"}))
+        q = swarmd.Queue()
+        with self.assertRaises(ValueError):
+            q.add("t", "d", "feature", origin="planner", allow_test_changes=True)
+
+    def test_no_change_never_reached_an_edit_is_harness(self):
+        """No diff and no edit call: the harness ran the rounds out — harness."""
+        c = self.cfg()
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                return "done"          # no edit call, no diff
+            return review(prompt)
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "no_change")
+        self.assertIn("never reached an edit", note)
+        self.assertEqual(swarmd.failure_class("no_change", note, edited=None), "harness")
+
+    def test_no_change_after_edit_calls_is_model(self):
+        """Edit calls that changed nothing are the model's doing — model."""
+        c = self.cfg()
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                # The turn called edit_file (3 calls) but the tree shows no diff.
+                swarmd._edit_calls["w0"] = 3
+                return "done"
+            return review(prompt)
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "no_change")
+        self.assertIn("changed nothing", note)
+        self.assertEqual(swarmd.failure_class("no_change", note, edited=3), "model")
+
+    def test_model_error_from_the_implementer(self):
+        c = self.cfg()
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                raise swarmd.ModelError("no usable json in reply")
+            return review(prompt)
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "model_error")
+        self.assertEqual(swarmd.failure_class("model_error", note), "model")
+
+    def test_conflict_when_trunk_moves_under_the_candidate(self):
+        """A competing commit on swarm/trunk touching the same path makes the
+        integrate rebase fail, and the attempt reports `conflict`."""
+        c = self.cfg()
+        q = swarmd.Queue()
+        w = self.worker(c, q)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                (cwd / "feature.txt").write_text("settings\n")
+                return "done"
+            if role == "adversary":
+                # Land a competing change on trunk at the same path, before the
+                # candidate is committed, so the rebase cannot apply cleanly.
+                _git(self.repo, "checkout", "-q", "swarm/trunk")
+                (self.repo / "feature.txt").write_text("other\n")
+                _git(self.repo, "add", "-A")
+                _git(self.repo, "commit", "-qm", "competing trunk change")
+                _git(self.repo, "checkout", "-q", "main")
+                return review(prompt)
+            return "done"
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "conflict")
+        self.assertIn("conflicts with newer trunk", note)
+        self.assertEqual(swarmd.failure_class(w.stage, note), "harness")
 
 
 if __name__ == "__main__":
