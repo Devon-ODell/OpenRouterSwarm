@@ -5,7 +5,70 @@ Every dependency is injected; nothing here imports the daemon or reads its globa
 """
 from __future__ import annotations
 
-import datetime as dt, os, shutil, subprocess, sys, time
+import datetime as dt, json, os, shutil, signal, subprocess, sys, threading, time, uuid
+import fcntl
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+from budget import Budget
+from learn import Ledger
+from metrics import Reconcile
+
+try:  # one class identity with the daemon's turn errors
+    from .agent_turn import CapReached, ModelError, NoCredits, ProviderDown, StepLimit
+except ImportError:  # pragma: no cover - script mode
+    from agent_turn import CapReached, ModelError, NoCredits, ProviderDown, StepLimit
+
+
+@dataclass(frozen=True)
+class SupervisorDeps:
+    """The daemon services the lifecycle uses, read when start() or run_daemon() is entered."""
+    log: Callable
+    journal: Callable
+    account: Callable
+    preflight: Callable
+    read_goal: Callable
+    run_status: Callable
+    shutdown: Callable
+    holder: Callable
+    hours_left: Callable
+    keep_awake: Callable
+    run_daemon: Callable
+    queue_for: Callable
+    note_interrupted: Callable
+    prune_attempts: Callable
+    trunk_name: Callable
+    config_kind: Callable
+    resync_allowance: Callable
+    pool: Callable
+    config_mtime: Callable
+    source_fingerprint: Callable
+    source_changed: Callable
+    restart_into_new_code: Callable
+    drain: Callable
+    dispatch_roadmap: Callable
+    quota_exhausted: Callable
+    quota_mode: Callable
+    sync_usage: Callable
+    import_bugs: Callable
+    report_progress: Callable
+    write_now: Callable
+    can_take_a_turn: Callable
+    sync_trunk: Callable
+    plan: Callable
+    rest: Callable
+    idle_improvement: Callable
+    read: Callable          # = _read
+    worker_cls: Callable    # = Worker
+    tally_cls: Callable     # = Tally
+    state: Path             # = STATE
+    config: Path            # = CONFIG
+    stop: Any               # = _stop (the Event object)
+    run: dict               # = _run  (the dict object)
+    run_lock: Any           # = _run_lock
+    cfg_seen: dict          # = _cfg_seen
+    drain_reason: dict      # = _drain_reason
 
 
 def allowance_recheck(c):
@@ -166,3 +229,276 @@ def hours_left(hours):
         if hours is None or left < hours:
             return left
     return hours
+
+
+def start(c, hours=None, max_tasks=None, awake=False, *, d):
+    if os.environ.get("FLINT_RUN_DEADLINE") and d.hours_left(hours) is None:
+        d.log("the shift this daemon was restarted into is already over; not starting")
+        return
+    hours = d.hours_left(hours)
+    if hours and not os.environ.get("FLINT_RUN_DEADLINE"):
+        # Fix the end of the shift now, once. Every later restart inherits this exact time, so
+        # a run that restarts ten times still ends when the first start said it would.
+        os.environ["FLINT_RUN_DEADLINE"] = str(time.time() + hours * 3600)
+    with open(d.state / "daemon.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit(f"another swarm daemon is already running on this repository.{d.holder()}")
+        (d.state / "daemon.pid").write_text(json.dumps(
+            {"pid": os.getpid(), "started": time.time(), "goal": d.read_goal(c)[:200],
+             "repo": str(Path(c["repo"]).expanduser().resolve()), "config": str(d.config)}))
+        d.stop.clear()
+        run_id = os.environ.get("FLINT_RUN_ID") or uuid.uuid4().hex
+        os.environ["FLINT_RUN_ID"] = run_id
+        try:
+            saved_run = json.loads((d.state / "run.json").read_text())
+        except (OSError, ValueError):
+            saved_run = {}
+        with d.run_lock:
+            d.run.clear()
+            d.run.update(saved_run if saved_run.get("id") == run_id else
+                        {"id": run_id, "started": time.time(), "blocked_seconds": 0,
+                         "requests_started": 0})
+            # Reconcile provider vs local at run boundaries (work order §12). The local
+            # count is the sidecar-backed sum; the provider deltas are OpenRouter's own
+            # daily free-request counters, so a restart mid-day still shows the leftover.
+            info = d.account()
+            q = ((info or {}).get("free_model_daily_requests") or {})
+            provider_now = q.get("used") if isinstance(q.get("used"), int) else None
+            if d.run.get("provider_before") is None and provider_now is not None:
+                d.run["provider_before"] = provider_now
+            if d.run.get("provider_last") is not None and provider_now is not None:
+                d.run["provider_delta_since_last"] = max(0, provider_now - d.run["provider_last"])
+            d.run["provider_last"] = provider_now
+            d.run.update(state="Running", stop_reason=None,
+                        deadline=float(os.environ["FLINT_RUN_DEADLINE"]) if os.environ.get("FLINT_RUN_DEADLINE") else None)
+        try:
+            d.preflight(c)
+        except BaseException as exc:
+            d.stop.set()
+            with d.run_lock:
+                d.run["stop_reason"] = f"Startup failed: {type(exc).__name__}: {exc}"
+            d.run_status([], c)
+            (d.state / "daemon.pid").unlink(missing_ok=True)
+            raise
+        if awake:
+            d.keep_awake()
+        timer = None
+        if hours:
+            # Preflight can run a multi-minute baseline suite. It consumes the shift,
+            # too; neither startup verification nor self-restarts may extend the deadline.
+            seconds = hours * 3600
+            try:
+                seconds = min(seconds, max(0, float(os.environ["FLINT_RUN_DEADLINE"]) - time.time()))
+            except (KeyError, ValueError):
+                pass
+            timer = threading.Timer(seconds, d.shutdown)
+            timer.daemon = True
+            timer.start()
+        signal.signal(signal.SIGTERM, lambda *_: d.shutdown())
+        # A shell starting a job in the background hands it SIGINT set to SIG_IGN, and CPython
+        # keeps an inherited SIG_IGN rather than installing its own handler. So a daemon
+        # launched with `&` or nohup — which is how every shift is started — silently ignored
+        # `swarm stop` and the panel's Stop button. Taking the signal back makes them work.
+        signal.signal(signal.SIGINT, lambda *_: d.shutdown())
+        try:
+            d.run_daemon(c, max_tasks, hours=hours)
+        finally:
+            if timer:
+                timer.cancel()
+            d.shutdown()
+            with d.run_lock:
+                if d.run.get("deadline") and time.time() >= d.run["deadline"]:
+                    d.run["stop_reason"] = "Shift deadline reached"
+                # Bank the run-level reconciliation at the stop boundary (work order §12).
+                # Provider deltas come from OpenRouter's own counters; local attempts come
+                # from the request sidecars. Differences are shown, never assigned.
+                last_provider = d.run.get("provider_last")
+                if isinstance(last_provider, int):
+                    d.run["provider_at_stop"] = last_provider
+                local_total = int(d.run.get("requests_started", 0))
+                paid_total = sum(int(a.get("paid_requests") or 0) for a in
+                                 d.read(d.state / "journal.jsonl")
+                                 if a.get("event") == "attempt" and a.get("run_id") == d.run.get("id"))
+                d.run["reconcile"] = Reconcile.summary(
+                    [],  # local rows are already summed in requests_started
+                    provider_before=d.run.get("provider_before"),
+                    provider_after=last_provider,
+                    paid_requests=paid_total)
+                d.run["reconcile"]["locally_observed"] = local_total
+                d.journal("run_stop", stop_reason=d.run.get("stop_reason"),
+                        requests_local=local_total,
+                        reconcile=d.run.get("reconcile"))
+            d.run_status([], c)
+            (d.state / "daemon.pid").unlink(missing_ok=True)
+            (d.state / "now.json").unlink(missing_ok=True)
+            d.log("stopped. `swarm report` summarises the run.")
+
+
+def run_daemon(c, max_tasks=None, hours=None, *, d):
+    repo = Path(c["repo"])
+    budget = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
+                    owner_window=c.get("owner_window", ["00:00", "00:00"]))
+    q, stop, tally = d.queue_for(c), d.stop, d.tally_cls(max_tasks)
+    ledger = Ledger(d.state / "learn.json")
+    q.recover()
+    d.note_interrupted(c, q)
+    d.prune_attempts(int(c.get("keep_attempts", 300)))
+    d.log(f"swarm up — repo={repo.name} trunk={d.trunk_name(c)} workers={c['workers']}")
+    d.log(f"config: {d.config} ({d.config_kind()})")
+    d.log(json.dumps(budget.snapshot()))
+    # A stale local counter is the one thing that can stall the swarm on startup or push
+    # every turn to a paid model: flint counts failed requests the provider never charged,
+    # and the count survives restarts. OpenRouter's daily free-request counter is the
+    # truth, so reconcile it now, once, before any turn is routed (work order §12).
+    d.resync_allowance(c, budget)
+    # Rests persist in learn.json across runs; say so, or a fresh start looks stuck.
+    live = set(d.pool(c))
+    for model, until, why in ledger.resting():
+        if model in live:
+            d.log(f"{model} is resting until {dt.datetime.fromtimestamp(until):%H:%M:%S} ({why[:120]})")
+
+    d.cfg_seen["mtime"] = d.config_mtime()     # so the first check is a real change, not this one
+    source = d.source_fingerprint()
+    restart_for, last_restart = [], time.time()
+    d.drain_reason["stop_requested"] = False
+    try:
+        signal.signal(signal.SIGUSR1, lambda *_: d.drain(tally))
+        d.log("edit the config to change settings without a restart; "
+            f"`swarm stop --drain` or `kill -USR1 {os.getpid()}` stops after this task")
+    except ValueError:
+        pass                                # not the main thread; a bounded run in a test
+    if c.get("roadmap_file"):
+        d.dispatch_roadmap(c, q)
+    workers = [d.worker_cls(i, c, q, budget, stop, ledger, tally) for i in range(c["workers"])]
+    for w in workers:
+        w.start()
+    last_plan, last_sync, last_beat, dry_runs, plan_fails = 0.0, time.time(), time.time(), 0, 0
+    last_bugs = 0.0
+    said = {}
+    try:
+        while not stop.is_set():
+            if tally.drain.is_set():
+                while any(w.is_alive() for w in workers) and not stop.is_set():
+                    d.write_now(workers, c)
+                    stop.wait(1)
+                if restart_for and d.drain_reason["stop_requested"]:
+                    d.log(f"not restarting into {', '.join(restart_for)}: this run was asked to "
+                        "stop, and a stop means stop")
+                    d.journal("self_restart_skipped", changed=restart_for, reason="stop requested")
+                    restart_for = []
+                if restart_for:
+                    # Everything is finished and nothing is running: the only safe moment.
+                    d.restart_into_new_code(restart_for)
+                    restart_for = []          # it refused; carry on with the code we have
+                    tally.drain.clear()
+                    d.run.update(state="Running", stop_reason=None)
+                    workers = [d.worker_cls(i, c, q, budget, stop, ledger, tally)
+                               for i in range(c["workers"])]
+                    for w in workers:
+                        w.start()
+                    continue
+                d.log(f"finished {tally.n} task(s); stopping")
+                break
+            # The free allowance can run out with the queue empty and nothing in flight — no
+            # worker ever calls flint() to notice, so the gate that stops a running turn
+            # (above, in flint()) never fires. Catch that here too, once a tick, so a swarm
+            # that starts already out of free requests doesn't just idle until midnight.
+            if not tally.drain.is_set() and d.quota_exhausted(c, budget):
+                d.log("free allowance exhausted with no usable fallback — finishing any "
+                    "task(s) in flight, then stopping (set shutdown_on_quota_exhausted to "
+                    "\"wait\" or \"paid\" to keep the daemon up instead)")
+                d.journal("quota_exhausted_shutdown", reason=budget.check()[2], mode=d.quota_mode(c))
+                d.drain(tally)
+                continue
+            # An editor that autosaves must not be able to thrash the daemon.
+            if (not restart_for and c.get("restart_on_change", True)
+                    and time.time() - last_restart > c.get("restart_min_interval", 300)):
+                changed = d.source_changed(source)
+                if changed:
+                    source, restart_for, last_restart = d.source_fingerprint(), changed, time.time()
+                    d.log(f"the harness changed on disk ({', '.join(changed)}); finishing the "
+                        "task(s) in flight, then restarting into it")
+                    d.journal("source_changed", changed=changed)
+                    d.drain(tally, stop=False)
+            if time.time() - last_sync > 900:
+                last_sync = time.time()
+                d.sync_usage(d.account())
+            if time.time() - last_bugs > 300:
+                last_bugs = time.time()
+                try:
+                    new = [] if c.get("roadmap_file") else d.import_bugs(c, q)
+                    if new:
+                        d.log(f"queued {len(new)} player bug report(s): "
+                            + "; ".join(t["title"][:60] for t in new))
+                except Exception as e:      # a player's report must never stop the run
+                    d.log(f"could not read the bug reports: {type(e).__name__}: {e}")
+            d.report_progress(workers, said)
+            d.write_now(workers, c)
+            if time.time() - last_beat > 3600:
+                last_beat = time.time()
+                d.log(f"heartbeat {json.dumps(budget.snapshot())}")
+            # Planning costs requests like anything else, so it is rate-limited
+            # and backs off when it stops producing new work.
+            cooldown = c.get("plan_cooldown", 600) * (2 ** min(dry_runs, 4))
+            if c.get("roadmap_file"):
+                try:
+                    d.dispatch_roadmap(c, q)
+                except Exception as exc:
+                    d.log(f"roadmap dispatch blocked: {exc}")
+            if (c.get("auto_plan", True) and not c.get("roadmap_file") and len(q.ready()) < c["workers"] and time.time() - last_plan > cooldown
+                    and d.can_take_a_turn(c, budget)):
+                last_plan = time.time()
+                try:
+                    d.sync_trunk(c)
+                    added = d.plan(c, q, budget, c.get("plan_batch", 5), ledger)
+                    plan_fails = 0
+                    dry_runs = 0 if added else dry_runs + 1
+                    if not added:
+                        d.log(f"planner added nothing — next attempt in "
+                            f"{c.get('plan_cooldown', 600) * 2 ** min(dry_runs, 4) / 60:.0f}m")
+                except (StepLimit, ModelError) as e:
+                    # A botched plan says nothing about whether work remains: redraw a
+                    # (now less likely) model soon, and back off only on a losing streak.
+                    plan_fails += 1
+                    if plan_fails < 4:
+                        last_plan = time.time() - cooldown + 60
+                        d.log(f"planner failed ({type(e).__name__}: {str(e).splitlines()[0][:120]}); "
+                            "redrawing in 1m")
+                    else:
+                        plan_fails, dry_runs = 0, dry_runs + 1
+                        d.log("planner failed 4 times in a row; backing off")
+                except CapReached:
+                    d.log("cap reached while planning — sleeping")
+                    stop.wait(60)
+                except ProviderDown as e:
+                    d.log(f"planner: {d.rest(ledger, e)}; redrawing another model")
+                    last_plan = 0.0
+                except NoCredits as e:
+                    d.log(f"out of credits: {e}")
+                    d.shutdown()
+                except Exception as e:
+                    d.log(f"planner error: {e}")
+                    dry_runs += 1
+            # Last, and only into genuinely empty time: `idle_ready` stands this down for any
+            # assigned work, anything in flight, any held roadmap packet, and the last half
+            # hour of the shift. It spends the same allowance as every other turn.
+            if c.get("idle_improvement", True) and not max_tasks:
+                try:
+                    d.idle_improvement(c, q, budget, ledger, hours=hours)
+                except (CapReached, ProviderDown):
+                    pass                    # the allowance or the provider; not our business
+                except NoCredits as e:
+                    d.log(f"out of credits: {e}")
+                    d.shutdown()
+                except Exception as e:      # work nobody asked for must never stop a run
+                    d.log(f"idle improvement error: {type(e).__name__}: {e}")
+            stop.wait(min(10, c.get("tick", 90)) if not max_tasks else 5)
+    except KeyboardInterrupt:
+        d.log("shutting down")
+    finally:
+        d.shutdown()
+        for w in workers:
+            w.join(timeout=10)
+
