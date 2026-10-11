@@ -103,6 +103,23 @@ class RepoAimingTests(RepoCase):
         self.assertEqual((args.repo, args.drain), ("/x", True))
 
 
+class PerRepositoryTurnBookTests(RepoCase):
+    """Each repository's RuntimeContext has its own turn counters (review finding on P8c)."""
+
+    def test_two_repositories_do_not_share_turn_counters(self):
+        other = RepoAimingTests.other_repo(self)
+        a = swarmd.use_repo(swarmd.aimed_at(swarmd.load_cfg(), str(self.repo)))
+        swarmd.count_edits("w0", 3)
+        b = swarmd.use_repo(swarmd.aimed_at(swarmd.load_cfg(), str(other)))
+        self.assertIsNot(a.turns, b.turns)
+        self.assertEqual(swarmd.count_edits("w0"), 0)
+        swarmd.count_edits("w0", 1)
+        again = swarmd.use_repo(swarmd.aimed_at(swarmd.load_cfg(), str(self.repo)))
+        self.assertIs(again.turns, a.turns)
+        self.assertEqual(swarmd.count_edits("w0"), 3)
+        self.assertIs(swarmd._ran_on, a.turns.ran_on)
+
+
 if __name__ == "__main__":
     import unittest
     unittest.main()

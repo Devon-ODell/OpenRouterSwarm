@@ -220,11 +220,13 @@ _view_lock = threading.RLock()
 _processes = set()
 _stop = threading.Event()
 _sync_failed = {}
-_study_lock = threading.Lock()
-_turns = TurnBook(lock=_study_lock)   # per-worker turn accounting; the RuntimeContext carries this same book
+# Per-worker turn accounting, one TurnBook per repository: use_repo() points `_turns` (and the
+# compatibility aliases below) at the selected repository's book, and that repository's
+# RuntimeContext carries the same object. Before any use_repo() it is an unselected book.
+_turn_books = {}      # repository slug -> its TurnBook
+_turns = TurnBook()
 _study_calls = _turns.study_calls
 _edit_calls = _turns.edit_calls
-_request_calls = _turns.request_calls
 _charges = _turns.charges
 _held = {}            # worker -> when it last said it was waiting for the allowance
 _waiting = {}         # worker -> why it is not working, or absent while it is
@@ -495,7 +497,16 @@ def use_repo(c):
     logs.mkdir(parents=True, exist_ok=True)
     context = _build_context(c, slug, state, logs)
     SLUG, STATE, LOGS = slug, state, logs
+    _select_turns(context.turns)
     return context
+
+
+def _select_turns(book):
+    """Bind the per-worker counter globals to `book`, one repository's TurnBook."""
+    global _turns, _study_calls, _edit_calls, _charges, _ran_on, _active_turns, _turn_logs
+    _turns = book
+    _study_calls, _edit_calls, _charges = book.study_calls, book.edit_calls, book.charges
+    _ran_on, _active_turns, _turn_logs = book.ran_on, book.active_turns, book.turn_logs
 
 
 def _build_context(c, slug, state, logs):
@@ -521,7 +532,7 @@ def _build_context(c, slug, state, logs):
         run_state=run_state,
         processes=ProcessRegistry(stop=stop),
         stop=stop,
-        turns=_turns)
+        turns=_turn_books.setdefault(slug, TurnBook()))
 
 
 def wt_root():
