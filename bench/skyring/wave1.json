@@ -1,0 +1,102 @@
+{
+  "benchmark": "skyring",
+  "wave": 1,
+  "repo": "/Users/devonodell/Desktop/internetmoney/video-games/SkyRing",
+  "base_commit": "6f7c210",
+  "_comment": "Fixed packets so runs over time are comparable. Sources: SkyRing swarm/tasks.json (dump-independent tasks only), narrowed to one observable outcome each. Every acceptance criterion is checked by the repository's own gate: python3 tools/verify.py --profile local (includes cargo test --all-targets and the C ABI check) plus python3 -m unittest discover -s tools/tests.",
+  "tasks": [
+    {
+      "ref": "ir-validator",
+      "backlog": "ir-schema-v1",
+      "kind": "feature",
+      "priority": 3,
+      "title": "Add a stdlib validator for combat IR v1 documents",
+      "detail": "Create tools/combat_ir.py exposing validate(doc: dict) -> list[str] (an empty list means valid) and a CLI `python3 tools/combat_ir.py validate FILE` that prints each error and exits 1 on any. Python standard library only: no jsonschema. An IR v1 document is a JSON object: {\"ir_version\": 1, \"provenance\": {\"source\": \"synthetic\" or \"owner\", \"generator\": non-empty string, \"data_fingerprint\": string or null}, \"units\": {\"time\": \"s\", \"distance\": \"m\", \"angle\": \"deg\"}, \"actions\": [ {\"id\": non-empty string, unique, \"duration_s\": number > 0, \"stamina_cost\": number >= 0, \"iframes_s\": [[start, end], ...], \"hit_windows_s\": [[start, end], ...], \"cancel_windows_s\": [[start, end], ...], \"root_motion_m\": [[t_s, dx, dy], ...]} ]}. Rules: every window has 0 <= start < end <= duration_s; root_motion times are within [0, duration_s] and increasing; units must be exactly the values above; provenance.source \"owner\" requires a non-null data_fingerprint. The Charter forbids porting Elden Ring's absolute damage model, so reject any key, at any depth, whose lower-cased name is one of damage, attack_rating, ar, hp, health, defense, defence, scaling, with an error containing the words \"absolute damage\". Add fixtures/ir/v1/synthetic_colossal_sword.json: a valid synthetic document with at least three actions (a light attack, a heavy attack and a roll with i-frames). Add tools/tests/test_combat_ir.py in the style of tools/tests/test_owner_data.py (it inserts tools/ on sys.path). Touch only those three files.",
+      "acceptance": [
+        "python3 -m unittest discover -s tools/tests passes and includes tools/tests/test_combat_ir.py",
+        "validate() returns [] for fixtures/ir/v1/synthetic_colossal_sword.json",
+        "Adding \"damage\": 300 to any action makes validate() return an error containing \"absolute damage\"",
+        "A document missing provenance, or with units.time \"ms\", or with a hit window ending after duration_s, each returns a non-empty error list (one test each)",
+        "python3 tools/verify.py --profile local passes"
+      ],
+      "allowed_paths": ["tools/combat_ir.py", "tools/tests/test_combat_ir.py", "fixtures/ir/v1/synthetic_colossal_sword.json"]
+    },
+    {
+      "ref": "determinism-trace",
+      "backlog": "deterministic-input-traces",
+      "kind": "test",
+      "priority": 3,
+      "title": "Prove the combat core is byte-stable over a scripted input trace",
+      "detail": "Add the Rust integration test file core/tests/determinism.rs. It drives er_combat_core's public ErCombat API (core/src/ffi.rs: ErCombat::new, update(dt, &ErInput, &ErWorld)) with a fixed scripted trace of 600 updates at dt = 1.0/60.0: move forward for the whole trace, press and release dodge around tick 60, press light around tick 120, hold heavy from tick 180 to 240, hold guard from tick 300 to 360, with ErWorld.position fed back from the previous ErOutput.position and ground_z = 0. Record format!(\"{:?}\", output) for every tick (ErOutput derives Debug). Run the same trace twice from fresh ErCombat values and assert the two recordings are identical. Also assert the trace really exercised the core: at least one tick reports action_kind Roll, one LightAttack and one of HeavyCharge/HeavyAttack. Button edges: set `pressed = 1` only on the tick a button goes down and `released = 1` only on the tick it goes up, `held = 1` in between. Touch only core/tests/determinism.rs; do not change library code. If something in lib.rs is not public enough to write this test, stop and say so rather than widening the API.",
+      "acceptance": [
+        "core/tests/determinism.rs exists and cargo test --all-targets runs a test named scripted_trace_is_byte_stable that passes",
+        "The test asserts two full 600-tick recordings are equal",
+        "The test asserts the trace produced Roll, LightAttack and a heavy action",
+        "python3 tools/verify.py --profile local passes"
+      ],
+      "allowed_paths": ["core/tests/determinism.rs"]
+    },
+    {
+      "ref": "hit-arbitration-table",
+      "backlog": "incoming-hit-arbitration",
+      "kind": "test",
+      "priority": 2,
+      "title": "Pin how ErCombat::receive_hit classifies incoming hits",
+      "detail": "Add the Rust integration test file core/tests/hit_arbitration.rs with one test per ErHitResult outcome that ErCombat::receive_hit(from, low, hurt) can return (core/src/ffi.rs; the decision is made in Player::receive_hit in core/src/sim/player.rs). Put the player in each state by calling update() with scripted ErInput/ErWorld frames at dt = 1.0/60.0, as a game would: (1) Hit: standing idle, struck from the front; (2) Dodged: struck during a roll's invincible frames (ErOutput.invincible == 1 at the moment of the hit); (3) Blocked: guard held and raised (ErOutput.guarding == 1), struck from the front; (4) GuardBroken: guard held, struck from the front repeatedly until guarding fails; (5) Jumped: airborne from a jump and struck with low = true, if the core supports it; if reading player.rs shows that low hits are never jumped, document that in a comment and assert the actual result instead. Name the tests hit_when_idle, dodged_during_iframes, blocked_while_guarding, guard_breaks_under_pressure, low_hit_while_jumping. Touch only that file; do not change library code.",
+      "acceptance": [
+        "cargo test --all-targets runs the five named tests in core/tests/hit_arbitration.rs and they pass",
+        "Each test asserts the exact ErHitResult variant returned",
+        "dodged_during_iframes asserts ErOutput.invincible == 1 before calling receive_hit",
+        "python3 tools/verify.py --profile local passes"
+      ],
+      "allowed_paths": ["core/tests/hit_arbitration.rs"]
+    },
+    {
+      "ref": "evidence-fingerprint",
+      "backlog": "runtime-evidence-capture",
+      "kind": "feature",
+      "priority": 2,
+      "title": "Add an evidence fingerprint tool that never writes into tracked paths",
+      "detail": "Create tools/evidence.py with fingerprint(paths: list[Path], repo: Path) -> dict returning {\"commit\": output of git rev-parse HEAD, \"dirty\": bool from git status --porcelain, \"files\": {str(path): {\"sha256\": hex, \"bytes\": int}}, \"platform\": {\"system\", \"release\", \"machine\", \"python\"}}, and a CLI `python3 tools/evidence.py fingerprint FILE [FILE...] [--out PATH]` that writes that dict as indented JSON to PATH, defaulting to verification/out/evidence.json. Evidence must never be committed, so the CLI refuses (exit 2, message naming the path) when the output path is tracked by git or not ignored by git (use `git check-ignore -q` and `git ls-files --error-unmatch`). Standard library only. Add tools/tests/test_evidence.py in the style of tools/tests/test_owner_data.py, using a temporary git repository for the refusal cases. Touch only those two files.",
+      "acceptance": [
+        "python3 -m unittest discover -s tools/tests passes and includes tools/tests/test_evidence.py",
+        "A test checks the sha256 and byte count of a file whose content the test wrote",
+        "A test checks commit equals git rev-parse HEAD of the temporary repository",
+        "A test checks the CLI exits 2 when --out names a tracked file, and when it names a path that is not git-ignored",
+        "python3 tools/verify.py --profile local passes"
+      ],
+      "allowed_paths": ["tools/evidence.py", "tools/tests/test_evidence.py"]
+    },
+    {
+      "ref": "host-stamina-pool",
+      "backlog": "skyrim-stamina-authority",
+      "kind": "feature",
+      "priority": 2,
+      "title": "Let Skyrim supply the stamina pool through ErWorld",
+      "detail": "Skyrim must own the stamina pool (AGENTS.md ownership table). Append two f32 fields to the END of the #[repr(C)] struct ErWorld in core/src/ffi.rs: stamina_current and stamina_max, documented as the actor's live stamina and maximum in Skyrim's own units. Append the same two `float` fields, in the same order, to the end of ErWorld in core/include/er_combat.h, so tools/verify.py's c_abi gate (sizes and offsets) still matches. In ErCombat::update, when world.stamina_max > 0, set the simulation's pool before stepping to (stamina_current / stamina_max).clamp(0, 1) * the core's MAX_STAMINA; when stamina_max <= 0 keep today's internal pool (so ErWorld::default() behaves exactly as now). Do not change any existing field's order, type or meaning. Add tests in core/src/sim/tests.rs or a new core/tests/host_stamina.rs: (1) with stamina_current 5 of stamina_max 100, pressing and releasing dodge does not start a roll; (2) with 100 of 100 it does; (3) with stamina_max 0 the existing behavior is unchanged (a roll starts from a fresh ErCombat).",
+      "acceptance": [
+        "python3 tools/verify.py --profile local passes, including its c_abi check",
+        "ErWorld in core/src/ffi.rs and core/include/er_combat.h both end with stamina_current, stamina_max",
+        "A test shows a roll is refused with a host pool of 5/100 and allowed with 100/100",
+        "A test shows ErWorld::default() (stamina_max 0) keeps the internal pool behavior"
+      ],
+      "allowed_paths": ["core/src/ffi.rs", "core/include/er_combat.h", "core/src/sim/tests.rs", "core/tests/host_stamina.rs", "core/src/sim/player.rs"]
+    },
+    {
+      "ref": "stamina-spent-report",
+      "backlog": "skyrim-stamina-authority",
+      "kind": "feature",
+      "priority": 1,
+      "depends_on": ["host-stamina-pool"],
+      "title": "Report the stamina each update spent so Skyrim can charge it",
+      "detail": "Skyrim owns the pool, so the core must report what it spent instead of keeping the debit. Append one f32 field stamina_spent to the END of the #[repr(C)] struct ErOutput in core/src/ffi.rs and the matching `float stamina_spent;` to the end of ErOutput in core/include/er_combat.h (tools/verify.py's c_abi gate checks sizes and offsets). It is the total stamina, in the same units as ErWorld.stamina_max, that the simulation spent during that update call (rolls, backsteps, jumps, attack hits, sprint drain, guard hits): scale the core's internal spend by stamina_max / MAX_STAMINA when the host supplies a pool, and report the internal amount when it does not. Track the spend inside Player (for example a per-step counter reset at the start of each update) rather than diffing the pool, so regeneration does not hide costs. Tests: (1) with a host pool of 100/100, the update in which a roll starts reports stamina_spent == ROLL_COST scaled to the host units, and the next idle update reports 0; (2) sprinting for one second with in_combat = 1 reports a total close to SPRINT_DRAIN scaled (within 5%).",
+      "acceptance": [
+        "python3 tools/verify.py --profile local passes, including its c_abi check",
+        "ErOutput in core/src/ffi.rs and core/include/er_combat.h both end with stamina_spent",
+        "A test shows the roll's update reports the roll cost and the following idle update reports 0",
+        "A test shows one second of combat sprinting reports SPRINT_DRAIN within 5%"
+      ],
+      "allowed_paths": ["core/src/ffi.rs", "core/include/er_combat.h", "core/src/sim/tests.rs", "core/tests/host_stamina.rs", "core/src/sim/player.rs"]
+    }
+  ]
+}
