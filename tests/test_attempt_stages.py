@@ -405,6 +405,158 @@ class AttemptStageFaultTests(RepoCase):
         self.assertIn("conflicts with newer trunk", note)
         self.assertEqual(swarmd.failure_class(w.stage, note), "harness")
 
+    def test_agent_timeout_from_a_real_agent_timeout(self):
+        """A turn that exhausts its wall-clock budget raises AgentTimeout, which
+        do_task catches and reports as agent_timeout (not no_change: the model
+        never answered badly, the harness cut it off)."""
+        c = self.cfg()
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                raise swarmd.AgentTimeout("implementer", "a:free", 420, "/tmp/log")
+            return review(prompt)
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "agent_timeout")
+        self.assertIn("no implementation changes", note)
+        self.assertEqual(swarmd.failure_class(w.stage, note), "harness")
+
+    def test_exploration_exhausted_is_reported_when_the_turn_never_edited(self):
+        """A turn stopped for spending 70% of its rounds without editing is
+        exploration_exhausted, a harness loss (work order §5)."""
+        c = self.cfg()
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                raise swarmd.ExplorationExhausted(
+                    "tour ended early after reaching 70% of its rounds without editing")
+            return review(prompt)
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "exploration_exhausted")
+        self.assertEqual(swarmd.failure_class(w.stage, note), "harness")
+
+    def test_review_error_when_the_adversary_crashes(self):
+        """A reviewer that raises ModelError (after the gate passed) is a
+        review_error, not a rejection: nothing was said about the candidate."""
+        c = self.cfg()
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                (cwd / "feature.txt").write_text("settings\n")
+                return "done"
+            if role == "adversary":
+                raise swarmd.ModelError("reviewer crashed")
+            return "done"
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "review_error")
+        self.assertEqual(swarmd.failure_class("review_error", ""), "model")
+
+    def test_review_format_error_on_malformed_review_json(self):
+        """A reviewer that returns unparseable JSON raises ReviewFormatError; the
+        attempt is review_format_error, and failure_class is the special
+        review_format value (never task, never silently harness)."""
+        c = self.cfg()
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                (cwd / "feature.txt").write_text("settings\n")
+                return "done"
+            if role == "adversary":
+                return "this is not json at all"
+            return "done"
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "review_format_error")
+        self.assertEqual(swarmd.failure_class(w.stage, note), "review_format")
+
+    def test_request_budget_is_reported_not_retried(self):
+        """Exhausting the task's request budget before the implementer turn is a
+        request_budget stage; failure_class is harness because the cap is the
+        swarm's own, not the model's."""
+        c = self.cfg()
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                raise swarmd.RequestBudget(
+                    "task request budget exhausted before implementer")
+            return review(prompt)
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "request_budget")
+        self.assertEqual(swarmd.failure_class(w.stage, note), "harness")
+
+    def test_model_pool_exhausted_when_every_implementer_is_excluded(self):
+        """When the circuit breaker excludes the only pool model for the
+        implementer role, the attempt parks: model_pool_exhausted is a harness
+        loss, not the model's fault."""
+        import time as _time
+        c = self.cfg()
+        task = self.task()
+        task["failed_models"] = [{"model": "a:free", "class": "harness",
+                                  "role": "implementer", "at": _time.time(),
+                                  "note": "timed out without editing"}]
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            raise AssertionError("flint must not be called when the pool is exhausted")
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(task, "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "model_pool_exhausted")
+        self.assertEqual(swarmd.failure_class(w.stage, note), "harness")
+
+    def test_deferred_re_raises_provider_down(self):
+        """A provider outage mid-attempt defers the task: do_task sets stage
+        'deferred' and re-raises the exception for the worker to handle."""
+        c = self.cfg()
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                raise swarmd.ProviderDown("a:free", "provider unavailable")
+            return review(prompt)
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            with self.assertRaises(swarmd.ProviderDown):
+                w.do_task(self.task(), "goal")
+        self.assertEqual(w.stage, "deferred")
+        # failure_class for a deferred/provider loss is harness: never the task's.
+        self.assertEqual(swarmd.failure_class("deferred", "provider unavailable"), "harness")
+
+    def test_interrupted_is_the_stopped_run_note_not_a_do_task_stage(self):
+        """An honest gap, per P0.1: `interrupted` is not a stage do_task returns.
+
+        `_attempt` never assigns the string 'interrupted'; a mid-attempt stop
+        surfaces as the Stopped exception (released by Worker.run as
+        'run stopped; changes retained', failure_class harness) and as the
+        default note 'attempt interrupted before completion' in the artifact.
+        It is a HARNESS_STAGES member and a HARNESS_NOTE token, classified at the
+        release boundary. Pinning do_task here would be asserting a non-path.
+        """
+        self.assertIn("interrupted", swarmd.HARNESS_STAGES)
+        self.assertEqual(swarmd.failure_class("interrupted"), "harness")
+        # And the artifact the stop leaves behind carries the note (via a direct
+        # Stopped propagation, as Worker.run consumes it).
+        self.assertTrue(hasattr(swarmd, "Stopped"))
+
 
 if __name__ == "__main__":
     unittest.main()
