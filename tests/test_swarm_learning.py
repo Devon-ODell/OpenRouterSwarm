@@ -340,8 +340,10 @@ class TrunkTests(SwarmBase):
 class ReinforcementTests(SwarmBase):
     JUDGE = json.dumps({"impact": 9, "creativity": 9, "quality": 8, "breakthrough": True,
                         "why": "new capability", "lesson": "Model levels as data so new mechanics need no code",
-                        "follow_ups": [{"title": "Level editor", "detail": "round-trips a level"},
-                                       {"title": "Level sharing", "detail": "export and import"}]})
+                        "follow_ups": [{"title": "Level editor", "detail": "round-trips a level",
+                                        "acceptance": ["a test round-trips a level"]},
+                                       {"title": "Level sharing", "detail": "export and import",
+                                        "acceptance": ["a test exports then imports a level"]}]})
 
     def test_breakthrough_is_reinforced_recorded_and_followed_up(self):
         repo, _ = self.repo()
@@ -364,6 +366,7 @@ class ReinforcementTests(SwarmBase):
         follow = [t for t in q.pending() if t.get("origin") == "follow_up"]
         self.assertEqual(sorted(t["title"] for t in follow), ["Level editor", "Level sharing"])
         self.assertTrue(all(t["priority"] == 2 and t["persona"] == "inventor" for t in follow))
+        self.assertTrue(all(t["acceptance"] for t in follow))
         swarmd.ensure_trunk(c)
         report = swarmd.build_report(c)
         self.assertIn("★ **Data-driven levels**", report)

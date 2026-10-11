@@ -59,7 +59,7 @@ class PromptsDirectTests(unittest.TestCase):
         "ARCHITECT": "df1b4dde38c1b6ae2ae722e741f56b46c8ed113922e0d03b2c7c2d085079f280",
         "IMPLEMENTER": "6bb22cff45ccd5d0f91e1ed8fd94d5921f0064ced4495ec73b12e5f3dd242652",
         "ADVERSARY": "89fe20a6cb9ad3e8dd90af54277c7d23e4b144388a0ff13159d8cdf41b689716",
-        "JUDGE": "3323ec0af928aa32cec86cbb04816afde16741c194a83a88672ee77df24a5ad5",
+        "JUDGE": "646c91c140f704df01c24e01d08a6628bd760cc33f4774e1ee59e60214c547c2",  # 2026-10-11: follow-ups need runnable criteria and paths
         "PLANNER": "b20b2a234f7fb842659d213492ca6b266c69deea7efcc5897a74fff529a1dec3",
         "DECOMPOSER": "1999ec882794c175756c961bad70eccdb83780996aa5b6c2f0e2bbbe5fab46c6",
         "PRIORITIES": "62e2f9750e7e5b3154b4cbf812447e44a0fd804c0b3d41cecb3090e7e05ad671",
