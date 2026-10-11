@@ -20,7 +20,7 @@ The supervisor never merges into your checkout: accepted work accumulates on
 merge what you want. Agents and tests run in a write-restricting macOS
 sandbox; it contains accidents, not a determined attacker.
 """
-import argparse, datetime as dt, fcntl, hashlib, json, os, plistlib, random, re, shlex, shutil, signal
+import datetime as dt, fcntl, hashlib, json, os, plistlib, random, re, shlex, shutil, signal
 import subprocess, sys, threading, time, traceback, uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -97,6 +97,11 @@ try:  # supervisor resolves against the same module identity as the daemon
     from . import supervisor
 except ImportError:  # pragma: no cover - exercised by bridge.py / direct swarmd.py execution
     import supervisor
+
+try:  # cli resolves against the same module identity as the daemon
+    from . import cli
+except ImportError:  # pragma: no cover - exercised by bridge.py / direct swarmd.py execution
+    import cli
 
 ROUND_LINE = reporting.ROUND_LINE
 
@@ -2006,79 +2011,16 @@ def cmd_models(a):
         print(f"\nwrote {len(c['models'])} models to {CONFIG}")
 
 
+def _cli_handlers():
+    """Sub-command handlers, read now so a test's patch of any cmd_* bites."""
+    return {"grind": cmd_grind, "run": cmd_run, "init": cmd_init, "status": cmd_status,
+            "report": cmd_report, "add": cmd_add, "plan": cmd_plan, "service": cmd_service,
+            "stop": cmd_stop, "wake": cmd_wake, "models": cmd_models,
+            "exceptions": cmd_exceptions}
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    g = sub.add_parser("grind", help="run nonstop until Ctrl-C (keeps the Mac awake)")
-    g.add_argument("repo", nargs="?", help="target Git repository (default: configured one)")
-    g.add_argument("--goal", help="what the project should become (stored with the swarm's state)")
-    g.add_argument("--new", metavar="DIR", help="start a new project in DIR for a problem with no codebase")
-    g.add_argument("--test-cmd", help="command that must pass for work to land")
-    g.add_argument("--hours", type=float, help="optional limit; default is no limit")
-    g.add_argument("--workers", type=int)
-    g.add_argument("--max-tasks", type=int, help="stop after finishing this many tasks")
-    g.set_defaults(fn=cmd_grind)
-    run = sub.add_parser("run", help="bounded run")
-    run.add_argument("--repo", help="target Git repository (default: configured one)")
-    run.add_argument("--hours", type=float, default=24, help="stop after this many hours (default 24)")
-    run.add_argument("--workers", type=int)
-    run.add_argument("--max-tasks", type=int)
-    run.set_defaults(fn=cmd_run)
-    init = sub.add_parser("init", help="write a tuned config + prov hooks for a repository (see --check)")
-    init.add_argument("repo", nargs="?", help="target Git repository")
-    init.add_argument("-n", "--check", action="store_true",
-                      help="print the repository's surroundings (nested repos, runtime deps, "
-                           "venv, node_modules) without writing a config")
-    init.set_defaults(fn=cmd_init)
-    st = sub.add_parser("status", help="what is running and where")
-    st.add_argument("--repo", help="target Git repository (default: configured one)")
-    st.set_defaults(fn=cmd_status)
-    r = sub.add_parser("report", help="what landed, breakthroughs, leaderboard, playbook")
-    r.add_argument("--repo", help="target Git repository (default: configured one)")
-    r.add_argument("--hours", type=float, default=24)
-    r.set_defaults(fn=cmd_report)
-    p = sub.add_parser("add")
-    p.add_argument("--repo", help="target Git repository (default: configured one)")
-    p.add_argument("title")
-    p.add_argument("--detail", default="")
-    p.add_argument("--kind", default="feature")
-    p.add_argument("--priority", type=int, default=1, help="hand-added tasks jump the queue (default 1)")
-    p.add_argument("--execution-class", choices=("standard", "fast"), default="standard",
-                   help="fast: explicit mechanical edit; no study/history, at most 4 rounds and 300s")
-    p.add_argument("--acceptance", action="append", metavar="TEXT",
-                   help="one thing the reviewer must verify; repeat for each (default: the detail)")
-    p.add_argument("--depends-on", action="append", metavar="TITLE_OR_ID", dest="depends_on",
-                   help="a task that must finish first, by exact title or id; repeat for each")
-    p.add_argument("--allow-test-changes", action="store_true", dest="allow_test_changes",
-                   help="this task may change or delete existing tests (e.g. removing a game "
-                        "and its tests). Only you can set this; the adversary is told.")
-    p.set_defaults(fn=cmd_add)
-    p2 = sub.add_parser("plan")
-    p2.add_argument("--repo", help="target Git repository (default: configured one)")
-    p2.add_argument("-n", type=int, default=5)
-    p2.set_defaults(fn=cmd_plan)
-    sv = sub.add_parser("service", help="a launchd agent that restarts this repository's swarm")
-    sv.add_argument("action", choices=("install", "status", "uninstall"))
-    sv.add_argument("--repo", help="the repository to grind (default: the configured one)")
-    sv.add_argument("--hours", type=float, help="stop after this many hours per run")
-    sv.add_argument("--goal", default="GOAL.md")
-    sv.add_argument("--autostart", action="store_true",
-                    help="also start at login and after a reboot. This daemon spends money, so "
-                         "it is off unless you ask for it.")
-    sv.set_defaults(fn=cmd_service)
-    st = sub.add_parser("stop", help="stop this repository's daemon")
-    st.add_argument("--drain", action="store_true",
-                    help="finish the task(s) in flight first, instead of killing them mid-turn")
-    st.set_defaults(fn=cmd_stop)
-    sub.add_parser("wake", help="end every model's rest now").set_defaults(fn=cmd_wake)
-    m = sub.add_parser("models", help="list free tool-capable models; --write sets the pool")
-    m.add_argument("--write", action="store_true")
-    m.set_defaults(fn=cmd_models)
-    ex = sub.add_parser("exceptions",
-                        help="show exceptions the harness swallowed (swallow.py recorder + journal errors)")
-    ex.set_defaults(fn=cmd_exceptions)
-    a = ap.parse_args()
+    a = cli.build_parser(_cli_handlers(), __doc__).parse_args()
     a.fn(a)
 
 
