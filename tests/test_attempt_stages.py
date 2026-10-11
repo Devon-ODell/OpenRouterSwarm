@@ -346,6 +346,40 @@ class AttemptStageFaultTests(RepoCase):
         self.assertEqual(w.stage, "rejected")
         self.assertEqual(swarmd.failure_class(w.stage, note), "task")
 
+    def test_rejected_exhausts_the_repair_middle(self):
+        """The same rejection with a repair budget: the adversary rejects, the
+        repair role runs, the repaired candidate is rejected with the same
+        signature, and the attempt returns `rejected` on the repeated signature.
+        This drives the gate/review/repair middle for the rejection path."""
+        c = self.cfg(max_repairs=1)
+        w = self.worker(c)
+        repair_turns = []
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                (cwd / "feature.txt").write_text("settings\n")
+                return "done"
+            if role == "repair":
+                repair_turns.append(role)
+                # A repair that does not address the blocker: the next review
+                # returns the same request_changes verdict (same signature), so
+                # the loop returns rejected on the repeated failure.
+                return "I attempted a repair"
+            if role == "adversary":
+                return review(prompt, "request_changes")
+            return "done"
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "rejected")
+        # The repair role really ran, and the rejection came back on the repeated
+        # signature, not on budget exhaustion alone.
+        self.assertEqual(len(repair_turns), 1)
+        self.assertGreaterEqual(w.role_calls, 2)
+        self.assertIn("repeated failure", note)
+        self.assertEqual(swarmd.failure_class(w.stage, note), "task")
+
     def test_weakened_tests_is_refused_and_origin_gated(self):
         """An implementer that guts an existing assertion is refused, and only a
         person (human/cursor origin) may ever authorise test changes."""
