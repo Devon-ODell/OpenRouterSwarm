@@ -72,6 +72,7 @@ def build_parser(handlers, description=None):
                          "it is off unless you ask for it.")
     sv.set_defaults(fn=handlers["service"])
     st = sub.add_parser("stop", help="stop this repository's daemon")
+    st.add_argument("--repo", help="target Git repository (default: configured one)")
     st.add_argument("--drain", action="store_true",
                     help="finish the task(s) in flight first, instead of killing them mid-turn")
     st.set_defaults(fn=handlers["stop"])

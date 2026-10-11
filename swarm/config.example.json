@@ -7,7 +7,6 @@
   "test_cmd": "__TEST_CMD__",
   "python": "__PYTHON__",
   "models": [
-    "inclusionai/ling-3.0-flash-fin",
     "qwen/qwen3.8-27b:free",
     "nex-agi/nex-n2.5-pro:free",
     "dots-studio/dots-3-note-preview:free",
@@ -40,7 +39,7 @@
     "00:00"
   ],
   "steps": {
-    "planner": 8,
+    "planner": 6,
     "architect": 0,
     "implementer": 10,
     "adversary": 5,

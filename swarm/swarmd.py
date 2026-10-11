@@ -338,7 +338,7 @@ def watch_config(c, budget=None):
             return []
         _cfg_seen["mtime"] = mtime
         try:
-            fresh = json.loads(CONFIG.read_text())
+            fresh = without_nulls(json.loads(CONFIG.read_text()))
         except (OSError, ValueError) as e:
             log(f"config changed but could not be read; keeping the running settings: {e}")
             return []
@@ -408,11 +408,27 @@ def load_cfg(repo=None):
     if not CONFIG.exists() and EXAMPLE.is_file() and CONFIG.parent == EXAMPLE.parent:
         CONFIG.write_text(EXAMPLE.read_text())
         log(f"created {CONFIG} from {EXAMPLE.name}")
-    return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+    return without_nulls(json.loads(CONFIG.read_text())) if CONFIG.exists() else {}
+
+
+def without_nulls(c):
+    """The config with every `null` setting treated as unset, so it falls back to its default.
+
+    Every reader does `c.get(key, default)`, which returns None for a key that is present but
+    null: `"goal_file": null` crashed the daemon at startup with a TypeError instead of using
+    GOAL.md. The dropped names are kept under `_nulls` so config_warnings can say so."""
+    if not isinstance(c, dict):
+        return c
+    nulls = sorted(k for k, v in c.items() if v is None)
+    out = {k: v for k, v in c.items() if v is not None and k != "_nulls"}
+    if nulls:
+        out["_nulls"] = nulls
+    return out
 
 
 def save_cfg(c):
     """Write back to whichever file this process loaded, per-repo file included."""
+    c = {k: v for k, v in c.items() if k != "_nulls"}
     tmp = CONFIG.with_suffix(".tmp")
     tmp.write_text(json.dumps(c, indent=2) + "\n")
     tmp.replace(CONFIG)
@@ -429,6 +445,22 @@ def cfg():
     if c.get("workers", 1) < 1:
         sys.exit("workers must be at least 1")
     return c
+
+
+def aimed_at(c, repo):
+    """`c` pointed at `repo`. A repository without a tuned file is served by the default config,
+    which names some other repository: `swarm stop --repo X` read X's config path and then
+    signalled the daemon of the repository config.json names. The bridge's config_for has
+    always applied this override; every `--repo` command now does too."""
+    resolved = str(Path(repo).expanduser().resolve())
+    if str(Path(c.get("repo", "")).expanduser().resolve()) == resolved:
+        return c
+    try:
+        branch = subprocess.run(["git", "-C", resolved, "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        branch = ""
+    return dict(c, repo=resolved, base_branch=branch if branch and branch != "HEAD" else "main")
 
 
 def python_for(c):
@@ -1354,6 +1386,9 @@ def config_warnings(c):
     fit its timeout gets the turn SIGKILLed mid-work, and a pool of paid ids under allow_paid
     means every turn is paid however much free allowance is left."""
     out = []
+    if c.get("_nulls"):
+        out.append(f"setting(s) {', '.join(c['_nulls'])} are null — treated as unset, so each "
+                   "uses its default; delete the key or give it a value")
     unknown = sorted(k for k in c if k not in KNOWN_KEYS and not k.startswith("_"))
     if unknown:
         out.append(f"unknown setting(s) {', '.join(unknown)} — nothing reads these, so they "
@@ -1568,9 +1603,12 @@ def build_report(c, hours=24):
 # ------------------------------------------------------------------ commands
 
 def _setup(a=None):
-    if a is not None and getattr(a, "repo", None):
-        use_config(a.repo)
+    repo = getattr(a, "repo", None) if a is not None else None
+    if repo:
+        use_config(repo)
     c = cfg()
+    if repo:
+        c = aimed_at(c, repo)
     use_repo(c)
     warn_config_mismatch(c["repo"], record=True)
     if a is not None and getattr(a, "workers", None):
@@ -1948,7 +1986,7 @@ def cmd_service(a):
 
 def cmd_stop(a):
     """Stop this repository's daemon: now, or after the task(s) in flight finish."""
-    _setup()
+    _setup(a)
     note = daemon_note()
     if not note:
         print("no swarm daemon is running on this repository")
