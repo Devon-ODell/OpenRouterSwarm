@@ -14,6 +14,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -429,14 +430,27 @@ class AttemptStageFaultTests(RepoCase):
         self.assertEqual(swarmd.failure_class("no_change", note, edited=None), "harness")
 
     def test_no_change_after_edit_calls_is_model(self):
-        """Edit calls that changed nothing are the model's doing — model."""
+        """Edit calls that changed nothing are the model's doing — model.
+
+        The edit calls are counted the same way the real turn-runner counts them
+        (swarmd.count_edits(worker, n), fed from the turn log's 'tool: edit_file'
+        lines): the fake implementer writes those lines to the worker's live turn
+        log and registers them through count_edits, then leaves the tree without a
+        diff. This drives the actual channel, not a raw dict seed."""
         c = self.cfg()
         w = self.worker(c)
 
         def fake(prompt, cwd, c_, role, *a):
             if role == "implementer":
-                # The turn called edit_file (3 calls) but the tree shows no diff.
-                swarmd._edit_calls["w0"] = 3
+                # The real turn-runner registers the worker's log under
+                # _turn_logs[w] then scans it for 'tool: edit_file' lines and
+                # tallies them into count_edits. Reproduce that channel exactly:
+                # three edit_file calls, no change to the tree.
+                logfile = swarmd.LOGS / f"w0-implementer-{time.time_ns()}.log"
+                swarmd._turn_logs["w0"] = logfile
+                logfile.write_text("tool: edit_file\n" * 3)
+                # Line 2156's tally: count_edits(worker, n_lines).
+                swarmd.count_edits("w0", 3)
                 return "done"
             return review(prompt)
 
@@ -445,6 +459,7 @@ class AttemptStageFaultTests(RepoCase):
         self.assertFalse(ok)
         self.assertEqual(w.stage, "no_change")
         self.assertIn("changed nothing", note)
+        # edited (info["edit_calls"]) is genuinely 3 via the system channel.
         self.assertEqual(swarmd.failure_class("no_change", note, edited=3), "model")
 
     def test_model_error_from_the_implementer(self):
