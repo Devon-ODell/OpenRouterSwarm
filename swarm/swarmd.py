@@ -1135,57 +1135,9 @@ def turn_round(worker):
 
 
 def write_now(workers, c=None):
-    """What the swarm is doing, for the panel's first line.
-
-    The panel's top line was a list of counters — free requests, a spend meter, a corpus chunk
-    count — none of which says whether the swarm is working or what on."""
-    rows, live = [], live_workers(workers)
-    for w in workers:
-        task, since = getattr(w, "task", None), getattr(w, "started", 0)
-        if not (task and since and w.is_alive()):
-            continue
-        rounds = turn_round(w.name)
-        # `doing` is "<role> with <model>" during a turn, but plain prose between turns
-        # ("running the tests (baseline)"). Splitting on the separator only when it is there
-        # keeps the gate from being reported as the name of the model.
-        role, _, model = (getattr(w, "doing", "") or "").partition(" with ")
-        rows.append({
-            "worker": w.name, "task": task.get("id"), "title": str(task.get("title", ""))[:120],
-            "role": role or None,
-            "model": _ran_on.get(w.name) or model or None,
-            "round": rounds and rounds[0], "rounds": rounds and rounds[1],
-            "since": since, "seconds": round(time.time() - since),
-            "doing": getattr(w, "doing", None), "waiting": _waiting.get(w.name)})
-        wvars = vars(w)
-        if "state" in wvars:
-            rows[-1]["state"] = wvars["state"]
-        clock = wvars.get("clock")
-        if isinstance(clock, BucketClock):
-            rows[-1]["buckets"] = clock.snapshot()
-    note = {"at": time.time(), "workers": rows}
-    if c is not None and _run.get("id"):
-        note["run"] = run_status(rows, c)
-    if not rows and c is not None:
-        ledger = Ledger(STATE / "learn.json")
-        resting = ledger.resting()
-        if resting and all(m in {m for m, _, _ in resting} for m in pool(c)):
-            first = min(u for _, u, _ in resting)
-            note["idle"] = "all models resting"
-            note["back"] = first
-        else:
-            # Only a worker that is still running can still be waiting. A reason left behind
-            # by a finished or replaced worker used to sit in the panel's idle line for the
-            # rest of the shift, describing an allowance hold that had long since cleared.
-            held = sorted(why for name, why in _waiting.items() if name in live)
-            if held:
-                note["idle"] = held[0]
-    tmp = (STATE / "now.json").with_suffix(".tmp")
-    try:
-        tmp.write_text(json.dumps(note))
-        tmp.replace(STATE / "now.json")
-    except OSError:
-        pass                              # a status line is never worth failing a run over
-    return note
+    return reporting.write_now(workers, c, state=STATE, ran_on=_ran_on, run=_run,
+                               waiting_books=_waiting, pool=pool, live_workers=live_workers,
+                               turn_round=turn_round, run_status=run_status)
 
 
 def mark_progress(kind):
@@ -1193,88 +1145,13 @@ def mark_progress(kind):
 
 
 def run_status(workers, c):
-    now = time.time()
-    for name, path in list(_turn_logs.items()):
-        try:
-            count = len(re.findall(r"^tool: ", Path(path).read_text(errors="replace"), re.M))
-        except OSError:
-            continue
-        if count > _progress_seen.get(str(path), 0):
-            _progress_seen[str(path)] = count
-            mark_progress(f"{name}: tool activity")
-    pending = queue_for(c).pending()
-    roots = list((read_roadmap() or {}).get("roots", [])) if c.get("roadmap_file") else []
-    parked = [r for r in _read(STATE / "done.jsonl")
-              if r.get("status") == "parked" and not r.get("dismissed_at")
-              and r.get("finished", 0) >= _run.get("started", now)]
-    parked_ids = {r["id"] for r in parked}
-    roots += [r["id"] for r in parked if not parked_ids.intersection(r.get("depends_on", []))]
-    with _run_lock:
-        state, reason = "Waiting", "No ready assigned work"
-        if _stop.is_set():
-            state, reason = "Stopped", _run.get("stop_reason") or "Stop requested"
-        elif _run.get("state") == "Draining":
-            state, reason = "Draining", _run.get("stop_reason")
-        elif workers:
-            # Work order §13: a worker is Waiting only when its structured state says it
-            # is idle/blocked; the prose `waiting` string is no longer the signal. An
-            # allowance hold banks real blocked seconds instead of reading as a long task.
-            states = [w.get("state") for w in workers]
-            state = "Waiting" if all(s in (None, "idle", "allowance_blocked") for s in states) else "Running"
-            reason = workers[0].get("doing") or workers[0].get("state") or "No ready assigned work"
-        elif roots or (pending and not queue_for(c).ready()):
-            state, reason = "Blocked", "Unmet dependencies or retry cooldown"
-        # Wall-time buckets across live workers, banked by state (work order §13).
-        buckets = {}
-        for w in workers:
-            clk = vars(w).get("clock") if not isinstance(w, dict) else None
-            if not isinstance(clk, BucketClock):
-                continue
-            for k, v in clk.snapshot().items():
-                buckets[k] = buckets.get(k, 0.0) + v
-        if buckets:
-            _run["wall_buckets"] = {k: round(v, 1) for k, v in buckets.items()}
-        _run["wall_total"] = round(sum(buckets.values()), 1) if buckets else _run.get("wall_total")
-        # One human line: how the run's wall time actually split (work order §13). The total
-        # approximately equals wall time; an allowance hold is its own bucket, not "waiting".
-        if buckets:
-            def pretty(secs):
-                secs = int(max(0, secs))
-                h, rem = divmod(secs, 3600)
-                m, s = divmod(rem, 60)
-                if h:
-                    return f"{h}h{m:02d}m"
-                if m:
-                    return f"{m}m"
-                return f"{s}s"
-            total = max(1, int(sum(buckets.values())))
-            model = buckets.get("active_model", 0)
-            hold = buckets.get("allowance_blocked", 0)
-            tests = buckets.get("testing", 0) + buckets.get("reviewing", 0)
-            idle = buckets.get("idle", 0) + buckets.get("dependency_blocked", 0)
-            _run["time_summary"] = (
-                f"{pretty(total)} wall: {pretty(model)} model work, {pretty(hold)} allowance hold, "
-                f"{pretty(tests)} tests/review, {pretty(idle)} idle/blocked")
-        if state == "Blocked":
-            _run.setdefault("blocked_since", now)
-        elif _run.get("blocked_since"):
-            _run["blocked_seconds"] = _run.get("blocked_seconds", 0) + now - _run.pop("blocked_since")
-        _run.update(state=state, reason=reason, heartbeat_at=now,
-                    remaining_seconds=max(0, _run["deadline"] - now) if _run.get("deadline") else None)
-        result = dict(_run)
-        result["progress_age"] = now - _run["last_progress_at"] if _run.get("last_progress_at") else None
-        result["blocked_duration"] = _run.get("blocked_seconds", 0) + (now - _run["blocked_since"] if _run.get("blocked_since") else 0)
-        result["root_blockers"] = roots
-        result["blocked_tasks"] = [{"id": r["id"], "title": r["title"], "reason": r.get("note"),
-                                    "next_action": "Inspect retained attempt; repair scope, verifier or reviewer before requeueing"}
-                                   for r in parked]
-        temp = STATE / "run.tmp"
-        temp.write_text(json.dumps(result, indent=2))
-        temp.replace(STATE / "run.json")
-        return result
+    return reporting.run_status(workers, c, state_dir=STATE, progress_seen=_progress_seen,
+                                read=_read, run=_run, run_lock=_run_lock, stop=_stop,
+                                turn_logs=_turn_logs, mark_progress=mark_progress,
+                                queue_for=queue_for, read_roadmap=read_roadmap)
 
 
-TRAILER = re.compile(r"^Swarm-([\w-]+):\s*(.*)$", re.M)
+TRAILER = reporting.TRAILER
 
 
 def promotion_state(c):
@@ -1282,40 +1159,7 @@ def promotion_state(c):
 
 
 def landed_commits(c, limit=20):
-    """The trunk commits this swarm landed, newest first, with who wrote them and what for."""
-    # Trunk itself, not base..trunk: once trunk is merged, base..trunk is empty and the swarm's
-    # own history would read as nothing landed. A Swarm-Task trailer is what makes it the
-    # swarm's, so the merge cannot hide it either.
-    rc, out = git(["log", f"--format=%H%x1f%h%x1f%s%x1f%at%x1f%b%x1e", "-n", str(limit * 4),
-                   trunk_name(c)], cwd=c["repo"])
-    if rc != 0 or not out.strip():
-        return []
-    rows = [r for r in _read(STATE / "journal.jsonl") if r["event"] in ("attempt", "reward")]
-    by_task = {}
-    for r in rows:
-        by_task.setdefault(r.get("id"), {}).update(
-            {k: v for k, v in r.items() if k in ("reward", "goal_item", "usd", "implementer")})
-    commits = []
-    for chunk in out.split(""):
-        parts = chunk.strip().split("")
-        if len(parts) < 4:
-            continue
-        sha, short, subject, at = parts[0], parts[1], parts[2], parts[3]
-        trailers = dict(TRAILER.findall(parts[4] if len(parts) > 4 else ""))
-        if "Task" not in trailers:
-            continue                  # someone's own commit that trunk happens to contain
-        meta = by_task.get(trailers.get("Task"), {})
-        commits.append({
-            "sha": sha, "short": short, "at": int(at) if at.isdigit() else 0,
-            "subject": re.sub(r"^swarm: ", "", subject),
-            "task": trailers.get("Task"),
-            "model": trailers.get("Implementer") or meta.get("implementer"),
-            "reviewer": trailers.get("Reviewer"),
-            "reward": meta.get("reward"), "goal_item": meta.get("goal_item"),
-            "usd": meta.get("usd")})
-        if len(commits) >= limit:
-            break
-    return commits
+    return reporting.landed_commits(c, limit, state=STATE, read=_read, git=git, trunk_name=trunk_name)
 
 
 def health(hours=24):
@@ -2466,125 +2310,8 @@ def run_daemon(c, max_tasks=None, hours=None):
 # ------------------------------------------------------------------ report
 
 def build_report(c, hours=24):
-    L = Ledger(STATE / "learn.json").snapshot()
-    since = time.time() - hours * 3600
-    repo, base, t = c["repo"], c.get("base_branch", "main"), trunk_name(c)
-    _, ahead = git(["rev-list", "--count", f"{base}..{t}"], cwd=repo)
-    _, commits = git(["log", "--format=- %h %s", "-n", "30", f"{base}..{t}"], cwd=repo)
-    accepted = [a for a in L["accepted"] if a["t"] >= since]
-    rows = _read(STATE / "journal.jsonl")
-    tasks = [j for j in rows if j["event"] == "task" and j["t"] >= since]
-    attempts = [j for j in rows if j["event"] == "attempt" and j["t"] >= since]
-    stages, classes = {}, {}
-    for j in tasks:
-        stages[j.get("stage", "?")] = stages.get(j.get("stage", "?"), 0) + 1
-        if not j.get("ok") and j.get("failure_class"):
-            classes[j["failure_class"]] = classes.get(j["failure_class"], 0) + 1
-    parked = [d for d in _read(STATE / "done.jsonl")
-              if d.get("status") in ("parked", "split") and not d.get("dismissed_at")
-              and d.get("finished", 0) >= since]
-    # Each task's own last outcome, so the report says what happened rather than guessing.
-    last = {j["id"]: j for j in rows if j["event"] == "task"}
-    # What the window cost, from OpenRouter's own numbers rather than a local price table.
-    spent = round(sum(a.get("usd") or 0.0 for a in attempts), 6)
-    requests = sum(int(a.get("requests") or 0) for a in attempts)
-    landed_n = sum(1 for a in attempts if a.get("stage") == "accepted")
-    by_model = {}
-    for a in attempts:
-        m = by_model.setdefault(a.get("implementer") or "?", {"attempts": 0, "landed": 0,
-                                                                 "requests": 0, "usd": 0.0})
-        m["attempts"] += 1
-        m["landed"] += a.get("stage") == "accepted"
-        m["requests"] += int(a.get("requests") or 0)
-        m["usd"] = round(m["usd"] + (a.get("usd") or 0.0), 6)
-    b = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
-               owner_window=c.get("owner_window", ["00:00", "00:00"])).snapshot()
-
-    out = [f"# Swarm report — {Path(repo).name}",
-           f"_{dt.datetime.now():%Y-%m-%d %H:%M}, last {hours:g}h_", "",
-           f"**{t}** is {ahead or 0} commit(s) ahead of **{base}**. Nothing has been merged into your branches.",
-           "", "## Promotion", "",
-           "Landed on `{t}` but **not** merged or deployed — that is the point of the "
-           "swarm trunk: review and merge when you like it.".format(t=t),
-           "", "```",
-           f"accepted/landed {int((promotion_state(c) or {}).get('landed', 0))}; "
-           f"merged to {base} {int((promotion_state(c) or {}).get('merged', 0))}; "
-           f"verified live {int((promotion_state(c) or {}).get('verified_live', 0))}",
-           (promotion_state(c) or {}).get("verified_live_note", ""),
-           "```", "",
-           "```sh", f"git -C '{repo}' log --oneline {base}..{t}",
-           f"git -C '{repo}' diff {base}...{t}",
-           f"git -C '{repo}' merge {t}   # from your {base} checkout, when you like it", "```", ""]
-    brk = [a for a in accepted if a.get("breakthrough")]
-    out += ["## Breakthroughs", ""]
-    out += [f"- ★ **{a['title']}** — reward {a['reward']:.2f}, `{a['implementer']}`, "
-            f"{a.get('persona') or a.get('origin')}: {(a.get('scores') or {}).get('why', '')}"
-            for a in brk] or ["- none this window"]
-    out += ["", f"## Landed ({len(accepted)})", "",
-            "| reward | impact | creativity | quality | task | implementer | idea from |",
-            "|---:|---:|---:|---:|---|---|---|"]
-    for a in sorted(accepted, key=lambda a: -a["reward"]):
-        s = a.get("scores") or {}
-        out.append(f"| {a['reward']:.2f} | {s.get('impact', '–')} | {s.get('creativity', '–')} | "
-                   f"{s.get('quality', '–')} | {a['title']} | `{a['implementer']}` | "
-                   f"{a.get('persona') or a.get('origin')} |")
-    out += ["", "## Outcomes", "", ", ".join(f"{k}: {v}" for k, v in sorted(stages.items())) or "no tasks finished"]
-    if classes:
-        out += ["", "Whose failures these were: "
-                + ", ".join(f"{k} {v}" for k, v in sorted(classes.items(), key=lambda kv: -kv[1]))
-                + ". Only `task` failures say the work was wrong."]
-    out += ["", "## Efficiency", "",
-            f"{landed_n} accepted / {len(tasks)} completed outcomes / {len(attempts)} model attempts / "
-            f"{requests} observed request starts.",
-            (f"{requests / landed_n:.1f} observed requests per accepted commit."
-             if landed_n else "No accepted commit denominator in this window."),
-            "", "First-pass accepted: "
-            + str(sum(1 for a in attempts if a.get("stage") == "accepted" and not a.get("repairs")))
-            + "; accepted after retry: "
-            + str(sum(1 for a in attempts if a.get("stage") == "accepted" and a.get("repairs")))
-            + ".",
-            "", "## Cost", ""]
-    if spent:
-        out += [f"${spent:.4f} across {len(attempts)} attempt(s); "
-                + (f"${spent / landed_n:.4f} per landed commit ({landed_n} landed)."
-                   if landed_n else "nothing landed in this window."),
-                "", "| model | attempts | landed | $ | $ per landed |", "|---|---:|---:|---:|---:|"]
-        for name, m in sorted(by_model.items(), key=lambda kv: -kv[1]["usd"]):
-            per = f"{m['usd'] / m['landed']:.4f}" if m["landed"] and m["usd"] else "–"
-            out.append(f"| `{name}` | {m['attempts']} | {m['landed']} | {m['usd']:.4f} | {per} |")
-    else:
-        out += ["No paid turns were charged in this window."]
-    # An experiment nobody is running is a section that says nothing, every morning.
-    if (c.get("mit_experiment") or {}).get("enabled") and c.get("inject_corpus", True):
-        import experiment
-        out += ["", "## MIT corpus experiment (every attempt so far)", "",
-                experiment.markdown(experiment.summary(STATE / "journal.jsonl"))]
-    if parked:
-        out += ["", "## Split or parked (needs a human look)", "",
-                "One line each, with whose failure it was. `harness` and `model` mean the task "
-                "itself was never shown to be wrong.", ""]
-        for d in parked:
-            j = last.get(d["id"], {})
-            stage = j.get("stage") or ""
-            raw = j.get("note") or d.get("note") or ""
-            # Classify the note as it was written: cleaning it for display strips the very
-            # words — sandbox, the timeout, the path — that say whose failure it was.
-            why = j.get("failure_class") or failure_class(stage, raw,
-                                                          edited=j.get("edit_calls"))
-            note = reportable(raw)
-            out.append(f"- **{d['status']}** · {why}"
-                       + (f" · {stage}" if stage else "")
-                       + f" · {d['title']} — {note[:140] or 'no reason recorded'}")
-    out += ["", "## Agent leaderboard", "", "| role | arm | pulls | mean reward | posterior |", "|---|---|---:|---:|---:|"]
-    for row in Ledger(STATE / "learn.json").leaderboard():
-        out.append(f"| {row['role']} | `{row['arm']}` | {row['pulls']} | {row['mean']:.2f} | {row['posterior']:.2f} |")
-    lessons, pitfalls = Ledger(STATE / "learn.json").playbook()
-    out += ["", "## Playbook", "", format_playbook(lessons, pitfalls) or "(empty so far)", "",
-            "## Budget", "", f"{b['spent_today']}/{b['usable']} usable free requests spent today; "
-            f"resets {b['resets_local']}.", "", "## Trunk commits", "", commits or "- none yet"]
-    text = "\n".join(out) + "\n"
-    (STATE / "REPORT.md").write_text(text)
-    return text
+    return reporting.build_report(c, hours, state=STATE, read=_read, git=git, trunk_name=trunk_name,
+                                  promotion_state=promotion_state, reportable=reportable)
 
 
 # ------------------------------------------------------------------ commands
