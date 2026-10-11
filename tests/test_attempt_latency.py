@@ -96,7 +96,8 @@ class BaselineGateTests(unittest.TestCase):
 
     def run_attempt(self, gates):
         c = {"repo": str(self.repo), "base_branch": "main", "test_cmd": "true",
-             "models": ["a:free"], "steps": {"architect": 0, "implementer": 2, "adversary": 2}}
+             "models": ["a:free"], "steps": {"architect": 0, "implementer": 2, "adversary": 2},
+             "keep_worktrees": False}   # tests clean up after themselves
         w = swarmd.Worker(0, c, swarmd.Queue(), Mock(), threading.Event())
 
         def fake(prompt, cwd, c_, role, *a):
@@ -128,7 +129,8 @@ class BaselineGateTests(unittest.TestCase):
     def test_a_changed_test_command_gates_again(self):
         self.run_attempt([(True, "")] * 4)
         c = {"repo": str(self.repo), "base_branch": "main", "test_cmd": "pytest -q",
-             "models": ["a:free"], "steps": {"architect": 0, "implementer": 2, "adversary": 2}}
+             "models": ["a:free"], "steps": {"architect": 0, "implementer": 2, "adversary": 2},
+             "keep_worktrees": False}
         w = swarmd.Worker(0, c, swarmd.Queue(), Mock(), threading.Event())
         with patch.object(swarmd, "flint", return_value="done"), \
              patch.object(w, "gate", side_effect=[(True, "")] * 4) as gate:

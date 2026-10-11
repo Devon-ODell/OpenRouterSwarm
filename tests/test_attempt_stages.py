@@ -65,6 +65,9 @@ class RepoCase(unittest.TestCase):
     def cfg(self, **kw):
         return {"repo": str(self.repo), "base_branch": "main", "test_cmd": "true",
                 "models": ["a:free"],
+                # Worktrees belong to the test run, not the repo: without this,
+                # every attempt leaves a stale dir under swarm/wt/default.
+                "keep_worktrees": False,
                 "steps": {"architect": 0, "implementer": 2, "adversary": 2,
                           "judge": 1, "decomposer": 1},
                 **kw}
