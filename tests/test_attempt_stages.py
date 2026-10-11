@@ -172,16 +172,15 @@ class AttemptStageTests(RepoCase):
     NOTE_DEPENDENT = frozenset({"model_error", "review_error", "no_change"})
 
     def test_the_frozen_stage_mapping_is_exact(self):
-        """failure_class per stage is the measured table, cross-checked against the
-        production vocabularies it is built from.
+        """failure_class per stage is pinned against the production vocabularies.
 
-        A naive `assertEqual(failure_class(stage), table[stage])` is closed over the
-        test's own table: editing the table and the implementation together stays
-        green. So every row is also required to be consistent with the *production*
-        sets that define it — TASK_STAGES, HARNESS_STAGES, and the three
-        note/edited-dependent stages — and the 18-stage vocabulary must be exactly
-        partitioned by them. A stage added to production can then only pass by
-        deliberately appearing here and in a production set.
+        The expected mapping is *derived from production*: every TASK_STAGES member
+        must classify 'task', every HARNESS_STAGES member 'harness', and the table
+        in this file must equal that derived mapping exactly. A production change
+        therefore cannot be hidden by editing the table or the test's stage set to
+        match — the derived mapping moves with production and the equality breaks.
+        Note/edited-dependent stages (model_error, review_error, no_change) and the
+        terminal accepted stage are pinned explicitly below.
         """
         stages = {"accepted", "refused", "out_of_scope", "baseline", "conflict",
                   "rejected", "tests_failed", "weakened_tests", "no_change",
@@ -193,32 +192,29 @@ class AttemptStageTests(RepoCase):
         self.assertEqual(len(stages), 18)
         # The vocabulary is exactly partitioned by the production sets, the
         # hard-coded review_format branch, the three note-dependent stages, and
-        # `accepted` — the terminal stage that never routes through failure_class
-        # (its table row is documentation; assert it cannot appear in the sets). A
-        # stage added to production without deliberate test coverage fails here; a
-        # stage dropped from production while still listed here fails too.
+        # `accepted` — the terminal stage that never routes through failure_class.
         self.assertEqual(
             stages,
             production_task | production_harness
             | {"review_format_error", "accepted"} | set(self.NOTE_DEPENDENT))
-        self.assertNotIn("accepted", production_task | production_harness)
-        # No stage may live in both the task and harness sets.
+        # No stage may live in both sets, and accepted may not be in either.
         self.assertEqual(production_task & production_harness, set())
-        # The mapping's keys are the vocabulary minus the three note-dependent stages.
-        self.assertEqual(set(self.STAGE_CLASS), stages - self.NOTE_DEPENDENT)
+        self.assertNotIn("accepted", production_task | production_harness)
+        # The expected mapping is derived FROM production. A table row that does
+        # not match its production set, or a production set member missing from
+        # the table, breaks the equality — no combination of edits to this file
+        # can absorb a production change.
+        expected = ({s: "task" for s in production_task}
+                    | {s: "harness" for s in production_harness}
+                    | {"review_format_error": "review_format", "accepted": "task"})
+        self.assertEqual(self.STAGE_CLASS, expected)
         # An unknown stage string must be recognizable as unmapped: "banana" falls
         # through failure_class()'s catch-all, but it is not a pinned stage.
         self.assertNotIn("banana", self.STAGE_CLASS)
-        # Every pinned stage classifies exactly as measured, and every row is
-        # consistent with the production set it is defined by.
-        for stage, cls in self.STAGE_CLASS.items():
-            self.assertEqual(swarmd.failure_class(stage), cls, stage)
-            if stage in production_task:
-                self.assertEqual(cls, "task", stage)
-            elif stage in production_harness:
-                self.assertEqual(cls, "harness", stage)
-            elif stage == "review_format_error":
-                self.assertEqual(cls, "review_format", stage)
+        # Live behaviour matches the derived mapping for every member of the
+        # production sets.
+        for stage in production_task | production_harness:
+            self.assertEqual(swarmd.failure_class(stage), expected[stage], stage)
         # The note- and edited-dependent directions, asserted both ways.
         self.assertEqual(swarmd.failure_class("model_error", ""), "model")
         self.assertEqual(swarmd.failure_class("model_error", "connection reset"), "harness")
