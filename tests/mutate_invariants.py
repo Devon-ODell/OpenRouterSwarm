@@ -98,7 +98,10 @@ def _run_in(wt, chosen, python):
         path.write_text(src.replace(old, new, 1))
         t0 = time.time()
         try:
-            r = subprocess.run([python, "-m", "pytest", "tests/", "-x", "-q", "-p", "no:cacheprovider"],
+            # The anchor test fails whenever a guard's text changes, so it would "kill" every
+            # mutant by itself and prove nothing about the behavior tests. Leave it out.
+            r = subprocess.run([python, "-m", "pytest", "tests/", "-x", "-q", "-p", "no:cacheprovider",
+                                "--ignore=tests/test_invariant_anchors.py"],
                                cwd=wt, capture_output=True, text=True, timeout=1200)
             lines = r.stdout.strip().splitlines()
             failed = [l for l in lines if l.startswith(("FAILED", "ERROR"))]
