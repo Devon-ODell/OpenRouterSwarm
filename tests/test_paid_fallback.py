@@ -961,10 +961,9 @@ class QuotaPauseTests(unittest.TestCase):
         w, q = self.worker(**cfg)
         waits, asked = [], []
 
-        def wait(seconds):
+        def rest(seconds):                     # the worker's one sleep (drain-aware)
             waits.append(seconds)
             w.stop.set()                       # one pass is enough
-            return True
         def recheck(c, budget):
             asked.append(True)
             return recheck_returns
@@ -972,7 +971,7 @@ class QuotaPauseTests(unittest.TestCase):
              patch.object(swarmd, "read_goal", return_value="goal"), \
              patch.object(swarmd, "watch_config", return_value=[]), \
              patch.object(swarmd, "recheck_allowance", side_effect=recheck), \
-             patch.object(w.stop, "wait", side_effect=wait):
+             patch.object(w, "rest", side_effect=rest):
             w.run()
         return waits, asked
 

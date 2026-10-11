@@ -37,6 +37,7 @@ FAILING = re.compile(r"^(?:FAIL|ERROR):.*|^E\s{2,}.*|^\s*(?:Assertion|Type|Value
 
 from task_rules import first_failing_line as _first_failing_line  # noqa: E402
 from task_rules import failure_class as _failure_class  # noqa: E402
+from task_rules import condense as _condense  # noqa: E402
 
 
 def attempt_lines(task, attempts_dir, limit=3, max_chars=1_200):
@@ -59,7 +60,8 @@ def attempt_lines(task, attempts_dir, limit=3, max_chars=1_200):
         when = dt.datetime.fromtimestamp(row["finished"]).strftime("%m-%d %H:%M")
         stage = row.get("phase") or "unknown"
         model = row.get("implementer") or row.get("active_model") or "?"
-        note = re.sub(r"\s+", " ", str(row.get("note") or "")).strip()
+        # Condensed before it is cut to 160: an exploration note's head is its round log.
+        note = re.sub(r"\s+", " ", _condense(str(row.get("note") or ""), 200)).strip()
         # Paths and evidence directories are noise here; the failing line is the signal.
         note = re.sub(r"(?:; )?evidence: \S+", "", note).strip(" ;")
         failing = _first_failing_line(row.get("note") or "")
@@ -77,7 +79,8 @@ def attempt_lines(task, attempts_dir, limit=3, max_chars=1_200):
 
 # Paths a task names in its own words. Anything outside this set is a guess about what matters,
 # and a guess is what filled these prompts with a lecture on parking-garage real options.
-CODE_PATH = re.compile(r"[\w][\w./-]*\.(?:py|js|cjs|mjs|jsx|ts|tsx|json|md|html|css|rs|toml)\b")
+CODE_PATH = re.compile(
+    r"[\w][\w./-]*\.(?:py|js|cjs|mjs|jsx|ts|tsx|json|md|html|css|rs|toml|h|hpp|c|cc|cpp)\b")
 GAME_DIR = re.compile(r"\b(games/([\w.-]+))/")
 # Definitions worth an outline when a file is too long to show: Python and JavaScript
 # functions, classes, and the consts a game's module keeps its tables in.
@@ -85,6 +88,26 @@ DEFINITION = re.compile(
     r"^\s*(?:export\s+)?(?:async\s+)?(?:def|class|function)\s+\w+"
     r"|^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*="
     r"|^\s*\w+\s*[:=]\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>)")
+# Rust has no use for the JavaScript rule above: there `let x =` is a local binding, and on
+# SkyRing it made the outline of a 1105-line player.rs 69 `let` lines and none of its 61
+# functions and types, so two implementers spent their rounds searching for receive_hit.
+RUST_DEFINITION = re.compile(
+    r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:const|async|unsafe|extern(?:\s+\"[^\"]*\")?)\s+)*"
+    r"(?:fn|struct|enum|union|trait|type|mod|const|static)\s+\w+"
+    r"|^\s*(?:unsafe\s+)?impl\b|^\s*macro_rules!")
+# C and C++: types, macros, and functions declared or defined at file scope (column 0).
+C_DEFINITION = re.compile(
+    r"^\s*(?:typedef\b|(?:struct|enum|union|class|namespace)\s+\w+|#\s*define\s+\w+)"
+    r"|^(?!(?:return|if|else|for|while|switch|case|do|goto|sizeof)\b)"
+    r"[A-Za-z_][\w:<>,*& ]*[\s*&]~?[A-Za-z_][\w:]*\s*\(")
+LANGUAGE_DEFINITION = {".rs": RUST_DEFINITION,
+                       **dict.fromkeys((".h", ".hpp", ".hh", ".c", ".cc", ".cpp", ".cxx"),
+                                       C_DEFINITION)}
+# The name a definition line introduces, for matching against the names a task mentions.
+DEFINED_NAME = re.compile(
+    r"\b(?:fn|struct|enum|union|trait|type|mod|def|class|function|const|static|let|var|define)"
+    r"\s+(\w+)")
+DECLARED_NAME = re.compile(r"(~?[A-Za-z_]\w*)\s*\(")   # a C function: the name before its "("
 
 
 def numbered(text, first=1):
@@ -92,13 +115,83 @@ def numbered(text, first=1):
     return "\n".join(f"{i:>5}\t{line}" for i, line in enumerate(text.splitlines(), first))
 
 
-def outline(text):
+def definition_pattern(name=""):
+    return LANGUAGE_DEFINITION.get(Path(str(name)).suffix.lower(), DEFINITION)
+
+
+def outline(text, name=""):
     """Definitions with their line numbers, for a file too long to show whole.
 
     A signature is what locates the code; the rest of a 200-character line is body, and an
-    outline that repeats it is as big as the file it stands in for."""
+    outline that repeats it is as big as the file it stands in for. `name` picks the
+    language's notion of a definition from the file's suffix."""
+    pattern = definition_pattern(name)
     return "\n".join(f"{i:>5}\t{line.rstrip()[:120]}"
-                     for i, line in enumerate(text.splitlines(), 1) if DEFINITION.match(line))
+                     for i, line in enumerate(text.splitlines(), 1) if pattern.match(line))
+
+
+def _span_end(lines, start, max_lines, name=""):
+    """The last line (0-based) of the definition that starts at `start`: where its indented
+    block ends (Python), or where its braces balance. A declaration that ends in `;` before
+    any brace opens (a prototype, an alias) ends on that line."""
+    stop = min(len(lines), start + max_lines)
+    if Path(str(name)).suffix.lower() == ".py":
+        indent = len(lines[start]) - len(lines[start].lstrip())
+        end = start
+        for i in range(start + 1, stop):
+            if lines[i].strip():
+                if len(lines[i]) - len(lines[i].lstrip()) <= indent:
+                    break
+                end = i
+        return end
+    depth, opened = 0, False
+    for i in range(start, stop):
+        code = re.sub(r'"(?:\\.|[^"\\])*"|//.*', "", lines[i])
+        if not opened and "{" not in code and code.rstrip().endswith(";"):
+            return i
+        depth += code.count("{") - code.count("}")
+        opened = opened or "{" in code
+        if opened and depth <= 0:
+            return i
+    return stop - 1
+
+
+def named_definitions(text, name, wanted, max_lines=150, limit=4):
+    """(first, last) 1-based line spans of the definitions in a file whose names the task uses.
+
+    An outline says where receive_hit is; the task is usually about what it does. A name counts
+    when the task writes it as code: `Type::name`, `.name(`, `name(`, or a snake_case or
+    CamelCase word of five or more characters."""
+    pattern, lines, found = definition_pattern(name), text.splitlines(), []
+    for i, line in enumerate(lines):
+        if not pattern.match(line):
+            continue
+        m = DEFINED_NAME.search(line) or DECLARED_NAME.search(line)
+        defined = m and m.group(1)
+        if not defined or defined not in wanted:
+            continue
+        end = _span_end(lines, i, max_lines, name)
+        if end > i:
+            found.append((-wanted[defined], i + 1, end + 1))
+    spans = []
+    # Names the task calls (`ErCombat::receive_hit(`) before names it only mentions, so four
+    # struct definitions cannot crowd out the function the task is about.
+    for _, first, last in sorted(found):
+        if not any(a <= first <= b for a, b in spans):
+            spans.append((first, last))
+        if len(spans) >= limit:
+            break
+    return sorted(spans)
+
+
+def wanted_names(text):
+    """The identifiers a task's text names as code, each with how directly: 2 for a call or a
+    path (`Type::name`, `.name(`, `name(`), 1 for a snake_case or CamelCase word."""
+    names = {w: 1 for w in re.findall(r"\b[A-Za-z_]\w{4,}\b", text)
+             if "_" in w.strip("_") or re.search(r"[a-z][A-Z]", w)}
+    for w in re.findall(r"::([A-Za-z_]\w*)|\.([A-Za-z_]\w*)\s*\(|\b([A-Za-z_]\w*)\s*\(", text):
+        names[next(x for x in w if x)] = 2
+    return names
 
 
 def task_text(task):
@@ -161,6 +254,7 @@ def context_pack(task, wd, limit=20_000, also="", git_run=None):
     # The last two sections are small and carry the most per character — which test module to
     # run, and what else is in the directory — so a long file cannot crowd them out.
     reserve = min(2_500, limit // 4)
+    wanted = wanted_names(text)
 
     def add(header, body, ceiling=None):
         nonlocal used
@@ -198,7 +292,10 @@ def context_pack(task, wd, limit=20_000, also="", git_run=None):
             add(f"--- {rel} ({len(lines)} lines) ---", whole, ceiling)
         else:
             add(f"--- {rel} ({len(lines)} lines; definitions only, read_file for the rest) ---",
-                outline(body), ceiling)
+                outline(body, rel), ceiling)
+            for first, last in named_definitions(body, rel, wanted):
+                add(f"--- {rel} lines {first}-{last} (in full: the task names it) ---",
+                    numbered("\n".join(lines[first - 1:last]), first), ceiling)
 
     paths = named_paths(task, also)
     seen = set()

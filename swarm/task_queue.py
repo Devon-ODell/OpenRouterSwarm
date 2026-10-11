@@ -16,10 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:  # package import in tests; top-level import when swarmd.py is executed directly
-    from .task_rules import estimate_requests
+    from .task_rules import condense, estimate_requests
     from .workflow import criteria, validate_scope
 except ImportError:  # pragma: no cover - exercised by the top-level swarmd identity
-    from task_rules import estimate_requests
+    from task_rules import condense, estimate_requests
     from workflow import criteria, validate_scope
 
 
@@ -154,7 +154,7 @@ class TaskPolicy:
             counters["review_format_failures"] = task.get("review_format_failures", 0) + 1
         attempts = task.get("attempts", 0) + (0 if defer or harness or parked else 1)
         counters["attempts"] = attempts
-        stored_note = None if harness else note[-800:]
+        stored_note = None if harness else condense(note, 800)
         not_before = None
 
         if defer:
@@ -165,7 +165,7 @@ class TaskPolicy:
             if stage == "model_pool_exhausted" and task.get("depth", 0) < self.max_depth:
                 status = "split"
             else:
-                status, stored_note = "parked", note[-800:]
+                status, stored_note = "parked", condense(note, 800)
         elif harness:
             harness_failures = task.get("harness_failures", 0) + 1
             exploration = task.get("exploration_failures", 0)
@@ -192,7 +192,7 @@ class TaskPolicy:
                 not_before = now + max(defer, delay)
             else:
                 status = "parked"
-                stored_note = f"needs harness look: {note[-500:]}"
+                stored_note = f"needs harness look: {condense(note, 500)}"
         elif attempts < self.max_attempts and not split_now:
             status, not_before = "retry", now + 300 * attempts ** 2
         elif task.get("depth", 0) < self.max_depth:
@@ -398,7 +398,7 @@ class TaskQueue:
                                  "role": failed_role or "implementer",
                                  "class": failure_class,
                                  "requests": max(0, int(requests or 0)), "at": now,
-                                 "note": note[-200:]})
+                                 "note": condense(note, 200)})
                 task["failed_models"] = failures[-8:]
                 if self.policy.counts_toward_circuit(failure_class):
                     key = f"{failed_model}|{failed_role or 'implementer'}"
@@ -420,9 +420,9 @@ class TaskQueue:
             harness = not ok and not defer and failure_class == "harness"
             effective_park = bool(park or format_error) and not ok and not defer
             if harness and not effective_park:
-                task["harness_note"] = note[-400:]
+                task["harness_note"] = condense(note, 400)
             elif not ok and not defer and not effective_park:
-                task["notes"] = (task.get("notes", []) + [note[-800:]])[-2:]
+                task["notes"] = (task.get("notes", []) + [condense(note, 800)])[-2:]
             task["finished"] = now
             self.store.write_pending(rows + ([task] if transition.status == "retry" else []))
             if transition.status != "retry":
@@ -487,7 +487,7 @@ class TaskQueue:
             return list(dict.fromkeys(row["id"] for row in selected))
 
     def edit(self, tid, title=None, detail=None, kind=None, priority=None, acceptance=None,
-             allow_test_changes=None):
+             allow_test_changes=None, allowed_paths=None):
         with self.locked():
             rows = self.store.pending_rows()
             task = next((row for row in rows if row["id"] == tid), None)
@@ -523,6 +523,13 @@ class TaskQueue:
                 new["allow_test_changes"] = bool(allow_test_changes)
                 if not new["allow_test_changes"]:
                     del new["allow_test_changes"]
+            if allowed_paths is not None:
+                # A packet whose scope leaves out a file its own change has to touch can never
+                # pass (the SkyRing stamina packets: three copies of one size check, two of
+                # them out of scope). Widening it is how such a packet is repaired in place.
+                new["allowed_paths"] = list(dict.fromkeys(p.strip() for p in allowed_paths
+                                                          if p and p.strip()))
+                validate_scope(new)
             criteria(new)
             new.pop("not_before", None)
             self.store.write_pending([new if row["id"] == tid else row for row in rows])

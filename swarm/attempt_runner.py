@@ -14,25 +14,25 @@ from typing import Any, Callable
 
 from learn import (BREAKTHROUGH_WEIGHT, CRIME, FAULTY, PENALTY_WEIGHT, defect, exhibit,
                    format_playbook, is_breakthrough, json_array, novelty, parse_scores,
-                   reward, weight)
+                   reward, unscored_policy, unscored_update, weight)
 from metrics import ACTIVE_MODEL, REVIEWING, TESTING
 from pacing import effective_steps
 from prompts import (ARCHITECT, DECOMPOSER, FAST_IMPLEMENTER, IMPLEMENTER, JUDGE,
                      PRIORITIES, REPAIR)
 from task_rules import failure_class, goal_item_weight, goal_items, scope_gap
-from workflow import (Attempt, REVIEW, STRATEGIES, contract, failure_signature,
-                      parse_review, path_allowed, validate_scope)
+from workflow import (Attempt, REVIEW, STRATEGIES, contract, failure_lines, failure_signature,
+                      out_of_scope_check, parse_review, path_allowed, validate_scope)
 from context_builder import named_paths
 from verification import weakened_tests
 
 try:  # one class identity with the daemon's turn errors
     from .agent_turn import (AgentTimeout, CapReached, ExplorationExhausted, ModelError,
                              ModelPoolExhausted, NoCredits, ProviderBusy, ProviderDown,
-                             RequestBudget, ReviewFormatError, StepLimit)
+                             RequestBudget, ReviewFormatError, StepLimit, Stopped)
 except ImportError:  # pragma: no cover - script mode
     from agent_turn import (AgentTimeout, CapReached, ExplorationExhausted, ModelError,
                             ModelPoolExhausted, NoCredits, ProviderBusy, ProviderDown,
-                            RequestBudget, ReviewFormatError, StepLimit)
+                            RequestBudget, ReviewFormatError, StepLimit, Stopped)
 
 try:  # same module identity as the daemon's workspace
     from . import workspace
@@ -146,8 +146,14 @@ class AttemptRunner:
             d.log(f"judge unavailable ({type(e).__name__}); accepted work remains unscored", w.name)
             return None
         scores = parse_scores(out)
+        # After a handoff the model that answered is not the one asked: name the one that did.
+        answered = w.last_model or model
         if scores is None:
-            d.log(f"judge {model} returned no usable JSON; accepted work remains unscored", w.name)
+            d.log(f"judge {answered} returned no usable JSON; accepted work remains unscored", w.name)
+        elif scores.get("salvaged"):
+            d.log(f"judge {answered} returned malformed JSON; its scores were recovered", w.name)
+            d.journal("judge_salvaged", id=task["id"], model=answered,
+                      follow_ups=len(scores.get("follow_ups") or []))
         return scores
 
     def follow_up(self, task, scores, r, breakthrough, c=None):
@@ -237,6 +243,11 @@ class AttemptRunner:
               f"'{task['title']}'", w.name)
         return w.decompose(task, goal, avoid={*avoid, model}, c=c,
                            attempt_budget=attempt_budget)
+
+    def grep(self, wd, text):
+        """`path:line` for each tracked line in the worktree containing `text` as written."""
+        _, out = self.d.git(["grep", "-n", "-F", "-e", text], cwd=wd)
+        return [":".join(l.split(":", 2)[:2]) for l in (out or "").splitlines() if ":" in l]
 
     def scope_violations(self):
         w, d = self.w, self.d
@@ -508,16 +519,29 @@ class AttemptRunner:
         # Only the author of faulty code pays the penalty weight; the planner whose
         # idea it was learns at normal weight. Success pays everyone at full weight.
         rw = weight(stage)
+        learns = True
+        if stage == "accepted" and not scores:
+            # The judge said nothing usable (N6): what that teaches is a policy under test.
+            info["unscored_policy"] = policy = unscored_policy(c, task["id"])
+            update = unscored_update(policy, nov, repairs=info.get("repairs", 0),
+                                     goal_weight=goal_item_weight(info["goal_item"], items),
+                                     model_mean=L.scored_mean(impl) if policy == "impute" else None)
+            if update is None:
+                learns = False
+            else:
+                r, rw = update
         credit = rw if stage == "accepted" else 1.0
-        L.update("implementer", impl, r, weight=rw)
-        if task.get("persona"):
-            L.update("persona", task["persona"], r, weight=credit)
-        if task.get("planner_model"):
-            L.update("planner", task["planner_model"], r, weight=credit)
-        L.credit(info.get("lessons", []), r)
+        if learns:
+            L.update("implementer", impl, r, weight=rw)
+            if task.get("persona"):
+                L.update("persona", task["persona"], r, weight=credit)
+            if task.get("planner_model"):
+                L.update("planner", task["planner_model"], r, weight=credit)
+            L.credit(info.get("lessons", []), r)
         breakthrough = False
         if stage == "accepted":
-            breakthrough = is_breakthrough(r, scores, L.accepted_rewards())
+            # Unjudged work is never a breakthrough, whatever an unscored policy credited it.
+            breakthrough = bool(scores) and is_breakthrough(r, scores, L.accepted_rewards())
             L.record_accepted({"id": task["id"], "title": task["title"], "detail": task.get("detail", ""),
                                "reward": r, "novelty": nov, "scores": scores, "implementer": impl,
                                "reviewer": info.get("reviewer"), "persona": task.get("persona"),
@@ -541,7 +565,7 @@ class AttemptRunner:
         info["reward"] = r
         d.journal("reward", id=task["id"], title=task["title"], stage=stage, reward=r, weight=rw,
                   novelty=nov, implementer=impl, persona=task.get("persona"),
-                  goal_item=info.get("goal_item"),
+                  goal_item=info.get("goal_item"), unscored_policy=info.get("unscored_policy"),
                   scores={k: v for k, v in (scores or {}).items() if k != "follow_ups"},
                   breakthrough=breakthrough)
         d.log(f"{task['id']}: {stage}, reward {r:.2f}{' ★ BREAKTHROUGH' if breakthrough else ''}", w.name)
@@ -708,6 +732,20 @@ class AttemptRunner:
             signature = failure_signature(stage, failure)
             w.evidence.record("repair_needed", failure=signature, reason=failure[-6000:])
             info["pitfall"] = failure[-600:]
+            if signature in seen and stage == "tests_failed":
+                where = out_of_scope_check(failure, task.get("allowed_paths"),
+                                           lambda text: self.grep(wd, text))
+                if where:
+                    # Not the model's fault and not worth another attempt: the packet forbids
+                    # the file the failing check is in. It parks with a note that says so.
+                    d.journal("packet_defect", id=task["id"], title=task["title"], where=where)
+                    d.log(f"{task['id']}: the failing check is at {where}, outside allowed_paths; "
+                          "parking the packet", wname)
+                    return ("out_of_scope",
+                            f"packet defect: the failing check is at {where}, outside allowed_paths. "
+                            "Widen the packet's allowed_paths or change that check on the base "
+                            f"branch first; evidence: {w.evidence.path}\n"
+                            + "\n".join(failure_lines(failure)[:8]), info)
             if cycle == repairs or signature in seen:
                 return stage, f"repair budget/repeated failure; evidence: {w.evidence.path}\n{failure[-2500:]}", info
             seen.add(signature)
@@ -859,6 +897,15 @@ class AttemptRunner:
             d.journal("attempt_deferred", id=task["id"], title=task["title"],
                       reason=type(exc).__name__, model=getattr(exc, "model", None) or w.last_model,
                       role=w.last_role, requests=w.attempt_requests,
+                      edit_calls=d.count_edits(w.name))
+            raise
+        except Exception as exc:
+            # A stopped run, or an error of ours. The requests were still spent: the 17:12
+            # SkyRing stop killed a turn 7 requests in and none of them reached the task.
+            w.attempt_requests = d.count_requests(w.name, reset=True)
+            d.journal("attempt_stopped" if isinstance(exc, Stopped) else "attempt_error",
+                      id=task["id"], title=task["title"], reason=type(exc).__name__,
+                      model=w.last_model, role=w.last_role, requests=w.attempt_requests,
                       edit_calls=d.count_edits(w.name))
             raise
         finally:

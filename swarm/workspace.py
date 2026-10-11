@@ -249,7 +249,7 @@ def snapshot(wt, branch, review_base, *, git, owns_branch, error):
 
 
 def cleanup(c, wt, branch, stage, task, *, git, owns_branch):
-    """Keep every attempt's work on its branch; remove the worktree if configured."""
+    """Keep every attempt's work on its branch; remove the worktree unless it is worth keeping."""
     if not wt or not Path(wt).exists():
         return
     repo, t = c["repo"], trunk_name(c)
@@ -259,9 +259,20 @@ def cleanup(c, wt, branch, stage, task, *, git, owns_branch):
         if rc == 1:
             git(["commit", "-q", "--no-verify", "-m",
                  f"swarm (not accepted: {stage}): {task['title']}"], cwd=wt)
-    if c.get("keep_worktrees", True):
+    keep = c.get("keep_worktrees", True)
+    _, ahead = git(["rev-list", "--count", f"{t}..{branch}"], cwd=repo)
+    # `true` keeps the worktrees that hold work trunk does not have, for inspection; one whose
+    # branch landed or never produced anything has nothing to show. SkyRing kept 16 worktrees
+    # for 6 tasks, 9 of them for one task, most with no edits or already on trunk. "all" keeps
+    # every one, as `true` used to. Branches are only deleted under `false`, as before.
+    if keep == "all" or (keep and ahead != "0"):
         return
     git(["worktree", "remove", "--force", str(wt)], cwd=repo)
-    _, ahead = git(["rev-list", "--count", f"{t}..{branch}"], cwd=repo)
-    if ahead == "0":  # landed on trunk, or never produced anything
+    try:
+        # The repository's worktree folder, once its last worktree is gone: it was left behind
+        # empty, and the harness had collected 148 of them under swarm/wt.
+        Path(wt).parent.rmdir()
+    except OSError:
+        pass                                      # still holds another attempt's worktree
+    if not keep and ahead == "0":  # landed on trunk, or never produced anything
         git(["branch", "-D", branch], cwd=repo)

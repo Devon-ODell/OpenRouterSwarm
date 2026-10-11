@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+try:  # package import in tests; top-level import when swarmd.py is executed directly
+    from .task_rules import condense
+except ImportError:  # pragma: no cover - script mode
+    from task_rules import condense
+
 
 def pool(c, role=None, *, default_model):
     """The free models the swarm works with. Paid ids in `models` are dropped unless
@@ -117,17 +122,35 @@ def rest(ledger, e, *, config):
             f"resting it until {dt.datetime.fromtimestamp(until):%H:%M:%S}")
 
 
-def next_wake(ledger, c, *, pool):
-    """(model, until) for the pool model that stops resting first, or (None, 0)."""
-    live = set(pool(c))
+def next_wake(ledger, c, role=None, *, pool):
+    """(model, until) for the model that may take `role` and stops resting first, or (None, 0)."""
+    live = set(pool(c, role) if role else pool(c))
     return next(((m, until) for m, until, _ in ledger.resting() if m in live), (None, 0))
 
 
-def all_resting(ledger, c, *, next_wake):
-    model, until = next_wake(ledger, c)
-    if not model:
-        return "every model is resting"
-    return f"every model is resting; {model} is back at {dt.datetime.fromtimestamp(until):%H:%M:%S} (`swarm wake` ends the rest now)"
+def idle_outside_role(ledger, c, role, *, pool):
+    """Pool models that are free right now but that `role_models` keeps out of `role`.
+
+    On SkyRing the implementer role was dots and laguna; both rested for most of an hour while
+    three nemotron models sat idle, and the log said "every model is resting"."""
+    if not role:
+        return []
+    allowed, resting = set(pool(c, role)), {m for m, _, _ in ledger.resting()}
+    return [m for m in pool(c) if m not in allowed and m not in resting]
+
+
+def all_resting(ledger, c, role=None, *, next_wake, pool=None):
+    who = f"every model allowed to be {role}" if role else "every model"
+    model, until = next_wake(ledger, c, role) if role else next_wake(ledger, c)
+    text = f"{who} is resting"
+    if model:
+        text += (f"; {model} is back at {dt.datetime.fromtimestamp(until):%H:%M:%S}"
+                 " (`swarm wake` ends the rest now)")
+    idle = idle_outside_role(ledger, c, role, pool=pool) if pool and role else []
+    if idle:
+        text += (f"; idle but not allowed to be {role}: {', '.join(idle)}"
+                 f" (role_models.{role}; `role_fallback: true` lets them stand in)")
+    return text
 
 
 def mit_arm(c, rng=random):
@@ -254,6 +277,14 @@ def pick_model(ledger, c, exclude=(), role="implementer", *, pool, paid_pool, sp
     m = ledger.pick("implementer", pool(c, role), exclude=exclude)
     if m is not None:
         return m
+    if c.get("role_fallback"):
+        # Every model the role allows is resting or excluded: one the owner kept out of the
+        # role stands in rather than the task waiting out the rest. Opt-in, because
+        # role_models is usually a judgement that the model is bad at the role.
+        allowed = set(pool(c, role))
+        m = ledger.pick("implementer", [x for x in pool(c) if x not in allowed], exclude=exclude)
+        if m is not None:
+            return m
     left = spend_left(c)
     if left is not None and left <= 0:
         return None
@@ -543,7 +574,9 @@ class AgentTurnRunner:
                 request_sidecar=request_file.name,
                 sidecar_total=sidecar_total, usd=usd)
         d.request_log(request_file).clear()
-        error = progress[-1200:]
+        # What went wrong first, not the turn's last 1200 characters: those began mid-way
+        # through its round log, and a 300-character note kept only "round 1/10: requesting".
+        error = condense(progress, 1200)
         with open(logfile, "a") as f:  # keep the answer beside the progress for later review
             f.write(f"\n--- answer from {model} (exit {p.returncode}) ---\n{out}\n")
         # Ctrl-C kills the turn's process, which would otherwise look like a crashed model and

@@ -144,8 +144,15 @@ class Reconcile:
     """
 
     @staticmethod
-    def summary(local_rows, provider_before=None, provider_after=None, paid_requests=0):
+    def summary(local_rows, provider_before=None, provider_after=None, paid_requests=0,
+                local_count=None):
+        """`local_count`, when given, is the free requests already counted elsewhere (the
+        run's request sidecars); `local_rows` then only adds paid ones. The daemon passed
+        no rows and patched the count in afterwards, so `other_unattributed` was the whole
+        provider delta: 138 "unattributed" in a run that observed 154 requests itself."""
         local = sum(1 for r in local_rows if r.get("paid") is not True)
+        if local_count is not None:
+            local = int(local_count)
         paid_local = sum(1 for r in local_rows if r.get("paid") is True)
         provider_delta = None
         if isinstance(provider_before, int) and isinstance(provider_after, int):

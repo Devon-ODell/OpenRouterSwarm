@@ -17,6 +17,7 @@ The judge's impact/creativity/quality scores only rank work that already
 passed them, so a flattering judge cannot promote broken code.
 """
 import fcntl
+import hashlib
 import json
 import math
 import random
@@ -28,12 +29,22 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+try:  # package import in tests; top-level import when swarmd.py is executed directly
+    from .workflow import salvaged_object
+except ImportError:  # pragma: no cover - script mode
+    from workflow import salvaged_object
+
 PRIOR = 1.0
 DISCOUNT = 0.97          # per pull of an arm: evidence half-life ≈ 23 pulls
 COOLDOWN_BASE = 1800     # seconds a model rests after provider failure; doubles per strike
 COOLDOWN_MAX = 12 * 3600 # also: strikes older than this are forgotten
 BUSY_COOLDOWN = 120      # rate-limited upstream ("busy"): a short rest, doubling per busy spell
 BUSY_MAX = 1800
+# A model rate-limited this often within the hour is passed over while a calmer one is free.
+# warm() forgets a model's rest on its next good turn, so the rest alone kept no memory of it:
+# laguna was busy on 6 of 9 SkyRing turns and was drawn again after every one of them.
+BUSY_WINDOW = 3600
+BUSY_SKIP = 3
 
 # Failure stages and their reward. None means "not the implementer's doing": no update.
 # Faulty code earns nothing; how hard it hurts is set by PENALTY_WEIGHT below.
@@ -112,6 +123,43 @@ def reward(stage, scores=None, nov=0.0, repairs=0, goal_weight=1.0):
     base = 0.4 + earned * clamp(goal_weight, 0.0, 1.0)
     base = max(0.4, base - REPAIR_COST * max(0, repairs or 0))
     return round(min(1.0, base + 0.1 * clamp(nov, 0.0, 1.0)), 4)
+
+
+# What a landed change teaches the bandit when its judge returned no usable scores (N6). Which
+# is right is measured by bench/unscored_ab.py on the swarm's own history; `unscored_reward`
+# in the config picks one, and "ab" splits tasks between `unscored_ab_arms`. The default is
+# impute: on 2026-10-11 it was the only policy never worse than the old neutral credit in any
+# scenario, and its credit missed the judges' real scores by +0.002 on average (neutral: -0.143).
+UNSCORED_POLICIES = ("neutral", "floor", "impute", "skip")
+
+
+def unscored_update(policy, nov=0.0, repairs=0, goal_weight=1.0, model_mean=None):
+    """(reward, weight) for an accepted change the judge did not score, or None: no update.
+
+    neutral  as if the judge had said nothing: 0.6 plus novelty at full weight (the old rule).
+    floor    only what landing proves: the 0.4 floor plus novelty, at weight 1.
+    impute   the implementer's own mean scored reward (the pooled one if it has none), at full
+             weight; with no scored history at all it falls back to neutral. The default.
+    skip     the landing is recorded but the bandit learns nothing from it."""
+    if policy == "skip":
+        return None
+    if policy == "floor":
+        zero = {k: 0 for k in WEIGHTS}
+        return reward("accepted", zero, nov, repairs, goal_weight), 1.0
+    if policy == "impute" and model_mean is not None:
+        return round(clamp(model_mean, 0.4, 1.0), 4), REWARD_WEIGHT
+    return reward("accepted", None, nov, repairs, goal_weight), REWARD_WEIGHT
+
+
+def unscored_policy(c, task_id):
+    """The policy for this task's unscored landing. Under "ab" the task id picks the arm, so a
+    retried task stays in its arm and the split is reproducible."""
+    policy = (c or {}).get("unscored_reward") or "impute"
+    if policy == "ab":
+        arms = [a for a in ((c or {}).get("unscored_ab_arms") or ["neutral", "impute"])
+                if a in UNSCORED_POLICIES] or ["neutral"]
+        return arms[int(hashlib.sha1(str(task_id).encode()).hexdigest()[:8], 16) % len(arms)]
+    return policy if policy in UNSCORED_POLICIES else "impute"
 
 
 def weight(stage):
@@ -195,16 +243,34 @@ def is_breakthrough(r, scores, history, min_history=8):
     return False
 
 
-def parse_scores(text):
-    """Judge output → scores dict, or None if it is not the requested JSON."""
+def _judge_json(text):
+    """(object, salvaged) from a judge reply, or (None, False).
+
+    Two of the first five SkyRing judge replies were lost whole over their follow-ups: one
+    ended without its final `}`, one had a follow-up object missing its `}`. Their scores were
+    well formed both times. So the reply as written, then the longest prefix of it that parses
+    once its open brackets are closed, which can lose a follow-up but keeps the assessment."""
     s, e = text.find("{"), text.rfind("}")
-    if s < 0 or e <= s:
-        return None
-    try:
-        d = json.loads(text[s:e + 1])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(d, dict):
+    if s < 0:
+        return None, False
+    if e > s:
+        try:
+            d = json.loads(text[s:e + 1])
+            if isinstance(d, dict):
+                return d, False
+        except json.JSONDecodeError:
+            pass
+    # The reviewer's salvage: cut back to where a value ended and close what is still open.
+    d = salvaged_object(text, s, required="impact")
+    return (d, True) if d is not None else (None, False)
+
+
+def parse_scores(text):
+    """Judge output → scores dict, or None if it is not the requested JSON.
+
+    A reply that needed repair carries `salvaged: True`."""
+    d, salvaged = _judge_json(text or "")
+    if d is None:
         return None
     out = {}
     for k in WEIGHTS:
@@ -220,14 +286,19 @@ def parse_scores(text):
     out["why"] = str(d.get("why", ""))[:300]
     out["lesson"] = str(d.get("lesson", ""))[:300]
     def strings(value, limit, width):
+        value = [value] if isinstance(value, str) else value   # one criterion, unlisted
         return [str(v).strip()[:width] for v in (value if isinstance(value, list) else [])
                 if isinstance(v, str) and v.strip()][:limit]
 
     out["follow_ups"] = [
         {"title": f["title"].strip()[:120], "detail": str(f.get("detail", ""))[:800],
-         "acceptance": strings(f.get("acceptance"), 5, 300), "paths": strings(f.get("paths"), 8, 200)}
-        for f in (d.get("follow_ups") or [])
+         # Judges write "acceptance_criteria" as often as the "acceptance" they are asked for.
+         "acceptance": strings(f.get("acceptance") or f.get("acceptance_criteria"), 5, 300),
+         "paths": strings(f.get("paths"), 8, 200)}
+        for f in (d.get("follow_ups") if isinstance(d.get("follow_ups"), list) else [])
         if isinstance(f, dict) and isinstance(f.get("title"), str) and f["title"].strip()][:2]
+    if salvaged:
+        out["salvaged"] = True
     return out
 
 
@@ -273,7 +344,7 @@ class Ledger:
             except (OSError, json.JSONDecodeError):
                 d = {}
             for k, v in (("arms", {}), ("lessons", []), ("accepted", []), ("cooldown", {}),
-                         ("shame", [])):
+                         ("shame", []), ("busy_at", {})):
                 d.setdefault(k, v)
             yield d
             if write:
@@ -288,13 +359,18 @@ class Ledger:
     # ------------------------------------------------------------ bandits
 
     def pick(self, role, arms, exclude=(), rng=random):
-        """Thompson sample among arms that are not excluded or cooling down."""
+        """Thompson sample among arms that are not excluded or cooling down, and not rate-limited
+        BUSY_SKIP times within the hour unless every free arm has been."""
         now = time.time()
         with self.txn(write=False) as d:
             table, cool = d["arms"].get(role, {}), d["cooldown"]
+            busy_at = d["busy_at"]
         live = [a for a in arms if a not in exclude and cool.get(a, {}).get("until", 0) <= now]
         if not live:
             return None
+        calm = [a for a in live
+                if sum(1 for t in busy_at.get(a, []) if now - t < BUSY_WINDOW) < BUSY_SKIP]
+        live = calm or live
         return max(live, key=lambda a: rng.betavariate(table.get(a, {}).get("a", PRIOR),
                                                         table.get(a, {}).get("b", PRIOR)))
 
@@ -327,6 +403,8 @@ class Ledger:
                 rest = COOLDOWN_MAX
             elif busy:
                 c["busy"] = c.get("busy", 0) + 1
+                d["busy_at"][model] = [t for t in d["busy_at"].get(model, [])
+                                       if now - t < BUSY_WINDOW] + [now]
                 rest = min(BUSY_MAX, BUSY_COOLDOWN * 2 ** (c["busy"] - 1))
             else:
                 c["strikes"] = c.get("strikes", 0) + 1
@@ -435,6 +513,17 @@ class Ledger:
     def accepted_texts(self, n=200):
         with self.txn(write=False) as d:
             return [f"{a['title']} {a.get('detail', '')}" for a in d["accepted"][-n:]]
+
+    def scored_mean(self, implementer=None, n=200):
+        """Mean reward of the judged landings in the last `n`: this implementer's, or everyone's
+        when it has none (or none is named). None when nothing was ever judged."""
+        with self.txn(write=False) as d:
+            rows = [a for a in d["accepted"][-n:]
+                    if a.get("scores") and a.get("quality_score") != "unscored"
+                    and isinstance(a.get("reward"), (int, float))]
+        own = [a["reward"] for a in rows if implementer and a.get("implementer") == implementer]
+        pool = own or [a["reward"] for a in rows]
+        return sum(pool) / len(pool) if pool else None
 
     def accepted_rewards(self, n=50):
         with self.txn(write=False) as d:

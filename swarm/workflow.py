@@ -9,6 +9,11 @@ from pathlib import Path
 import re
 import time
 
+try:  # package import in tests; top-level import when swarmd.py is executed directly
+    from .task_rules import SIGNAL_LINE
+except ImportError:  # pragma: no cover - script mode
+    from task_rules import SIGNAL_LINE
+
 
 STRATEGIES = {
     "regression_first": "Reproduce the problem with a focused regression test. Make the smallest fix, then run the complete configured checks.",
@@ -57,7 +62,7 @@ def path_allowed(path, scope):
     return any(path == p or (p.endswith("/") and path.startswith(p)) for p in scope)
 
 
-def salvaged_object(text, start):
+def salvaged_object(text, start, required="verdict"):
     """The longest prefix of the object at `start` that parses once its containers are closed.
 
     A reviewer that closes `"acceptance": [...` with `}` instead of `]`, or simply stops mid
@@ -101,7 +106,7 @@ def salvaged_object(text, start):
             value = json.loads(text[start:cut] + "".join(reversed(open_containers)))
         except ValueError:
             continue
-        if isinstance(value, dict) and "verdict" in value:
+        if isinstance(value, dict) and required in value:
             return value
     return None
 
@@ -127,6 +132,11 @@ def review_object(text):
         if value is not None:
             return value, True
     raise ValueError("no JSON object with a verdict")
+
+
+# Severities reviewers use for remarks that are not defects.
+OBSERVATION = frozenset({"info", "information", "note", "nit", "nitpick", "suggestion",
+                         "observation", "praise", "none", "low"})
 
 
 def parse_review(text, tree, acceptance):
@@ -178,11 +188,19 @@ def parse_review(text, tree, acceptance):
             raise ValueError("invalid, duplicate or unevidenced acceptance check")
         seen.add(row["criterion"])
     for finding in findings:
+        if isinstance(finding, dict) and str(finding.get("severity", "")).lower() in OBSERVATION:
+            # An observation, not a defect. The first SkyRing review filed one as "info" with
+            # no verification, and the whole verdict was rejected for it (5 requests, 39 s).
+            # Filed as minor it cannot block, and the acceptance-gap check below still reads it.
+            finding["severity"] = "minor"
         if not isinstance(finding, dict) or finding.get("severity") not in ("blocker", "major", "minor"):
             raise ValueError("each finding needs a severity")
-        for field in ("issue", "verification"):
+        # A minor finding blocks nothing, so there is nothing for a verification to prove.
+        for field in ("issue", "verification") if finding["severity"] != "minor" else ("issue",):
             if not isinstance(finding.get(field), str) or not finding[field].strip():
                 raise ValueError(f"each finding needs {field}")
+        if not isinstance(finding.get("verification"), str):
+            finding["verification"] = ""
         # A real defect is not always one file and line — "no corpus audit was done
         # before this check went live" has nothing to point a line number at. path and
         # line are required together, as a pair, or omitted together; a finding is never
@@ -210,10 +228,52 @@ def parse_review(text, tree, acceptance):
     return review
 
 
+def failure_lines(details):
+    """The lines of a failure that say what failed, with directories cut to file names."""
+    lines = [l.strip() for l in re.split(r"\n|\\n", str(details or ""))
+             if SIGNAL_LINE.search(l) and not l.strip().startswith(("PASS", '"log"'))]
+    # The gate's own bookkeeping (which log, how long) changes every cycle; so do directories.
+    lines = [re.sub(r'"(?:log|seconds)":\s*(?:"[^"]*"|[\d.]+),?\s*', "", l) for l in lines]
+    return [re.sub(r"(?:/[^\s/'\"]+)+/", "/", l) for l in lines]
+
+
 def failure_signature(stage, details):
-    # Stable enough to detect repeating the same failed approach after a repair.
-    text = re.sub(r"\b[0-9a-f]{7,40}\b|\b\d+(?:\.\d+)?s\b", "<value>", details.lower())
+    """Stable enough to detect repeating the same failed approach after a repair.
+
+    It hashed the whole gate evidence, which names the cycle's log file, its timing and the
+    temp directory the gate built in, so no two failures ever matched: the SkyRing stamina
+    packet failed three times on the same `44 == 36` and was repaired twice regardless."""
+    # A review's findings are its substance, so only a gate failure is reduced to its lines.
+    lines = failure_lines(details) if stage == "tests_failed" else []
+    text = "\n".join(lines) if lines else str(details or "")
+    text = re.sub(r"\b[0-9a-f]{7,40}\b|\b\d+(?:\.\d+)?s\b", "<value>", text.lower())
     return hashlib.sha256(f"{stage}:{text}".encode()).hexdigest()[:16]
+
+
+def out_of_scope_check(details, scope, grep):
+    """`path:line` of the check a failure comes from (up to three), when every copy of it
+    lives outside `scope`.
+
+    A failure that survives a repair and whose check sits in a file the packet may not touch
+    is the packet's defect, not the model's: the stamina packet appended ErWorld fields that
+    plugin/src/Bridge.cpp and tools/verify.py pin at 36 bytes, and allowed_paths had neither.
+    `grep(text)` returns `path:line` hits for a fixed string in the worktree."""
+    if not scope:
+        return ""
+    # Only a compiler's diagnostic counts: it echoes the failing source line under
+    # `file:line:col: error:`, and code outside the packet that no longer compiles has to change.
+    # A test's assertion is not enough. A test outside the packet that fails on a quoted value
+    # is usually the in-scope code being wrong, which is the model's to fix.
+    lines = [l.strip() for l in re.split(r"\n|\\n", str(details or ""))]
+    snippets = [code for diag, code in zip(lines, lines[1:])
+                if re.search(r":\d+(?::\d+)?: (?:fatal )?error\b", diag)
+                and len(code) >= 8 and not code.startswith(("^", "~", "|"))]
+    for snippet in dict.fromkeys(snippets):
+        hits = [h for h in grep(snippet) if h]
+        files = {h.split(":", 1)[0] for h in hits}
+        if hits and not any(path_allowed(f, scope) for f in files):
+            return ", ".join(hits[:3])
+    return ""
 
 
 class Attempt:
@@ -283,6 +343,7 @@ claim you ran commands; the supplied gate records say what actually ran.
 "lesson":"optional, specific advice supported by this change",
 "follow_ups":[{{"title":"...","detail":"why this advances the same goal",
 "acceptance":["concrete check"]}}]}}
+Only defects go in findings: leave observations, praise and ideas out of it.
 Use an empty findings list when there are none. Blockers/major findings or failed
 criteria require request_changes. Suggestions for future features are not blockers.
 """

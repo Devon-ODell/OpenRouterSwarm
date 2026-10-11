@@ -47,7 +47,10 @@ class RepoCase(unittest.TestCase):
         self.root = Path(d.name)
         for name in ("state", "logs"):
             (self.root / name).mkdir()
-        for attr, value in (("STATE", self.root / "state"), ("LOGS", self.root / "logs")):
+        for attr, value in (("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
+                            # Worktrees of a temp repository belong to the test run, not
+                            # under the harness's own swarm/wt.
+                            ("wt_root", lambda: self.root / "wt" / swarmd.SLUG)):
             p = patch.object(swarmd, attr, value)
             p.start()
             self.addCleanup(p.stop)

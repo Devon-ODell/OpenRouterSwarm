@@ -206,4 +206,49 @@ def first_failing_line(text):
     return re.sub(r"\s+", " ", m.group(0)).strip()[:200] if m else ""
 
 
+# A turn's progress lines: what it did, not what went wrong.
+PROGRESS_LINE = re.compile(r"^(?:round \d+/\d+: |tool: |provider busy |step limit: )")
+# Lines that say what went wrong, wherever they are in a failure's text.
+SIGNAL_LINE = re.compile(r"\berror\b|\bfail(?:s|ed|ure)?\b|assert|panicked|evaluates to|"
+                         r"stopped after|^flint:|traceback|exception", re.I)
+
+
+def condense(text, limit=800):
+    """A failure's text in `limit` characters, what went wrong first.
+
+    Notes used to be cut to their head or their tail. On SkyRing the head of an exploration
+    note was "round 1/10: requesting …" and the tail of a gate note was a build log
+    ("Bundling source/chr/…"), while the lines that mattered ("Stopped after 8 rounds with no
+    edit", "evaluates to '44 == 36'") were cut. This keeps the first line, a count of the
+    turn's rounds and tools, and every line that names a failure, then fills with the tail."""
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    # Gate evidence arrives JSON-escaped, its newlines as a literal backslash-n.
+    lines = [l.strip() for l in re.split(r"\n|\\n", text) if l.strip()]
+    rounds = sum(1 for l in lines if re.match(r"round \d+/\d+: ", l))
+    tools = {}
+    for l in lines:
+        if l.startswith("tool: "):
+            tools[l[6:].strip()] = tools.get(l[6:].strip(), 0) + 1
+    head = []
+    if rounds:
+        head.append(f"{rounds} rounds; tools: "
+                    + (", ".join(f"{t} x{n}" for t, n in tools.items()) or "none"))
+    rest = [l for l in lines if not PROGRESS_LINE.match(l)]
+    for l in rest[:1] + [l for l in rest[1:] if SIGNAL_LINE.search(l)]:
+        # An absolute path says where the gate ran, not what failed: keep the file's name.
+        l = re.sub(r"(?:evidence: )?(?:/[\w.@+-]+){2,}/([\w.+-]+)", r"\1", l)[:240]
+        if l not in head:
+            head.append(l)
+    out = "\n".join(head)
+    if len(out) >= limit:
+        return out[:limit]
+    room = limit - len(out) - 3
+    tail = text[-room:].split("\n", 1)[-1] if room > 80 else ""
+    news = [l.strip() for l in re.split(r"\n|\\n", tail)
+            if l.strip() and not PROGRESS_LINE.match(l.strip()) and l.strip() not in head]
+    return out + ("\n…\n" + tail if news else "")
+
+
 

@@ -1593,7 +1593,10 @@ class Agent:
         edit_only = False
         for step in range(MAX_STEPS):
             if self.headless:
-                print(f"round {step + 1}/{MAX_STEPS}: requesting {self.model}", file=sys.stderr, flush=True)
+                # The clock time makes seconds-per-round readable from the log (laguna ran at
+                # 68.8 s a round on SkyRing and nothing in its logs said so).
+                print(f"round {step + 1}/{MAX_STEPS}: requesting {self.model} at "
+                      f"{datetime.datetime.now():%H:%M:%S}", file=sys.stderr, flush=True)
             content, calls = self.complete()
             msg = self._assistant_msg(content, calls)
             self.messages.append(msg)

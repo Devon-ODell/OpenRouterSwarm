@@ -184,8 +184,9 @@ git -C REPO merge swarm/trunk        # from your main checkout, when you like it
 
 New commits on `main` are merged into trunk automatically when they merge
 cleanly and keep the tests green. Rejected attempts stay on `swarm/<task>-<id>`
-branches, committed as "not accepted"; worktrees are removed after each attempt
-(`keep_worktrees: true` keeps them).
+branches, committed as "not accepted". `keep_worktrees` decides which worktrees
+outlive their attempt: `false` removes them all, `true` (the default) keeps only those
+whose branch holds work trunk does not have, and `"all"` keeps every one.
 
 ## Cursor / VS Code extension
 

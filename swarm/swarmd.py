@@ -263,11 +263,54 @@ def journal(event, **kw):
 EXAMPLE = HERE / "config.example.json"
 
 
+STATE_ROOT = HERE / "state"              # where every repository's state directory lives
+
+
+def _slug(path):
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", Path(path).name) + "-" + \
+        hashlib.sha1(str(path).encode()).hexdigest()[:6]
+
+
+def true_path(repo):
+    """`repo` resolved and spelled as the filesystem spells it.
+
+    macOS matches names without regard to case, so .../SkyRing and .../skyRing open the same
+    directory; resolve() keeps whatever case was typed. F_GETPATH asks the filesystem."""
+    path = Path(repo).expanduser().resolve()
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return path
+    try:
+        return Path(os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b"\0")))
+    except (AttributeError, OSError, ValueError):   # F_GETPATH is macOS-only
+        return path
+    finally:
+        os.close(fd)
+
+
 def repo_slug(repo):
-    """The short, stable name a repository's state, logs, worktrees and config are filed under."""
-    repo = str(Path(repo).expanduser().resolve())
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", Path(repo).name) + "-" + \
-        hashlib.sha1(repo.encode()).hexdigest()[:6]
+    """The short, stable name a repository's state, logs, worktrees and config are filed under.
+
+    The name hashed the path as typed, so SkyRing and skyRing were two swarms with two
+    queues, two ledgers and two daemon locks on one directory. It is now the filesystem's
+    spelling, except that a swarm which already ran under another spelling of the same
+    directory (it has a journal) keeps its name, whichever spelling is typed."""
+    true = true_path(repo)
+    typed = Path(repo).expanduser().resolve()
+    candidates = [true, typed]
+    try:
+        for d in STATE_ROOT.iterdir():
+            name = d.name.rpartition("-")[0]
+            if name.casefold() == true.name.casefold() and name != true.name:
+                candidates.append(true.parent / name)
+    except OSError:
+        pass
+    for path in dict.fromkeys(candidates):
+        slug = _slug(path)
+        if path != true and (STATE_ROOT / slug / "journal.jsonl").is_file():
+            return slug
+    return _slug(true)
 
 
 def per_repo_config(repo):
@@ -1020,12 +1063,12 @@ def rest(ledger, e):
     return agent_turn.rest(ledger, e, config=CONFIG)
 
 
-def next_wake(ledger, c):
-    return agent_turn.next_wake(ledger, c, pool=pool)
+def next_wake(ledger, c, role=None):
+    return agent_turn.next_wake(ledger, c, role, pool=pool)
 
 
-def all_resting(ledger, c):
-    return agent_turn.all_resting(ledger, c, next_wake=next_wake)
+def all_resting(ledger, c, role=None):
+    return agent_turn.all_resting(ledger, c, role, next_wake=next_wake, pool=pool)
 
 
 def read_charges(path, role, worker, model):
@@ -1408,7 +1451,8 @@ KNOWN_KEYS = frozenset({
     "daily_usd", "monthly_usd", "spend_reset_day", "allowance_recheck", "editor_wallet",
     "corpus_db", "corpus_root", "corpus_k", "study", "inject_corpus", "mit_experiment",
     "sandbox", "sandbox_write", "keep_worktrees", "notify", "baseline_ttl", "personas",
-    "restart_on_change", "restart_min_interval", "role_models",
+    "restart_on_change", "restart_min_interval", "role_fallback", "role_models",
+    "unscored_reward", "unscored_ab_arms",
     "scope_gate", "idle_improvement", "idle_improvement_cooldown", "max_review_formats",
     "task_request_cap", "run_request_cap", "max_role_calls",
     "keep_attempts", "execution_class", "auto_plan", "prov", "shutdown_on_quota_exhausted",

@@ -11,7 +11,7 @@ Every command prints JSON. `ask` streams one JSON object per line as models fini
     bridge.py task     --repo PATH --title T [--detail D] [--file F --start N --end M --selection-file S]
     bridge.py queue-get    --repo PATH --id ID
     bridge.py queue-edit   --repo PATH --id ID [--title T] [--detail D] [--kind K]
-                           [--priority N] [--acceptance TEXT ...]
+                           [--priority N] [--acceptance TEXT ...] [--allowed-path P ...]
                            [--allow-test-changes | --no-allow-test-changes]
     bridge.py queue-retry   --repo PATH --id ID
     bridge.py queue-requeue --repo PATH --id ID
@@ -579,7 +579,8 @@ def cmd_queue_edit(a):
     c, q = _queue(a.repo)
     try:
         t = q.edit(a.id, title=a.title, detail=a.detail, kind=a.kind, priority=a.priority,
-                   acceptance=a.acceptance, allow_test_changes=a.allow_test_changes)
+                   acceptance=a.acceptance, allow_test_changes=a.allow_test_changes,
+                   allowed_paths=a.allowed_paths)
     except KeyError:
         emit({"ok": False, "error": f"no queued task with id {a.id}"})
         return 2
@@ -1364,6 +1365,9 @@ def main(argv=None):
             s.add_argument("--priority", type=int, choices=(0, 1, 2))
             s.add_argument("--acceptance", action="append",
                            help="one acceptance criterion; repeat for several")
+            s.add_argument("--allowed-path", dest="allowed_paths", action="append",
+                           help="a file or directory/ the task may change; repeat for several "
+                                "(replaces the task's whole scope)")
             # Editing the queue is a person's doing, so this is theirs to grant or take back.
             s.add_argument("--allow-test-changes", dest="allow_test_changes",
                            action="store_true", default=None,

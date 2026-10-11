@@ -96,6 +96,27 @@ class Worker(threading.Thread):
         self.doing = why
         self.publish(state)
 
+    def spent(self):
+        """What the attempt being released spent, for whichever path releases it.
+
+        Only the provider-outage path used to pass these, so a stop, a quota pause or an
+        error left the task's requests_spent short: 8 recorded for 15 made on SkyRing."""
+        started = getattr(self, "started", 0) or time.time()
+        return dict(requests=getattr(self, "attempt_requests", 0) or 0,
+                    turn_seconds=round(max(0, time.time() - started), 1),
+                    role_turns=getattr(self, "role_calls", 0) or 0)
+
+    def rest(self, seconds):
+        """Sleep until `seconds` pass, the run stops, or a drain is requested.
+
+        Waiting on `stop` alone kept a deferred task's worker asleep for the whole retry
+        delay after a drain began: a source-change restart sat 120 s with nothing in flight."""
+        end = time.time() + seconds
+        while True:
+            left = end - time.time()
+            if left <= 0 or self.stop.wait(min(1.0, left)) or self.tally.drain.is_set():
+                return
+
     # -- helpers -----------------------------------------------------------
 
     def _attempt_config(self, c=None):
@@ -149,7 +170,7 @@ class Worker(threading.Thread):
             if not task:
                 self.doing, self.state = None, IDLE
                 self.clock.enter(IDLE)
-                self.stop.wait(20)
+                self.rest(20)
                 continue
             # One claim, one immutable view. A different worker may reload the live dict and
             # retune the daemon budget while this task is running; neither change reaches this
@@ -177,12 +198,10 @@ class Worker(threading.Thread):
                 final = self.q.release(task["id"], ok, note, failure_class=self.failure_class,
                                        split_now=self.agent_timed_out and self.stage != "agent_timeout",
                                        park=self.stage in ("out_of_scope", "request_budget", "model_pool_exhausted"),
-                                       requests=getattr(self, "attempt_requests", 0),
                                        failed_model=(self.last_model if not ok and self.failure_class in
                                                      ("harness", "model") else None),
                                        failed_role=self.last_role, ledger=self.ledger,
-                                       turn_seconds=round(max(0, time.time() - (getattr(self, "started", 0) or time.time())), 1),
-                                       role_turns=getattr(self, "role_calls", 0) or 0, stage=self.stage)
+                                       stage=self.stage, **self.spent())
                 d.journal("task", id=task["id"], title=task["title"], ok=ok, stage=self.stage,
                           failure_class=None if ok else self.failure_class,
                           status=final.get("status") if final else None,
@@ -197,37 +216,40 @@ class Worker(threading.Thread):
             except CapReached:
                 d.log("quota/window pause — deferring task", self.name)
                 self.q.release(task["id"], False, "quota/window pause", defer=60,
-                               failure_class="harness", requests=self.attempt_requests)
+                               failure_class="harness", **self.spent())
                 # 22 of these in one day, ten minutes each, while the local count read
                 # 1025/1000 and OpenRouter reported fewer requests used. Ask before sleeping,
                 # and sleep no longer than the interval at which the next ask is due.
                 if d.recheck_allowance(c, attempt_budget):
                     continue
                 self.backing_off(ALLOWANCE_BLOCKED, "waiting for the free allowance")
-                self.stop.wait(min(600, d.allowance_recheck(c) or 600))
+                self.rest(min(600, d.allowance_recheck(c) or 600))
             except ProviderDown as e:
                 self.q.release(task["id"], False, f"provider unavailable: {str(e)[:200]}", defer=30,
-                               failure_class="harness", requests=self.attempt_requests,
-                               turn_seconds=round(max(0, time.time() - (getattr(self, "started", 0) or time.time())), 1),
-                               role_turns=getattr(self, "role_calls", 0) or 0)
+                               failure_class="harness", **self.spent())
                 if self.pick(c=c) is None:
                     # No model can take a turn. Sleep until the first one is back, not blindly.
-                    _, until = d.next_wake(self.ledger, c)
+                    # Wake for the first model that may implement, not the first in the pool.
+                    _, until = d.next_wake(self.ledger, c, "implementer")
                     wait = max(30, min(300, until - time.time()))
-                    d.log(f"{d.all_resting(self.ledger, c)}; task deferred, next try in {wait:.0f}s", self.name)
+                    resting = d.all_resting(self.ledger, c, "implementer")
+                    d.log(f"{resting}; task deferred, next try in {wait:.0f}s", self.name)
+                    if "idle but not allowed" in resting:
+                        d.journal("role_starved", id=task["id"], role="implementer",
+                                  detail=resting, wait=round(wait))
                 else:
                     wait = 30
                     d.log(f"no other model could take over from {e.model}; task deferred, next try in 30s", self.name)
                 self.backing_off(PROVIDER_BACKOFF, f"waiting for a model (next try in {wait:.0f}s)")
-                self.stop.wait(wait)
+                self.rest(wait)
             except NoCredits as e:
                 d.log(f"out of credits: {e}", self.name)
-                self.q.release(task["id"], False, "no credits", requests=self.attempt_requests)
+                self.q.release(task["id"], False, "no credits", **self.spent())
                 self.stop.set()
             except Exception as e:
                 if self.stop.is_set():
                     self.q.release(task["id"], False, "run stopped; changes retained", defer=1,
-                                   failure_class="harness")
+                                   failure_class="harness", **self.spent())
                     return
                 described = d.describe_error(e)
                 d.log(f"error on {task['id']}: {described['kind']}: {described['err']}", self.name)
@@ -235,14 +257,15 @@ class Worker(threading.Thread):
                 # A turn that timed out is still a failed attempt: let it split like any other,
                 # or the task is shelved with no smaller pieces to try.
                 # An unexpected exception in the supervisor is ours, not the task's.
-                final = self.q.release(task["id"], False, str(e)[:400], failure_class="harness")
+                final = self.q.release(task["id"], False, str(e)[:400], failure_class="harness",
+                                       **self.spent())
                 if final and final.get("status") == "split":
                     try:
                         self.decompose(final, d.read_goal(c), c=c,
                                        attempt_budget=attempt_budget)
                     except Exception as exc:
                         d.log(f"could not split '{final['title']}': {exc}", self.name)
-                self.stop.wait(30)
+                self.rest(30)
             finally:
                 # Between tasks a worker is not working on anything. `task` and `started` used
                 # to keep the last task's values while the worker sat in claim(), so the panel

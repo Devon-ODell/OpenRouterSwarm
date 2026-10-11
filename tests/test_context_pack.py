@@ -146,6 +146,48 @@ class ContextPackTests(unittest.TestCase):
         self.assertNotIn("chars not shown", pack)
         self.assertNotIn("x + x", pack, "the bodies are what would not fit")
 
+    def test_a_long_rust_file_outlines_its_items_not_its_let_bindings(self):
+        """SkyRing 2026-10-11: player.rs (1105 lines) outlined as 69 `let` lines and none of
+        its 61 functions and types, so two implementers spent 15 requests looking for
+        receive_hit and never edited."""
+        filler = "".join(f"        let v{i} = {i};\n" for i in range(450))
+        self.write("core/src/sim/player.rs",
+                   "pub struct Player {\n    hp: f32,\n}\n\nimpl Player {\n"
+                   "    pub fn update(&mut self) {\n" + filler + "    }\n\n"
+                   "    pub(crate) fn receive_hit(&mut self, low: bool) -> HitResult {\n"
+                   "        if low { HitResult::Dodged } else { HitResult::Hit }\n    }\n}\n\n"
+                   "pub enum HitResult {\n    Hit,\n    Dodged,\n}\n")
+        pack = self.pack(self.task("Pin how Player::receive_hit classifies hits",
+                                   "Add core/tests/hits.rs; the logic is in core/src/sim/player.rs"))
+        self.assertIn("definitions only", pack)
+        for item in ("pub struct Player", "impl Player", "pub fn update", "pub enum HitResult"):
+            self.assertIn(item, pack)
+        self.assertNotIn("let v1 =", pack)
+        # The function the task names comes in full, numbered as read_file numbers it.
+        self.assertIn("(in full: the task names it)", pack)
+        self.assertIn("  459\t    pub(crate) fn receive_hit(&mut self, low: bool) -> HitResult {", pack)
+        self.assertIn("  460\t        if low { HitResult::Dodged } else { HitResult::Hit }", pack)
+
+    def test_a_long_c_header_outlines_its_types_and_prototypes(self):
+        self.write("core/include/api.h",
+                   "#define API_VERSION 3\n" + "/* note */\n" * 450 +
+                   "typedef struct ErWorld {\n    float x;\n} ErWorld;\n"
+                   "ErHitResult er_receive_hit(ErCombat* combat, uint8_t low);\n")
+        pack = self.pack(self.task("Fix core/include/api.h"))
+        self.assertIn("#define API_VERSION 3", pack)
+        self.assertIn("typedef struct ErWorld {", pack)
+        self.assertIn("ErHitResult er_receive_hit(ErCombat* combat, uint8_t low);", pack)
+        self.assertNotIn("/* note */", pack)
+
+    def test_named_python_function_is_shown_whole_when_its_file_is_outlined(self):
+        self.write("tools/big.py", "".join(f"def f{i}():\n    return {i}\n\n" for i in range(200))
+                   + "def validate(doc):\n    errors = []\n    return errors\n\n\ndef after():\n"
+                   "    pass\n")
+        pack = self.pack(self.task("Make validate() in tools/big.py reject owner docs"))
+        self.assertIn("  601\tdef validate(doc):", pack)
+        self.assertIn("  603\t    return errors", pack)
+        self.assertNotIn("  606\tdef after():\n  607", pack)
+
     def test_the_test_module_survives_a_long_file(self):
         """The reserved tail: which narrow test to run is the smallest, most useful section."""
         self.write("games/crosstown/game.js",

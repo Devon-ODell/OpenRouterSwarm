@@ -49,6 +49,10 @@ def score(benchmark):
             # Stopped by a provider outage or the allowance: requests spent, no verdict.
             attempts[j["id"]].append({**j, "stage": "deferred", "failure_class": "provider",
                                       "implementer": j.get("model")})
+        elif j.get("event") in ("attempt_stopped", "attempt_error"):
+            # Cut short by a stop or by an error of the harness's own: spent, never judged.
+            attempts[j["id"]].append({**j, "stage": j["event"].split("_", 1)[1],
+                                      "failure_class": "harness", "implementer": j.get("model")})
 
     def family(tid):
         """The task and the pieces the decomposer split it into. A judge's follow-ups share the

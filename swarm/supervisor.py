@@ -296,12 +296,20 @@ def start(c, hours=None, max_tasks=None, awake=False, *, d):
             timer = threading.Timer(seconds, d.shutdown)
             timer.daemon = True
             timer.start()
-        signal.signal(signal.SIGTERM, lambda *_: d.shutdown())
+        def stopped_by(name):
+            def handler(*_):
+                # The run record said `stop_reason: null` after `swarm stop`; say who stopped it.
+                with d.run_lock:
+                    d.run["stop_reason"] = d.run.get("stop_reason") or f"Stopped ({name})"
+                d.shutdown()
+            return handler
+
+        signal.signal(signal.SIGTERM, stopped_by("SIGTERM"))
         # A shell starting a job in the background hands it SIGINT set to SIG_IGN, and CPython
         # keeps an inherited SIG_IGN rather than installing its own handler. So a daemon
         # launched with `&` or nohup — which is how every shift is started — silently ignored
         # `swarm stop` and the panel's Stop button. Taking the signal back makes them work.
-        signal.signal(signal.SIGINT, lambda *_: d.shutdown())
+        signal.signal(signal.SIGINT, stopped_by("SIGINT"))
         try:
             d.run_daemon(c, max_tasks, hours=hours)
         finally:
@@ -315,6 +323,13 @@ def start(c, hours=None, max_tasks=None, awake=False, *, d):
                 # Provider deltas come from OpenRouter's own counters; local attempts come
                 # from the request sidecars. Differences are shown, never assigned.
                 last_provider = d.run.get("provider_last")
+                # provider_last is read at (re)start, so by now it is a shift old: ask again.
+                try:
+                    used = ((d.account() or {}).get("free_model_daily_requests") or {}).get("used")
+                    if isinstance(used, int):
+                        last_provider = d.run["provider_last"] = used
+                except Exception:
+                    pass                    # a stop never waits on, or fails over, the account
                 if isinstance(last_provider, int):
                     d.run["provider_at_stop"] = last_provider
                 local_total = int(d.run.get("requests_started", 0))
@@ -325,8 +340,7 @@ def start(c, hours=None, max_tasks=None, awake=False, *, d):
                     [],  # local rows are already summed in requests_started
                     provider_before=d.run.get("provider_before"),
                     provider_after=last_provider,
-                    paid_requests=paid_total)
-                d.run["reconcile"]["locally_observed"] = local_total
+                    paid_requests=paid_total, local_count=local_total)
                 d.journal("run_stop", stop_reason=d.run.get("stop_reason"),
                         requests_local=local_total,
                         reconcile=d.run.get("reconcile"))
