@@ -140,10 +140,10 @@ class RecoveryContracts(unittest.TestCase):
         self.assertIn(task['id'], row['root_blockers'])
         self.assertIn('review formats', row['blocked_tasks'][0]['reason'])
 
-    def test_reporting_edits_do_not_restart_the_daemon(self):
+    def test_watcher_tracks_real_swarm_modules_but_not_nonexistent_board(self):
         watched = {p.name for p in swarmd.source_files()}
         self.assertNotIn('board.py', watched)
-        self.assertNotIn('bridge.py', watched)
+        self.assertIn('bridge.py', watched)   # P1: every direct swarm module is watched now
         self.assertIn('workflow.py', watched)
 
 

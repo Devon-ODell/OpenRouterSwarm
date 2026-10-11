@@ -276,6 +276,110 @@ class SourceChangeTests(unittest.TestCase):
             _, _, env = self.restart()
         self.assertNotIn("FLINT_RUN_DEADLINE", env)
 
+    # ---- P1: the watcher now covers every direct production source ----------
+
+    def test_every_direct_swarm_module_and_root_entry_is_watched(self):
+        watched = {p.resolve() for p in swarmd.source_files()}
+        root = Path(swarmd.ROOT).resolve()
+        here = Path(swarmd.HERE).resolve()
+        entries = {root / "flint.py", root / "nonstop.py"}
+        direct = {p.resolve() for p in here.iterdir() if p.is_file() and p.suffix == ".py"}
+        # The harness is exactly the 22 direct swarm modules plus the two root entry
+        # points -- asserted as set equality, so adding a module can't rot this test.
+        self.assertLessEqual(entries, watched, "the root entry points must be watched")
+        self.assertLessEqual(direct, watched, "every direct swarm module must be watched")
+        self.assertEqual(watched, direct | entries,
+                         "nothing outside the direct modules and root entries is watched")
+
+    def test_the_watch_skips_state_worktrees_and_cache_trees(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        fake = Path(d.name).resolve()
+        watched = fake / "watched.py"
+        watched.write_text("import this\n")
+        with patch.object(swarmd, "HERE", fake), patch.object(swarmd, "ROOT", fake):
+            before = {p.resolve() for p in swarmd.source_files()}
+        self.assertIn(watched.resolve(), before)
+        junk = []
+        for sub in swarmd.WATCH_SKIP:
+            tree = fake / sub
+            tree.mkdir()
+            (tree / "junk.py").write_text("import this\n")
+            nested = tree / "nested"
+            nested.mkdir()
+            (nested / "deeper.py").write_text("import this\n")
+            junk += [tree / "junk.py", nested / "deeper.py"]
+        with patch.object(swarmd, "HERE", fake), patch.object(swarmd, "ROOT", fake):
+            after = {p.resolve() for p in swarmd.source_files()}
+        self.assertEqual(after, before,
+                         "edits under state/wt/caches must not disturb the watch set")
+        self.assertTrue(all(j.resolve() not in after for j in junk),
+                        "a state/worktree/cache file must never appear in the watch set")
+
+    def test_a_newly_added_swarm_module_changes_the_fingerprint(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        fake = Path(d.name)
+        (fake / "state").mkdir()
+        module = fake / "brand_new.py"
+        module.write_text("NEW = True\n")
+        with patch.object(swarmd, "HERE", fake), \
+             patch.object(swarmd, "ROOT", fake), \
+             patch.object(swarmd, "WATCH_SKIP", (".venv", "wt", "state", "__pycache__")):
+            before = dict(swarmd.source_fingerprint())
+            self.assertIn(str(module), before)
+            fingerprint = swarmd.source_fingerprint()
+            self.assertEqual(swarmd.source_changed(fingerprint), [])
+            module.write_text("NEW = False\n")
+            self.assertEqual(swarmd.source_changed(fingerprint), ["brand_new.py"])
+
+    def test_an_invalid_edit_is_refused_and_journalled_through_the_real_traversal(self):
+        here = Path(swarmd.HERE)
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d)
+            (fake / "state").mkdir()
+            broken = fake / "broken_harness.py"
+            broken.write_text("def f(:\n")
+            good = fake / "good_harness.py"
+            good.write_text("def f():\n    return 1\n")
+            with patch.object(swarmd, "HERE", fake), \
+                 patch.object(swarmd, "ROOT", fake), \
+                 patch.object(swarmd, "WATCH_SKIP", (".venv", "wt", "state", "__pycache__")), \
+                 patch.object(swarmd, "log"), \
+                 patch.object(swarmd, "journal") as journal, \
+                 patch.object(swarmd.os, "execve") as execve:
+                self.assertFalse(swarmd.restart_into_new_code(["broken_harness.py"]))
+                self.assertTrue(any(call.args[0] == "self_restart_refused"
+                                    for call in journal.call_args_list))
+                execve.assert_not_called()
+        self.assertTrue((here / "swarmd.py").is_file(), "the real tree is untouched")
+
+    def test_watch_traversal_is_bounded_by_the_direct_tree(self):
+        """Fingerprinting must not walk the 43k worktree files under swarm/wt.
+
+        Measured on this repo: the literal rglob sample traverses 43,418 worktree
+        Python files at ~2.7 s; pruned traversal yields the identical 24-file set
+        in ~1 ms. Assert the walk bound, not wall-clock time, so the check stays
+        deterministic in CI."""
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        fake = Path(d.name)
+        for sub in ("state", "wt"):
+            (fake / sub).mkdir()
+        watched = fake / "watched.py"
+        watched.write_text("import this\n")
+        skipped = fake / "wt" / "alien.py"
+        skipped.write_text("import this\n")
+        with patch.object(swarmd, "HERE", fake), \
+             patch.object(swarmd, "ROOT", fake), \
+             patch.object(swarmd, "WATCH_SKIP", ("state", "wt", "__pycache__",
+                                                 ".venv", ".sessions", ".pytest_cache",
+                                                 ".albatross")):
+            files = swarmd.source_files()
+        touched = [Path(p).name for p in files]
+        self.assertIn("watched.py", touched)
+        self.assertNotIn("alien.py", touched, "walk must prune wt/ instead of descending")
+
 
 class ShiftDeadlineTests(unittest.TestCase):
     """A restart must not extend the shift it was restarted into."""

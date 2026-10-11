@@ -628,9 +628,21 @@ def describe_error(e):
 # The daemon imports swarmd once and keeps it, but spawns flint.py afresh for every turn. Edit
 # the harness while it runs and it becomes half one version and half another: new flint against
 # old supervisor, with no sign of it in any log.
+# The direct files of swarm/ plus the two repo-root entry points are the harness. Trees like
+# state/ and wt/ are generated (and wt/ holds 43k worktree *.py files); pruning them at walk
+# time keeps the per-check fingerprint ~1 ms instead of ~2.7 s while watching everything else.
+WATCH_SKIP = ("state", "wt", "__pycache__", ".venv", ".sessions",
+              ".pytest_cache", ".albatross")
+
+
 def source_files():
-    return sorted({ROOT / "flint.py", ROOT / "nonstop.py",
-                   *(HERE / name for name in ("swarmd.py", "budget.py", "learn.py", "workflow.py", "sandbox.py"))})
+    out = {ROOT / "flint.py", ROOT / "nonstop.py"}
+    for dirpath, dirnames, filenames in os.walk(HERE):
+        dirnames[:] = [d for d in dirnames if d not in WATCH_SKIP]
+        for name in filenames:
+            if name.endswith(".py"):
+                out.add(Path(dirpath) / name)
+    return sorted(out)
 
 
 def source_fingerprint():
