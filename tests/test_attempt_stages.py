@@ -506,7 +506,34 @@ class AttemptStageFaultTests(RepoCase):
         self.assertIn("conflicts with newer trunk", note)
         self.assertEqual(swarmd.failure_class(w.stage, note), "harness")
 
-    def test_agent_timeout_from_a_real_agent_timeout(self):
+    def test_conflict_when_trunk_is_checked_out(self):
+        """A different `conflict` branch: trunk has not moved, but it is checked
+        out in the main repo, so integrate's compare-and-swap guard refuses
+        ("swarm/trunk is checked out; not moving it") and the attempt reports
+        conflict without any rebase."""
+        c = self.cfg()
+        q = swarmd.Queue()
+        w = self.worker(c, q)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                (cwd / "feature.txt").write_text("settings\n")
+                return "done"
+            if role == "adversary":
+                # Check trunk out in the main repo and LEAVE it checked out: the
+                # trunk's own worktree is then occupied, so the CAS guard fires.
+                _git(self.repo, "checkout", "-q", "swarm/trunk")
+                return review(prompt)
+            return "done"
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "conflict")
+        self.assertIn("is checked out", note)
+        self.assertEqual(swarmd.failure_class(w.stage, note), "harness")
+        # Leave the repo on main for the next test.
+        _git(self.repo, "checkout", "-q", "main")
         """A turn that exhausts its wall-clock budget raises AgentTimeout, which
         do_task catches and reports as agent_timeout (not no_change: the model
         never answered badly, the harness cut it off)."""
