@@ -4,15 +4,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from swarm import bridge
+from swarm import bridge, swarmd
 
 
 class UsageReportingTests(unittest.TestCase):
     def info(self, account):
         out = []
-        with patch.object(bridge.swarmd, "load_cfg", return_value={"corpus_db": "/nonexistent/corpus.db"}), \
-                patch.object(bridge.swarmd, "account", return_value=account), \
-                patch.object(bridge.swarmd, "pool", return_value=[]), \
+        with patch.object(swarmd, "load_cfg", return_value={"corpus_db": "/nonexistent/corpus.db"}), \
+                patch.object(swarmd, "account", return_value=account), \
+                patch.object(swarmd, "pool", return_value=[]), \
                 patch.object(bridge, "wallet_for", return_value=None), \
                 patch.object(bridge.sandbox, "available", return_value=False), \
                 patch.object(bridge, "emit", side_effect=out.append):
@@ -29,14 +29,14 @@ class UsageReportingTests(unittest.TestCase):
         self.assertNotIn("label", u)
 
     def test_monthly_sandbox_uses_shared_ledger_and_daily_uses_repo_ledger(self):
-        with patch.object(bridge.swarmd, "HERE", Path("/engine/swarm")), \
-                patch.object(bridge.swarmd, "STATE", Path("/engine/swarm/state/project")):
-            self.assertEqual(bridge.swarmd.spend_ledger_paths({"monthly_usd": 20}),
+        with patch.object(swarmd, "HERE", Path("/engine/swarm")), \
+                patch.object(swarmd, "STATE", Path("/engine/swarm/state/project")):
+            self.assertEqual(swarmd.spend_ledger_paths({"monthly_usd": 20}),
                              [Path("/engine/swarm/state/spend" + ext) for ext in (".json", ".lock", ".tmp")])
-            self.assertEqual(bridge.swarmd.spend_ledger_paths({"daily_usd": 1}),
+            self.assertEqual(swarmd.spend_ledger_paths({"daily_usd": 1}),
                              [Path("/engine/swarm/state/project/spend" + ext) for ext in (".json", ".lock", ".tmp")])
-            with patch.object(bridge.swarmd.sandbox, "git_paths", return_value=[]):
-                profile = bridge.swarmd.sandbox_profile("/work", {"monthly_usd": 20})
+            with patch.object(swarmd.sandbox, "git_paths", return_value=[]):
+                profile = swarmd.sandbox_profile("/work", {"monthly_usd": 20})
             self.assertIn('(subpath "/engine/swarm/state/spend.lock")', profile)
             self.assertNotIn('(subpath "/engine/swarm/state")', profile)
 

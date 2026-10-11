@@ -2,12 +2,11 @@
 
 These tests close the characterization gaps the first P0 pass left open:
 
-1. The *real* bridge.swarmd dual identity — the bridge runs the repo's `swarmd.py`
-   via a sys.path-inserted `import swarmd`, so the live dual identity is that a
-   top-level `swarmd` module and a packaged `swarm.swarmd` module coexist in one
-   process. The old test built its second identity with `spec_from_file_location`
-   under a *renamed* module, which proved nothing about the bridge's actual load
-   path and could never collide with the packaged module.
+1. The bridge.swarmd identity. The bridge used to `import swarmd` from a sys.path entry,
+   so a top-level `swarmd` and the packaged `swarm.swarmd` coexisted in one process
+   with separate globals (landmine L1). Since P12 the bridge imports `swarm.swarmd`;
+   these tests pin that it gets the packaged module, and that a top-level import
+   (how `swarmd.py` runs as a script) is still a separate copy.
 2. The run_daemon stop-vs-restart branch driven through the real daemon loop, not
    a copied conditional: when a stop lands while a source-change restart is
    pending, the loop must clear `restart_for` (and journal `self_restart_skipped`)
@@ -50,57 +49,60 @@ def _git(repo, *args):
 
 
 def _top_level_import_swarmd(source_dir):
-    """Import `swarmd` as a *top-level* module from source_dir, the way bridge.py
-    runs it: `import swarmd` after inserting the source dir on sys.path.
-
-    Returns the module object, with sys.path restored afterwards.
+    """Import `swarmd` as a *top-level* module from source_dir, the way `swarmd.py` is
+    loaded when it runs as a script. The module is not left in sys.modules.
     """
     spec = importlib.util.spec_from_file_location(
         "swarmd", str(Path(source_dir) / "swarmd.py"))
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules["swarmd"] = module  # the dual identity lives in sys.modules
-    spec.loader.exec_module(module)
+    previous = sys.modules.get("swarmd")
+    sys.modules["swarmd"] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop("swarmd", None)
+        else:
+            sys.modules["swarmd"] = previous
     return module
 
 
-# -- 1. the real dual identity ----------------------------------------------
+# -- 1. the bridge's daemon identity ----------------------------------------
 
 
-class RealDualIdentityTests(unittest.TestCase):
-    """The live hazard L1 documents, tested the way the bridge actually loads:
+class BridgeDaemonIdentityTests(unittest.TestCase):
+    """L1 closed at P12: the bridge and every package-mode importer share one daemon.
 
-    bridge.py does `sys.path.insert(0, repo)` and `import swarmd`; the extension
-    imports `from swarm import swarmd`. Both module objects coexist in one
-    process and share nothing (not even mutable module globals)."""
+    A test that patches `swarmd.STATE` now patches what the bridge reads; nothing has to
+    patch a second copy."""
 
     @classmethod
     def setUpClass(cls):
         cls.repo = Path(__file__).resolve().parents[1]  # repo root: swarm/ sits here
         cls.top = _top_level_import_swarmd(cls.repo / "swarm")
 
-    def test_bridge_import_path_yields_a_distinct_module_object(self):
-        packaged = swarmd
-        top = self.top
-        self.assertIsNot(packaged, top)
-        self.assertIsNot(packaged.STATE, top.STATE)
-        self.assertIsNot(packaged._run, top._run)
-        self.assertIsNot(packaged._stop, top._stop)
+    def test_bridge_imports_the_packaged_daemon(self):
+        from swarm import bridge
+        self.assertIs(bridge.swarmd, swarmd)
+        self.assertNotIn("swarmd", sys.modules,
+                         "nothing in a package-mode process should load a top-level swarmd")
 
-    def test_both_identities_expose_the_bridge_contract(self):
+    def test_a_top_level_import_is_still_a_separate_copy(self):
+        # Script mode (`python swarm/swarmd.py ...`) runs in its own process, where this is
+        # the only copy. Inside one process a second copy would share nothing.
+        top = self.top
+        self.assertIsNot(swarmd, top)
+        self.assertIsNot(swarmd.STATE, top.STATE)
+        self.assertIsNot(swarmd._run, top._run)
+        self.assertIsNot(swarmd._stop, top._stop)
+
+    def test_the_bridge_contract_is_exposed(self):
         for mod in (swarmd, self.top):
             for name in ("Queue", "STATE", "load_cfg", "queue_for", "use_repo",
                          "daemon_note", "config_kind", "idle_state", "account",
                          "health", "pool", "read_now"):
                 self.assertTrue(hasattr(mod, name), f"{mod.__name__} lost {name}")
-
-    def test_each_identity_keeps_its_own_globals(self):
-        # Setting a global on one identity must not leak into the other: later
-        # packets that fuse the identities must do it explicitly.
-        self.top._probe_global = "top"
-        self.assertFalse(hasattr(swarmd, "_probe_global"))
-        swarmd._probe_global = "packaged"
-        self.assertNotEqual(self.top._probe_global, swarmd._probe_global)
 
 
 # -- 2. the real daemon-loop stop-vs-restart branch -------------------------
@@ -318,11 +320,9 @@ class BridgeSchemaNormalizedTests(StageRepoCase):
         super().setUp()
         # use_repo re-points STATE/LOGS under HERE, so HERE must be the temp root
         # or these tests would write into the real source tree's swarm/state.
-        from swarm import bridge
-        for mod in (swarmd, bridge.swarmd):
-            p = patch.object(mod, "HERE", self.root)
-            p.start()
-            self.addCleanup(p.stop)
+        p = patch.object(swarmd, "HERE", self.root)
+        p.start()
+        self.addCleanup(p.stop)
         self.repo = self.repo.resolve()
 
     def bridge_status(self):
@@ -399,10 +399,10 @@ class BridgeSchemaNormalizedTests(StageRepoCase):
         # config_for() fills the same settings the daemon would use.
         default = {**self.cfg(), "repo": str(self.repo), "python": sys.executable}
         (self.root / "config.json").write_text(json.dumps(default, indent=2) + "\n")
-        c = bridge.swarmd.load_cfg(self.repo)
-        bridge.swarmd.use_repo(c)
-        bridge.swarmd.queue_for(c).add("Add the settings screen", kind="feature",
-                                       origin="human")
+        c = swarmd.load_cfg(self.repo)
+        swarmd.use_repo(c)
+        swarmd.queue_for(c).add("Add the settings screen", kind="feature",
+                                origin="human")
         snap = self.bridge_status()
         self.assertEqual(len(snap["queue"]), 1)
         row = snap["queue"][0]

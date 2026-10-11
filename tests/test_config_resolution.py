@@ -19,9 +19,6 @@ from unittest.mock import patch
 
 from swarm import bridge, swarmd
 
-# bridge.py runs as a script and imports swarmd as a top-level module, so there are two module
-# objects for it in a test process. Patch both or the bridge keeps reading the real checkout.
-SWARMDS = (swarmd, bridge.swarmd)
 
 
 class ConfigResolutionTests(unittest.TestCase):
@@ -36,13 +33,12 @@ class ConfigResolutionTests(unittest.TestCase):
         self.default = self.root / "config.json"
         self.repo = self.make_repo("target")
         self.write(self.default, test_cmd="default-tests")
-        for mod in SWARMDS:
-            for name, value in (("HERE", self.root), ("CONFIG", self.default),
-                                ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
-                                ("EXAMPLE", self.root / "config.example.json")):
-                p = patch.object(mod, name, value)
-                p.start()
-                self.addCleanup(p.stop)
+        for name, value in (("HERE", self.root), ("CONFIG", self.default),
+                            ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
+                            ("EXAMPLE", self.root / "config.example.json")):
+            p = patch.object(swarmd, name, value)
+            p.start()
+            self.addCleanup(p.stop)
         p = patch.dict(os.environ, {}, clear=False)
         p.start()
         self.addCleanup(p.stop)

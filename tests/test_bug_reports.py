@@ -17,8 +17,6 @@ from unittest.mock import patch
 
 from swarm import bridge, swarmd
 
-SWARMDS = (swarmd, bridge.swarmd)
-
 
 def report(rid, **kw):
     return {"id": rid, "t": time.time(), "summary": "the car falls through the road",
@@ -172,13 +170,12 @@ class BridgeImportTests(unittest.TestCase):
         self.default.write_text(json.dumps(
             {"repo": str(self.repo), "base_branch": "main", "test_cmd": "true",
              "models": ["a:free"], "python": sys.executable, "workers": 1}))
-        for mod in SWARMDS:
-            for attr, value in (("HERE", self.root), ("CONFIG", self.default),
-                                ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
-                                ("EXAMPLE", self.root / "config.example.json")):
-                p = patch.object(mod, attr, value)
-                p.start()
-                self.addCleanup(p.stop)
+        for attr, value in (("HERE", self.root), ("CONFIG", self.default),
+                            ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
+                            ("EXAMPLE", self.root / "config.example.json")):
+            p = patch.object(swarmd, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
         import os
         os.environ.pop("FLINT_SWARM_CONFIG", None)
 

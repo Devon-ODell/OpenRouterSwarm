@@ -18,9 +18,6 @@ from unittest.mock import Mock, patch
 
 from swarm import bridge, swarmd
 
-# bridge.py runs as a script and imports swarmd as a top-level module, so there are two module
-# objects for it in a test process. Patch both or the bridge keeps reading the real checkout.
-SWARMDS = (swarmd, bridge.swarmd)
 
 
 class StopOneSwarmTests(unittest.TestCase):
@@ -45,13 +42,12 @@ class StopOneSwarmTests(unittest.TestCase):
         self.default.write_text(json.dumps(
             {"repo": str(self.repos["alpha"]), "base_branch": "main", "test_cmd": "true",
              "models": ["a:free"], "python": sys.executable, "workers": 1}))
-        for mod in SWARMDS:
-            for attr, value in (("HERE", self.root), ("CONFIG", self.default),
-                                ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
-                                ("EXAMPLE", self.root / "config.example.json")):
-                p = patch.object(mod, attr, value)
-                p.start()
-                self.addCleanup(p.stop)
+        for attr, value in (("HERE", self.root), ("CONFIG", self.default),
+                            ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
+                            ("EXAMPLE", self.root / "config.example.json")):
+            p = patch.object(swarmd, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
         os.environ.pop("FLINT_SWARM_CONFIG", None)
 
     def daemon(self, name):
@@ -358,13 +354,12 @@ class StopDrainTests(unittest.TestCase):
         self.default.write_text(json.dumps(
             {"repo": str(self.repo), "base_branch": "main", "test_cmd": "true",
              "models": ["a:free"], "python": sys.executable, "workers": 1}))
-        for mod in SWARMDS:
-            for attr, value in (("HERE", self.root), ("CONFIG", self.default),
-                                ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
-                                ("EXAMPLE", self.root / "config.example.json")):
-                p = patch.object(mod, attr, value)
-                p.start()
-                self.addCleanup(p.stop)
+        for attr, value in (("HERE", self.root), ("CONFIG", self.default),
+                            ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
+                            ("EXAMPLE", self.root / "config.example.json")):
+            p = patch.object(swarmd, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
         os.environ.pop("FLINT_SWARM_CONFIG", None)
 
     def test_a_drain_sends_sigusr1_and_a_plain_stop_sends_sigint(self):

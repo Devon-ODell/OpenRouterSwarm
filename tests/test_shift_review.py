@@ -366,9 +366,9 @@ class EvidenceTests(Base):
         task = {"id": "t1a2b3c4", "title": "Change app.txt", "detail": "",
                 "acceptance": ["app.txt reads 'changed'"]}
         self.attempt_for(task)
-        with patch.object(bridge.swarmd, "STATE", self.root / "state"), \
+        with patch.object(swarmd, "STATE", self.root / "state"), \
              patch.object(bridge, "config_for", return_value={"repo": str(repo)}), \
-             patch.object(bridge.swarmd, "use_repo"):
+             patch.object(swarmd, "use_repo"):
             out = capture(bridge.cmd_evidence, NS(repo=str(repo), id="t1a2b3c4"))
         self.assertEqual(len(out["attempts"]), 1)
         self.assertEqual(out["attempts"][0]["phase"], "rejected")
@@ -389,9 +389,9 @@ class TaskPreviewTests(Base):
     def preview(self, repo, title, detail):
         from swarm import bridge
         c = {"repo": str(repo), "base_branch": "main", "test_cmd": "true", "max_queue": 20}
-        with patch.object(bridge.swarmd, "STATE", self.root / "state"), \
+        with patch.object(swarmd, "STATE", self.root / "state"), \
              patch.object(bridge, "config_for", return_value=c), \
-             patch.object(bridge.swarmd, "use_repo"), \
+             patch.object(swarmd, "use_repo"), \
              patch.object(bridge, "is_target", return_value=True), \
              patch.object(bridge, "daemon_running", return_value=False):
             return capture(bridge.cmd_task, NS(

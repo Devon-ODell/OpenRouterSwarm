@@ -27,10 +27,6 @@ from swarm.learn import Ledger
 import swallow
 from swarm.workflow import Attempt
 
-# bridge.py runs as a script and imports swarmd as a top-level module, so there are two
-# module objects for it in a test process. Patch both or the bridge keeps reading the real
-# checkout (see L1 in the work order).
-SWARMDS = (swarmd, bridge.swarmd)
 
 
 def _git(repo, *args, check=True):
@@ -58,13 +54,12 @@ class RepoCase(unittest.TestCase):
         _git(self.repo, "commit", "-qm", "baseline")
         self.default = self.root / "config.json"
         self.write_config(self.default)
-        for mod in SWARMDS:
-            for attr, value in (("HERE", self.root), ("CONFIG", self.default),
-                                ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
-                                ("EXAMPLE", self.root / "config.example.json")):
-                p = patch.object(mod, attr, value)
-                p.start()
-                self.addCleanup(p.stop)
+        for attr, value in (("HERE", self.root), ("CONFIG", self.default),
+                            ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
+                            ("EXAMPLE", self.root / "config.example.json")):
+            p = patch.object(swarmd, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
         os.environ.pop("FLINT_SWARM_CONFIG", None)
         swarmd._run.clear()
         swarmd._stop.clear()
@@ -259,9 +254,9 @@ class BridgeStatusJsonTests(RepoCase):
 
     def add_task_for_bridge(self, title="Add the settings screen"):
         """Queue a task through the bridge's own module identity so its use_repo sees it."""
-        c = bridge.swarmd.load_cfg(self.repo)
-        bridge.swarmd.use_repo(c)
-        return bridge.swarmd.queue_for(c).add(title, kind="feature", origin="human")
+        c = swarmd.load_cfg(self.repo)
+        swarmd.use_repo(c)
+        return swarmd.queue_for(c).add(title, kind="feature", origin="human")
 
     def test_bridge_status_has_the_frozen_top_level_fields(self):
         rc, out = self.run_bridge("status", "--repo", str(self.repo))

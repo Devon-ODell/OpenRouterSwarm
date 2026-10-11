@@ -62,12 +62,17 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
+# The daemon is imported as `swarm.swarmd`, the same module object the tests and any
+# other package-mode importer get. As a bare `import swarmd` it was a second copy with
+# its own STATE/CONFIG/_run, and anything patched or set on one was invisible to the other.
+if str(ROOT) not in sys.path:
+    sys.path.insert(1, str(ROOT))
 from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env", override=False)   # the sandbox cannot read .env; children get the key via env
 
 import sandbox  # noqa: E402
-import swarmd  # noqa: E402
+from swarm import swarmd  # noqa: E402
 import wallet  # noqa: E402
 from learn import Ledger  # noqa: E402
 # swarm/ is on sys.path (inserted above), so providers resolves as a plain module here;

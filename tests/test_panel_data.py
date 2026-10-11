@@ -18,8 +18,6 @@ from unittest.mock import Mock, patch
 
 from swarm import bridge, swarmd
 
-SWARMDS = (swarmd, bridge.swarmd)
-
 
 class NowTests(unittest.TestCase):
     """`now.json`: the task, the role, the model, the round and how long it has been."""
@@ -329,13 +327,12 @@ class BridgeSurfaceTests(unittest.TestCase):
         self.default.write_text(json.dumps(
             {"repo": str(self.repo), "base_branch": "main", "test_cmd": "true",
              "models": ["a:free"], "python": sys.executable, "workers": 1}))
-        for mod in SWARMDS:
-            for attr, value in (("HERE", self.root), ("CONFIG", self.default),
-                                ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
-                                ("EXAMPLE", self.root / "config.example.json")):
-                p = patch.object(mod, attr, value)
-                p.start()
-                self.addCleanup(p.stop)
+        for attr, value in (("HERE", self.root), ("CONFIG", self.default),
+                            ("STATE", self.root / "state"), ("LOGS", self.root / "logs"),
+                            ("EXAMPLE", self.root / "config.example.json")):
+            p = patch.object(swarmd, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
         import os
         os.environ.pop("FLINT_SWARM_CONFIG", None)
 

@@ -394,9 +394,8 @@ class BridgeTests(SwarmBase):
         self.config = self.root / "config.json"
         self.config.write_text(json.dumps({"repo": "__REPO__", "models": ["a:free", "b:free", "c:free", "paid/x"],
                                            "corpus_db": str(self.db), "python": sys.executable}))
-        # bridge.py runs as a script and imports swarmd as a top-level module: patch that copy
-        # too, or its state would land in the real swarm/state folder.
-        self.sw = bridge.swarmd
+        # bridge.py and the tests now share one swarmd module object; self.sw is just an alias.
+        self.sw = swarmd
         patches = [(swarmd, "CONFIG", self.config), (bridge, "CONSULT", self.root / "consult.json"),
                    (bridge.wallet, "STATE", self.root)]
         patches += [(self.sw, name, value) for name, value in (
