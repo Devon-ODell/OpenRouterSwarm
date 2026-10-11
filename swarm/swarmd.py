@@ -1436,7 +1436,8 @@ def _attempt_deps():
         run_lock=_run_lock, attempt_lines=attempt_lines, baseline_cache=baseline_cache,
         baseline_key=baseline_key, context_pack=context_pack, count_edits=count_edits,
         kin_text=kin_text, mark_progress=mark_progress, mit_arm=mit_arm, study=study,
-        checked_out_at=checked_out_at, trunk_locked=trunk_locked)
+        checked_out_at=checked_out_at, trunk_locked=trunk_locked,
+        count_study=count_study, count_usd=count_usd, forget_worker=forget_worker)
 
 
 class Worker(threading.Thread):
@@ -1557,73 +1558,8 @@ class Worker(threading.Thread):
     # -- one task ----------------------------------------------------------
 
     def do_task(self, task, goal, c=None, attempt_budget=None):
-        c, attempt_budget = self._attempt_inputs(c, attempt_budget)
-        self.task, self.stage, self.wt = task, "error", None
-        self.doing, self.started = "starting", time.time()
-        self.evidence, self.role_calls, self.gate_count = None, 0, 0
-        # Provisioning belongs to the lifetime of this fresh worktree, not to each gate.
-        # Candidate repair cycles and a rebase reuse the same installed dependencies.
-        self.worktree_provisioned = False
-        self.last_model, self.last_role = None, None
-        self.mit = None
-        self.agent_timed_out = False
-        self.failure_class = "task"
-        self.execution_class = task.get("execution_class", "standard")
-        # Not just the counters: a task starts with no inherited model, waiting reason or
-        # live-turn log either, or its first status line describes the task before it.
-        forget_worker(self.name)
-        note, info = "attempt interrupted before completion", {}
-        try:
-            self.stage, note, info = self._attempt(task, goal, info, c, attempt_budget)
-        except AgentTimeout as exc:
-            self.stage, note = "agent_timeout", str(exc)
-        except ExplorationExhausted as exc:
-            # The turn spent 70% of its rounds without editing. The swarm's harness let it
-            # explore, so it is not scored against the model as faulty code, but the pairing
-            # is excluded for the rest of the run/24h (work order §5): the failure_class
-            # below stays harness, which parks/holds rather than consuming an attempt.
-            self.last_role = getattr(self, "last_role", None)
-            self.stage, note = "exploration_exhausted", str(exc)
-        except ReviewFormatError as exc:
-            self.stage, note = "review_format_error", str(exc)
-        except RequestBudget as exc:
-            self.stage, note = "request_budget", str(exc)
-        except ModelPoolExhausted as exc:
-            self.stage, note = "model_pool_exhausted", str(exc)
-        except (CapReached, ProviderDown, NoCredits):
-            self.stage = "deferred"
-            raise
-        finally:
-            if self.evidence:
-                self.evidence.finish(self.stage, note)
-            try:
-                self._cleanup(c)
-            except Exception as exc:
-                # Preserve the outcome and artifact if shutdown/Git prevents cleanup.
-                log(f"cleanup deferred for {self.branch}: {exc}", self.name)
-        self.attempt_requests = info["requests"] = count_requests(self.name, reset=True)
-        self.failure_class = ("task" if self.stage == "accepted" else
-                              failure_class(self.stage, note, edited=info.get("edit_calls")))
-        if info.get("implementer"):
-            try:
-                self._reinforce(task, self.stage, info, c, attempt_budget)
-            except Exception as exc:
-                journal("learning_error", id=task["id"], err=str(exc), stage=self.stage)
-                log(f"learning update failed; task outcome retained: {exc}", self.name)
-            # One row per attempt that spent model calls: the MIT experiment's raw data.
-            journal("attempt", id=task["id"], title=task["title"], stage=self.stage,
-                    goal_item=info.get("goal_item"), usd=count_usd(self.name, reset=True),
-                    failure_class=None if self.stage == "accepted" else self.failure_class,
-                    edit_calls=info.get("edit_calls"),
-                    mit=info.get("mit"), injected=info.get("mit_injected", False),
-                    study_calls=count_study(self.name, reset=True), role_calls=self.role_calls,
-                    requests=self.attempt_requests, commit=info.get("commit"),
-                    implementer=info["implementer"], reviewer=info.get("reviewer"),
-                    judge=info.get("judge"), reward=info.get("reward"),
-                    scores={k: v for k, v in (info.get("scores") or {}).items()
-                            if k in ("impact", "creativity", "quality", "breakthrough")},
-                    persona=task.get("persona"), origin=task.get("origin", "human"))
-        return self.stage == "accepted", note
+        outcome = self.runner().run(task, goal, c, attempt_budget)
+        return outcome.accepted, outcome.note
 
     def gate(self, label, c=None):
         """Run configured commands and retain supervisor-owned evidence."""

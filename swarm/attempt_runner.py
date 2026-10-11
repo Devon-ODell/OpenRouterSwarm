@@ -26,11 +26,13 @@ from context_builder import named_paths
 from verification import weakened_tests
 
 try:  # one class identity with the daemon's turn errors
-    from .agent_turn import (AgentTimeout, ModelError, ModelPoolExhausted, ProviderBusy,
-                             ProviderDown, RequestBudget, ReviewFormatError, StepLimit)
+    from .agent_turn import (AgentTimeout, CapReached, ExplorationExhausted, ModelError,
+                             ModelPoolExhausted, NoCredits, ProviderBusy, ProviderDown,
+                             RequestBudget, ReviewFormatError, StepLimit)
 except ImportError:  # pragma: no cover - script mode
-    from agent_turn import (AgentTimeout, ModelError, ModelPoolExhausted, ProviderBusy,
-                            ProviderDown, RequestBudget, ReviewFormatError, StepLimit)
+    from agent_turn import (AgentTimeout, CapReached, ExplorationExhausted, ModelError,
+                            ModelPoolExhausted, NoCredits, ProviderBusy, ProviderDown,
+                            RequestBudget, ReviewFormatError, StepLimit)
 
 try:  # same module identity as the daemon's workspace
     from . import workspace
@@ -71,6 +73,40 @@ class AttemptDeps:
     study: Callable            # = study
     checked_out_at: Callable   # = checked_out_at
     trunk_locked: Callable     # = trunk_locked
+    count_study: Callable      # = count_study
+    count_usd: Callable        # = count_usd
+    forget_worker: Callable    # = forget_worker
+
+
+# The stage vocabulary is closed: failure_class(), TASK_STAGES, HARNESS_STAGES and every
+# consumer depend on these exact strings.
+STAGES = frozenset({
+    "accepted",
+    "refused", "out_of_scope", "baseline", "conflict",
+    "rejected", "tests_failed", "weakened_tests",
+    "no_change", "agent_timeout",
+    "model_error", "review_error", "review_format_error",
+    "model_pool_exhausted", "exploration_exhausted", "request_budget",
+    "interrupted", "deferred",
+})
+
+
+@dataclass(frozen=True)
+class AttemptOutcome:
+    """What one attempt at a task came to. Normal task outcomes are data, not exceptions."""
+    stage: str                      # one of STAGES (or "error" if the attempt never set one)
+    note: str
+    failure_class: str | None       # "task" | "model" | "harness" | "review_format"; None when accepted
+    implementer: str | None
+    reviewer: str | None
+    commit: str | None
+    requests: int
+    evidence_path: Path | None
+    scores: dict | None
+
+    @property
+    def accepted(self) -> bool:
+        return self.stage == "accepted"
 
 
 class AttemptRunner:
@@ -746,3 +782,80 @@ class AttemptRunner:
                 return False, note
             # "moved" and "failed" fall through to the next iteration, exactly as before
         return False, "trunk kept moving; retained candidate for a later attempt"
+
+    def run(self, task, goal, c=None, attempt_budget=None):
+        """One attempt at a task, from provisioning to release: run() is do_task's body."""
+        w, d = self.w, self.d
+        c, attempt_budget = w._attempt_inputs(c, attempt_budget)
+        w.task, w.stage, w.wt = task, "error", None
+        w.doing, w.started = "starting", time.time()
+        w.evidence, w.role_calls, w.gate_count = None, 0, 0
+        # Provisioning belongs to the lifetime of this fresh worktree, not to each gate.
+        # Candidate repair cycles and a rebase reuse the same installed dependencies.
+        w.worktree_provisioned = False
+        w.last_model, w.last_role = None, None
+        w.mit = None
+        w.agent_timed_out = False
+        w.failure_class = "task"
+        w.execution_class = task.get("execution_class", "standard")
+        # Not just the counters: a task starts with no inherited model, waiting reason or
+        # live-turn log either, or its first status line describes the task before it.
+        d.forget_worker(w.name)
+        note, info = "attempt interrupted before completion", {}
+        try:
+            w.stage, note, info = w._attempt(task, goal, info, c, attempt_budget)
+        except AgentTimeout as exc:
+            w.stage, note = "agent_timeout", str(exc)
+        except ExplorationExhausted as exc:
+            # The turn spent 70% of its rounds without editing. The swarm's harness let it
+            # explore, so it is not scored against the model as faulty code, but the pairing
+            # is excluded for the rest of the run/24h (work order §5): the failure_class
+            # below stays harness, which parks/holds rather than consuming an attempt.
+            w.last_role = getattr(w, "last_role", None)
+            w.stage, note = "exploration_exhausted", str(exc)
+        except ReviewFormatError as exc:
+            w.stage, note = "review_format_error", str(exc)
+        except RequestBudget as exc:
+            w.stage, note = "request_budget", str(exc)
+        except ModelPoolExhausted as exc:
+            w.stage, note = "model_pool_exhausted", str(exc)
+        except (CapReached, ProviderDown, NoCredits):
+            w.stage = "deferred"
+            raise
+        finally:
+            if w.evidence:
+                w.evidence.finish(w.stage, note)
+            try:
+                w._cleanup(c)
+            except Exception as exc:
+                # Preserve the outcome and artifact if shutdown/Git prevents cleanup.
+                d.log(f"cleanup deferred for {w.branch}: {exc}", w.name)
+        w.attempt_requests = info["requests"] = d.count_requests(w.name, reset=True)
+        w.failure_class = ("task" if w.stage == "accepted" else
+                           failure_class(w.stage, note, edited=info.get("edit_calls")))
+        if info.get("implementer"):
+            try:
+                w._reinforce(task, w.stage, info, c, attempt_budget)
+            except Exception as exc:
+                d.journal("learning_error", id=task["id"], err=str(exc), stage=w.stage)
+                d.log(f"learning update failed; task outcome retained: {exc}", w.name)
+            # One row per attempt that spent model calls: the MIT experiment's raw data.
+            d.journal("attempt", id=task["id"], title=task["title"], stage=w.stage,
+                      goal_item=info.get("goal_item"), usd=d.count_usd(w.name, reset=True),
+                      failure_class=None if w.stage == "accepted" else w.failure_class,
+                      edit_calls=info.get("edit_calls"),
+                      mit=info.get("mit"), injected=info.get("mit_injected", False),
+                      study_calls=d.count_study(w.name, reset=True), role_calls=w.role_calls,
+                      requests=w.attempt_requests, commit=info.get("commit"),
+                      implementer=info["implementer"], reviewer=info.get("reviewer"),
+                      judge=info.get("judge"), reward=info.get("reward"),
+                      scores={k: v for k, v in (info.get("scores") or {}).items()
+                              if k in ("impact", "creativity", "quality", "breakthrough")},
+                      persona=task.get("persona"), origin=task.get("origin", "human"))
+        evidence = w.evidence.path if w.evidence else None
+        return AttemptOutcome(
+            stage=w.stage, note=note,
+            failure_class=None if w.stage == "accepted" else w.failure_class,
+            implementer=info.get("implementer"), reviewer=info.get("reviewer"),
+            commit=info.get("commit"), requests=w.attempt_requests,
+            evidence_path=evidence, scores=info.get("scores"))
