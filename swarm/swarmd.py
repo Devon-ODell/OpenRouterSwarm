@@ -2477,9 +2477,7 @@ class Worker(threading.Thread):
             _, old = git(["rev-parse", t], cwd=c["repo"], check=True)
             rc, _ = git(["merge-base", "--is-ancestor", old, "HEAD"], cwd=self.wt)
             if rc != 0:
-                rc, _ = git(["rebase", old], cwd=self.wt)
-                if rc != 0:
-                    git(["rebase", "--abort"], cwd=self.wt)
+                if not workspace.rebase_onto(self.wt, old, git=git):
                     return False, f"conflicts with newer trunk; work retained on {self.branch}"
                 self.review_base = old
                 tree, diff = self.snapshot()
@@ -2497,19 +2495,14 @@ class Worker(threading.Thread):
                     raise error
                 if review["verdict"] != "approve":
                     return False, "rebased candidate needs changes; fresh review saved in artifacts"
-            with trunk_locked():
-                if checked_out_at(c, t):
-                    return False, f"{t} is checked out; not moving it"
-                _, current = git(["rev-parse", t], cwd=c["repo"], check=True)
-                if current != old:
-                    continue
-                _, head = git(["rev-parse", "HEAD"], cwd=self.wt, check=True)
-                _, committed_tree = git(["rev-parse", "HEAD^{tree}"], cwd=self.wt, check=True)
-                if committed_tree != self.evidence.data.get("reviewed_tree"):
-                    return False, "candidate commit does not match the reviewed tree"
-                rc, output = git(["update-ref", f"refs/heads/{t}", head, old], cwd=c["repo"])
-                if rc == 0:
-                    return True, ""
+            status, note = workspace.land_on_trunk(
+                c, self.wt, old, self.evidence.data.get("reviewed_tree"),
+                git=git, locked=trunk_locked, checked_out_at=checked_out_at)
+            if status == "landed":
+                return True, ""
+            if status in ("checked_out", "mismatch"):
+                return False, note
+            # "moved" and "failed" fall through to the next iteration, exactly as before
         return False, "trunk kept moving; retained candidate for a later attempt"
 
     def judge(self, task, goal, diff, verdict, model, avoid=(), c=None,

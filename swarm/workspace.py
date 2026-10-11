@@ -161,6 +161,38 @@ def sync_trunk(c, *, git, ensure_trunk, locked, worktrees, run_gate_with_prov,
             git(["worktree", "remove", "--force", str(tmp)], cwd=repo)
 
 
+def rebase_onto(wt, old, *, git):
+    """Rebase `wt` onto `old`; abort the rebase and report False on conflict."""
+    rc, _ = git(["rebase", old], cwd=wt)
+    if rc != 0:
+        git(["rebase", "--abort"], cwd=wt)
+        return False
+    return True
+
+
+def land_on_trunk(c, wt, old, reviewed_tree, *, git, locked, checked_out_at):
+    """Compare-and-swap trunk onto the candidate's HEAD under the trunk lock.
+
+    Returns ("checked_out"|"moved"|"mismatch"|"landed"|"failed", note).  The caller
+    retries on "moved" and "failed", exactly as it did when this was inline in the daemon.
+    """
+    t = trunk_name(c)
+    with locked():
+        if checked_out_at(c, t):
+            return "checked_out", f"{t} is checked out; not moving it"
+        _, current = git(["rev-parse", t], cwd=c["repo"], check=True)
+        if current != old:
+            return "moved", ""
+        _, head = git(["rev-parse", "HEAD"], cwd=wt, check=True)
+        _, committed_tree = git(["rev-parse", "HEAD^{tree}"], cwd=wt, check=True)
+        if committed_tree != reviewed_tree:
+            return "mismatch", "candidate commit does not match the reviewed tree"
+        rc, _ = git(["update-ref", f"refs/heads/{t}", head, old], cwd=c["repo"])
+        if rc == 0:
+            return "landed", ""
+        return "failed", ""
+
+
 def create_worktree(c, task_id, *, git, ensure_trunk, worktrees):
     # Every attempt gets its own branch from trunk: never reset a user's
     # checkout or discard a previous attempt's changes.
