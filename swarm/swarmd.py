@@ -37,10 +37,89 @@ from pacing import LatencyLearner, effective_steps        # noqa: E402
 from learn import (Ledger, format_playbook, is_breakthrough, json_array,  # noqa: E402
                    novelty, parse_scores, reward, weight, defect, exhibit,
                    FAULTY, CRIME, BREAKTHROUGH_WEIGHT, PENALTY_WEIGHT)
-from workflow import Attempt, STRATEGIES, REVIEW, REPAIR, contract, criteria, parse_review, failure_signature  # noqa: E501
+from workflow import Attempt, STRATEGIES, REVIEW, contract, criteria, parse_review, failure_signature  # noqa: E501
 import sandbox                          # noqa: E402
 import swallow                          # noqa: E402
 from workflow import validate_scope, path_allowed
+
+# ------------------------------------------------------------------ P2 extracted leaves
+#
+# prompts / task_rules / context_builder / verification / provisioning hold the code;
+# swarmd re-exports every name the rest of the daemon (and the tests) still use, with
+# compatibility wrappers where the new module needs an explicit dependency. No new module
+# imports swarmd in any form.
+from prompts import (FAST_IMPLEMENTER, PERSONAS, ARCHITECT, IMPLEMENTER, ADVERSARY,  # noqa: E402
+                     JUDGE, PRIORITIES, PLANNER, PLANNER_SERVES, DECOMPOSER, persona_text,
+                     REPAIR)
+from task_rules import (PRIORITY_HEADING, NUMBERED, GOAL_ITEM_WEIGHT,  # noqa: E402
+                        goal_items, goal_item_weight,
+                        STATIC_REQUEST_ESTIMATES, estimate_requests,
+                        TASK_STAGES, NAMES_A_PATH, NAMES_A_SYMBOL, BROAD_ASK,
+                        HARNESS_STAGES, HARNESS_NOTE, MODEL_NOTE,
+                        scope_gap, failure_class, FAILING, first_failing_line)
+from context_builder import (CODE_PATH, GAME_DIR, DEFINITION,  # noqa: E402
+                             numbered, outline, task_text, named_paths,
+                             kin_text as _kin_text, covering_tests as _covering_tests,
+                             context_pack as _context_pack, attempt_lines as _attempt_lines)
+from verification import (ASSERT_CALL, GENERIC_DIR, assert_counts, identifiers,  # noqa: E402
+                          deleted_paths, test_hunks, names_deleted, names_its_source,
+                          weakened_tests, last_error)
+from provisioning import (RUNTIME_MARKERS, PROV_RECIPES, embedded_repos, _subdirs, sub_projects,  # noqa: E402
+                          test_cmd_hint, test_cmds, project_test_cmd, other_test_cmds,
+                          why_unrunnable, probe_surroundings, build_prov_block,
+                          detect_test_cmd as _detect_test_cmd,
+                          scaffold as _scaffold, configure as _configure,
+                          render_surroundings as _render_surroundings)
+
+
+
+# ------------------------------------------------------------------ P2 compat wrappers
+def _git_run(args, cwd):
+    """swarmd.git returns (rc, out) as a tuple; the extracted modules want the same shape."""
+    return git(args, cwd=cwd)
+
+
+def attempt_lines(task, limit=3, max_chars=1_200):
+    """swarmd compatibility: reads attempts under STATE (P2 wrapper)."""
+    return _attempt_lines(task, STATE, limit=limit, max_chars=max_chars)
+
+
+def kin_text(task, q):
+    """swarmd compatibility: reads the queue's done rows via _read (P2 wrapper)."""
+    return _kin_text(task, q, read_done=_read)
+
+
+def covering_tests(wd, terms, limit=2):
+    """swarmd compatibility: git subprocess via the daemon's git() (P2 wrapper)."""
+    return _covering_tests(wd, terms, limit=limit, git_run=_git_run)
+
+
+def context_pack(task, wd, limit=20_000, also=""):
+    """swarmd compatibility: git subprocess via the daemon's git() (P2 wrapper)."""
+    return _context_pack(task, wd, limit=limit, also=also, git_run=_git_run)
+
+
+def detect_test_cmd(repo):
+    """swarmd compatibility: log() wired (P2 wrapper)."""
+    return _detect_test_cmd(repo, log=log)
+
+
+def configure(repo, test_cmd=None):
+    """swarmd compatibility: config I/O and logging wired (P2 wrapper)."""
+    return _configure(repo, test_cmd=test_cmd, load_cfg=load_cfg, save_cfg=save_cfg,
+                      python_for=python_for, log=log)
+
+
+def scaffold(path, goal):
+    """swarmd compatibility: git identity wired (P2 wrapper)."""
+    return _scaffold(path, goal, git_ident=GIT_IDENT)
+
+
+def render_surroundings(repo, slug, s, config_path, existing=None):
+    """swarmd compatibility: branch detection via git_branch (P2 wrapper)."""
+    return _render_surroundings(repo, slug, s, config_path, existing=existing,
+                                git_branch=git_branch)
+
 
 CONFIG = Path(os.environ.get("FLINT_SWARM_CONFIG") or HERE / "config.json").expanduser()
 STATE = HERE / "state"                  # per target repo once use_repo() runs
@@ -493,53 +572,6 @@ def trunk_name(c):
     return c.get("trunk", "swarm/trunk")
 
 
-# A goal file's ordered priorities, when it has any. The heading has to say so: a "Legacy
-# backlog (reference, not the next dispatch order)" is exactly what this must not read as a
-# priority list.
-PRIORITY_HEADING = re.compile(r"^#{1,6}\s*.*(?:work on now|priorities).*$", re.I | re.M)
-NUMBERED = re.compile(r"^\s{0,3}(\d+)[.)]\s+(.*)$")
-# How much of a landed change's reward its place in that list is worth. The judge gave 0.94 to
-# a thumbnail validator and 0.97 to a configurable word list while the four deep games GOAL.md
-# puts first landed nothing, and those rewards are what trained the planner toward tooling.
-GOAL_ITEM_WEIGHT = {1: 1.0, 2: 0.85, 3: 0.6, 4: 0.5, 0: 0.35}
-
-
-def goal_items(goal_text):
-    """The numbered priorities under the goal's own "work on now" heading, in order.
-
-    Empty when the goal does not rank anything, and then nothing downstream changes: no task is
-    dropped for serving no item and no reward is scaled. A goal that does not say what comes
-    first cannot be used to say a change came second."""
-    m = PRIORITY_HEADING.search(goal_text or "")
-    if not m:
-        return []
-    items, seen = [], set()
-    for line in (goal_text[m.end():]).splitlines():
-        if line.startswith("#"):
-            break                       # the next heading ends the list
-        row = NUMBERED.match(line)
-        if row:
-            n = int(row.group(1))
-            if n in seen:
-                break                   # a second list under the same heading
-            seen.add(n)
-            items.append(re.sub(r"\*\*|`", "", row.group(2)).strip()[:200])
-    return items
-
-
-def goal_item_weight(n, items):
-    """What a landed change's place in the priority list multiplies its reward by."""
-    if not items:
-        return 1.0
-    try:
-        n = int(n)
-    except (TypeError, ValueError):
-        n = 0
-    if not 1 <= n <= len(items):
-        n = 0
-    return GOAL_ITEM_WEIGHT.get(n, 0.5 if n else GOAL_ITEM_WEIGHT[0])
-
-
 def read_goal(c):
     for p in (STATE / "GOAL.md", Path(c["repo"]) / c.get("goal_file", "GOAL.md")):
         if p.is_file() and p.read_text().strip():
@@ -791,34 +823,6 @@ def _write(path, rows):
     tmp = path.with_suffix(".tmp")
     tmp.write_text("".join(json.dumps(r) + "\n" for r in rows))
     tmp.replace(path)
-
-
-# Static request estimates for EV selection (work order §9). Until enough history exists,
-# these are the conservative defaults: bugfix 25, feature 35, test 20, documentation 12,
-# broad/unknown 45. A task that carries its own `request_class` (small/medium/manual) maps
-# to a comparable figure so a planner can say what it expects to cost.
-STATIC_REQUEST_ESTIMATES = {
-    "bugfix": 25,
-    "feature": 35,
-    "test": 20,
-    "documentation": 12,
-    "refactor": 30,
-}
-
-
-def estimate_requests(r):
-    """Estimated request cost of a task, for EV ranking."""
-    cls = str((r or {}).get("request_class") or "").lower()
-    if cls in ("small",):
-        return 15
-    if cls == "medium":
-        return 30
-    if cls == "manual":
-        return 60
-    kind = (r or {}).get("kind") or "feature"
-    if kind in STATIC_REQUEST_ESTIMATES:
-        return STATIC_REQUEST_ESTIMATES[kind]
-    return 45
 
 
 class Queue:
@@ -1441,522 +1445,6 @@ def note_interrupted(c, q):
     return found
 
 
-# ------------------------------------------------------------------ failure classes
-
-# Whose problem a failure is. Queue.release treated them all alike — a note, an attempt spent,
-# and after two attempts a split or a park — so a step limit, a sandbox timeout or a restart
-# cost a task one of its two lives and scored the model down for it. 90 of 121 finished tasks
-# were split or parked, every deep-game milestone among them.
-TASK_STAGES = frozenset({"tests_failed", "rejected", "weakened_tests", "out_of_scope"})
-
-# A path, or a symbol, written plainly enough that an implementer could open it.
-NAMES_A_PATH = re.compile(
-    r"[\w./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|json|md|html|css|scss|sh|go|rs|java|rb|"
-    r"c|h|cc|cpp|hpp|yml|yaml|toml|sql|swift|kt)\b")
-NAMES_A_SYMBOL = re.compile(r"\b(?:def|class|function|const|fn|func|struct|interface)\s+\w+"
-                            r"|\b\w+\(\)|`[^`\n]{2,60}`")
-# Phrasing with no wrong answer. On its own this is not a defect — plenty of good tasks say
-# "and so on" in passing — so it only counts against a task that also names no observable.
-BROAD_ASK = re.compile(
-    r"\b(?:everything|anything else|all (?:the )?(?:code|files|tests|games|issues)|"
-    r"as (?:needed|appropriate|you see fit)|and so on|etc\.?|various (?:issues|places|files)|"
-    r"wherever (?:needed|possible|appropriate)|"
-    r"(?:improve|clean up|tidy|refactor|fix) (?:the )?(?:whole|entire|rest of the|codebase)|"
-    r"any (?:other )?(?:issues|bugs|problems)(?: you (?:can )?find)?)\b", re.I)
-
-
-def scope_gap(task, c=None):
-    """Why this task cannot be handed to an implementer as written, or "" when it can.
-
-    A roadmap packet arrives with acceptance criteria, verification commands and the files it
-    concerns, and `dispatch_roadmap` will not hand it out until its gates are evidenced. Work
-    that arrives any other way — a planner batch, a question the editor turned into a task, a
-    report typed in by hand — reaches the same implementer with whatever text it happened to
-    carry, and bypasses every one of those checks. A request broad enough to have no wrong
-    answer then spends an implementer turn, a full suite, a review and a repair before anyone
-    discovers it had no scope. This applies the packet's guarantees to every task, before a
-    model is paid to find the gap.
-
-    It is deliberately hard to fail: a task is refused only when it declared acceptance
-    criteria that say no more than its title does, and nothing in it names a file, a symbol
-    or a command either — or when it reads as open-ended however it arrived."""
-    title = (task.get("title") or "").strip()
-    text = f"{title}\n{task.get('detail') or ''}"
-    declared = task.get("acceptance")
-    rows = [r for r in (declared or []) if isinstance(r, str) and r.strip()]
-    # Work order §10: a task marked manual is held before a model request — queued for
-    # visibility but never automatically claimed; a person must pick it up.
-    if (task.get("request_class") == "manual" or task.get("origin") == "manual"):
-        return ("manual task: queued for visibility but not automatically claimed; "
-                "a person must pick it up")
-    # Every task is verified by the configured test_cmd; a per-task verifier is
-    # additive, not required. What is required is that the task name a file, a symbol
-    # or an observable so a finished attempt can be told from an abandoned one — the
-    # existing checks below. Open-ended epics are what this gate holds.
-    # A criterion counts only if it says more than the title did and is not itself an
-    # open-ended ask. The editor copies a task's detail into its acceptance, so "clean up the
-    # whole codebase as needed" would otherwise arrive as its own acceptance criterion and
-    # pass a check meant to catch exactly that.
-    if [r for r in rows if r.strip().lower() != title.lower() and not BROAD_ASK.search(r)]:
-        return ""
-    broad = BROAD_ASK.search(text)
-    if broad:
-        return (f"open-ended request ({broad.group(0).strip()!r}) with no acceptance criterion "
-                "beyond its title: say what must be true when it is done")
-    if declared is None:
-        # Nothing was declared at all, so there is no vacuous declaration to object to. The
-        # queue's own `criteria()` is what decides whether a task may be added; this gate
-        # judges what a task claims about itself, not what it omitted.
-        return ""
-    if not (NAMES_A_PATH.search(text) or NAMES_A_SYMBOL.search(text)):
-        return ("nothing here names a file, a symbol or an observable, so there is no way to "
-                "tell a finished attempt from an abandoned one: add an acceptance criterion "
-                "or name the code it concerns")
-    return ""
-# Not the model answering badly: the baseline was already broken, trunk moved under the attempt,
-# the supervisor declined it, or the run was stopped.
-HARNESS_STAGES = frozenset({"baseline", "conflict", "refused", "interrupted", "deferred",
-                            "agent_timeout", "request_budget", "model_pool_exhausted",
-                            "exploration_exhausted"})
-HARNESS_NOTE = re.compile(
-    r"step limit|stopped after \d+ rounds|timed out|timeout|exceeded \d+s|sandbox|"
-    r"interrupted before completion|deferred|killed|sigkill|provider (?:unavailable|kept failing)|"
-    r"not available|empty response|connection|\b50\d\b|\b429\b", re.I)
-MODEL_NOTE = re.compile(r"no usable json|malformed|unparseable|could not parse|invalid json|"
-                        r"wrote .*as (?:reply )?text|did not follow", re.I)
-
-
-def failure_class(stage, note="", edited=None):
-    """`task`, `model` or `harness` — the only distinction worth acting on differently.
-
-    task     the change was wrong: the tests failed, or the reviewer proved a defect.
-    model    the model did not produce usable output, or edited and still changed nothing.
-    harness  this swarm lost the turn: rounds, wall clock, a restart, a sandbox, a provider.
-    """
-    note = str(note or "")
-    if stage == "review_format_error":
-        return "review_format"
-    if stage in TASK_STAGES:
-        return "task"
-    if stage in HARNESS_STAGES:
-        return "harness"
-    if stage == "model_error":
-        # A provider that returned 5xx or nothing at all is not a model answering badly.
-        return "harness" if HARNESS_NOTE.search(note) else "model"
-    if stage == "review_error":
-        return "harness" if HARNESS_NOTE.search(note) else "model"
-    if stage == "no_change":
-        # Having tried an edit and still changed nothing is the model's doing. Never reaching an
-        # edit is this harness running the rounds out on it.
-        return "model" if edited else "harness"
-    if MODEL_NOTE.search(note):
-        return "model"
-    if HARNESS_NOTE.search(note):
-        return "harness"
-    return "task"
-
-
-# ------------------------------------------------------------------ earlier attempts
-
-# The one line of a failure that says what to do differently.
-FAILING = re.compile(r"^(?:FAIL|ERROR):.*|^E\s{2,}.*|^\s*(?:Assertion|Type|Value|Name|Attribute|"
-                     r"Index|Key|Import|Module|Syntax|Runtime|OS|IO)Error\b.*|^\s*assert\s.*",
-                     re.M)
-
-
-def first_failing_line(text):
-    """The first line of a test failure worth repeating, or ""."""
-    m = FAILING.search(text or "")
-    return re.sub(r"\s+", " ", m.group(0)).strip()[:200] if m else ""
-
-
-def attempt_lines(task, limit=3, max_chars=1_200):
-    """What earlier attempts at this task actually hit, one line each.
-
-    This was `json.dumps(sorted(prior)[-3:])[-6000:]`: a JSON dump cut off mid-string, made
-    mostly of absolute paths the model cannot open, at the point in the prompt where the model
-    is most likely to be reading."""
-    relevant = {task["id"], task.get("parent"), *(task.get("depends_on") or [])}
-    rows = []
-    for path in (STATE / "attempts").glob("*/attempt.json"):
-        try:
-            row = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if row.get("task", {}).get("id") in relevant and row.get("finished"):
-            rows.append(row)
-    out = []
-    for row in sorted(rows, key=lambda r: r["finished"])[-limit:]:
-        when = dt.datetime.fromtimestamp(row["finished"]).strftime("%m-%d %H:%M")
-        stage = row.get("phase") or "unknown"
-        model = row.get("implementer") or row.get("active_model") or "?"
-        note = re.sub(r"\s+", " ", str(row.get("note") or "")).strip()
-        # Paths and evidence directories are noise here; the failing line is the signal.
-        note = re.sub(r"(?:; )?evidence: \S+", "", note).strip(" ;")
-        failing = first_failing_line(row.get("note") or "")
-        line = f"- {when} {stage} on {model}: {failure_class(stage, note)}"
-        if note and note != stage:
-            line += f" — {note[:160]}"
-        if failing:
-            line += f" ({failing})"
-        out.append(line)
-    text = "\n".join(out)
-    return text[:max_chars]
-
-
-# ------------------------------------------------------------------ context pack
-
-# Paths a task names in its own words. Anything outside this set is a guess about what matters,
-# and a guess is what filled these prompts with a lecture on parking-garage real options.
-CODE_PATH = re.compile(r"[\w][\w./-]*\.(?:py|js|cjs|mjs|jsx|ts|tsx|json|md|html|css|rs|toml)\b")
-GAME_DIR = re.compile(r"\b(games/([\w.-]+))/")
-# Definitions worth an outline when a file is too long to show: Python and JavaScript
-# functions, classes, and the consts a game's module keeps its tables in.
-DEFINITION = re.compile(
-    r"^\s*(?:export\s+)?(?:async\s+)?(?:def|class|function)\s+\w+"
-    r"|^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*="
-    r"|^\s*\w+\s*[:=]\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>)")
-
-
-def numbered(text, first=1):
-    """Lines in read_file's exact format, so an edit_file old_str can be copied out of them."""
-    return "\n".join(f"{i:>5}\t{line}" for i, line in enumerate(text.splitlines(), first))
-
-
-def outline(text):
-    """Definitions with their line numbers, for a file too long to show whole.
-
-    A signature is what locates the code; the rest of a 200-character line is body, and an
-    outline that repeats it is as big as the file it stands in for."""
-    return "\n".join(f"{i:>5}\t{line.rstrip()[:120]}"
-                     for i, line in enumerate(text.splitlines(), 1) if DEFINITION.match(line))
-
-
-def task_text(task):
-    rows = task.get("acceptance") or []
-    return " ".join([str(task.get("title") or ""), str(task.get("detail") or "")]
-                    + [r if isinstance(r, str) else str(r.get("text", "")) for r in rows])
-
-
-def named_paths(task, also=""):
-    """The file paths the task names, in the order it names them, deduplicated."""
-    text = task_text(task) + " " + (also or "")
-    return list(dict.fromkeys([*(task.get("allowed_paths") or []),
-                               *(m.group(0).rstrip(".") for m in CODE_PATH.finditer(text))]))
-
-
-def kin_text(task, q):
-    """The words a task inherits from the task it was split out of.
-
-    44 of 121 finished tasks were splits, and a decomposer writes subtasks in terms of behaviour:
-    "Add parked vehicle data structure and rendering" names no file, while the task it came out
-    of names games/crosstown/game.js. Without this the splits — the ones already failing — are
-    exactly the ones that get no code."""
-    out = []
-    for tid in dict.fromkeys(x for x in (task.get("parent"), task.get("root")) if x and x != task["id"]):
-        row = q.get(tid) or next((r for r in _read(q.done) if r.get("id") == tid), None)
-        if row:
-            out.append(task_text(row))
-    return " ".join(out)
-
-
-def covering_tests(wd, terms, limit=2):
-    """Test files that mention what the task is about, first `limit` of them."""
-    found = []
-    for term in terms:
-        if len(found) >= limit or not term:
-            break
-        rc, out = git(["grep", "-l", "-F", "-i", "--", term, "tests"], cwd=wd)
-        if rc == 0:
-            for path in out.splitlines():
-                if path not in found:
-                    found.append(path)
-    return found[:limit]
-
-
-def context_pack(task, wd, limit=20_000, also=""):
-    """The code this task is about, in the prompt, in read_file's own format.
-
-    The implementer prompt carried no code at all: 16.6 KB of goal, rules and unrelated
-    excerpts, and not one line of the files the task names. A model with 12 tool rounds spent 6
-    to 11 of them reading before it could edit anything, and 60 of 189 attempts ran out of
-    rounds before the first edit. Everything here comes from paths the task itself names, or
-    the task it was split out of, so there is nothing to guess and nothing to pad.
-    """
-    wd, parts, used = Path(wd), [], 0
-    text = task_text(task) + " " + (also or "")
-    # The last two sections are small and carry the most per character — which test module to
-    # run, and what else is in the directory — so a long file cannot crowd them out.
-    reserve = min(2_500, limit // 4)
-
-    def add(header, body, ceiling=None):
-        nonlocal used
-        # Only blank lines come off: a line's leading spaces are its line number's padding, and
-        # read_file's format is the whole point — an old_str is copied out of it byte for byte.
-        body = (body or "").strip("\n")
-        ceiling = limit if ceiling is None else ceiling
-        if not body.strip() or used >= ceiling:
-            return False
-        room = ceiling - used
-        if len(body) > room:
-            body = body[:room] + f"\n… [{len(body) - room} chars not shown; read_file for the rest]"
-        parts.append(f"{header}\n{body}")
-        used += len(body) + len(header) + 2
-        return True
-
-    def show(rel, max_lines=400, head=None):
-        f = wd / rel
-        if not f.is_file():
-            return
-        try:
-            body = f.read_text(errors="replace")
-        except OSError:
-            return
-        lines, ceiling = body.splitlines(), limit - reserve
-        if head:
-            add(f"--- {rel} (first {min(head, len(lines))} of {len(lines)} lines) ---",
-                numbered("\n".join(lines[:head])), ceiling)
-            return
-        whole = numbered(body)
-        # A game's logic runs to 300 lines of 200 characters, so the line count alone is not a
-        # size. A file that will not fit gets its definitions, which is still navigable — a
-        # file cut off halfway is not.
-        if len(lines) <= max_lines and len(whole) <= max(0, ceiling - used):
-            add(f"--- {rel} ({len(lines)} lines) ---", whole, ceiling)
-        else:
-            add(f"--- {rel} ({len(lines)} lines; definitions only, read_file for the rest) ---",
-                outline(body), ceiling)
-
-    paths = named_paths(task, also)
-    seen = set()
-    for rel in paths:
-        if (wd / rel).is_file() and rel not in seen:
-            seen.add(rel)
-            show(rel)
-    # A game directory is a unit: what it declares, what its notes say, and its logic.
-    for whole, slug in dict.fromkeys(GAME_DIR.findall(text)):
-        for rel, kw in ((f"{whole}/manifest.json", {}), (f"{whole}/NOTES.md", {"head": 60}),
-                        (f"{whole}/game.js", {})):
-            if rel not in seen:
-                seen.add(rel)
-                show(rel, **kw)
-    terms = [slug for _, slug in GAME_DIR.findall(text)] + [Path(rel).stem for rel in paths]
-    for rel in covering_tests(wd, list(dict.fromkeys(terms))):
-        if rel in seen:
-            continue
-        seen.add(rel)
-        body = (wd / rel).read_text(errors="replace") if (wd / rel).is_file() else ""
-        tests = "\n".join(f"{i:>5}\t{line.rstrip()}" for i, line in enumerate(body.splitlines(), 1)
-                          if re.match(r"\s*(?:def test_|it\(|test\()", line))
-        add(f"--- {rel} (the tests in it; run this module, not the whole suite) ---", tests)
-    for d in dict.fromkeys(str(Path(rel).parent) for rel in paths if "/" in rel):
-        rc, out = git(["ls-files", "--", d], cwd=wd)
-        if rc == 0 and out:
-            add(f"--- files in {d} ---", "\n".join(out.splitlines()[:60]))
-    if not parts:
-        return ""
-    return ("CODE THIS TASK TOUCHES (already read for you; line numbers match read_file, so an\n"
-            "old_str can be copied straight out of it)\n\n" + "\n\n".join(parts))
-
-
-def study(q, c, k=None):
-    """MIT OCW excerpts for a prompt: lecture cards, then source pages, as absolute paths.
-    Empty unless a lecture card matches, since tangential pages only distract small models.
-    Local BM25 — costs no API quota."""
-    if not c.get("corpus_db") or not Path(c["corpus_db"]).expanduser().is_file():
-        return ""
-    try:
-        import mit_corpus
-        return mit_corpus.study(q, k or c.get("corpus_k", 4), Path(c["corpus_db"]).expanduser(),
-                                c.get("corpus_root"), max_chars=1200, require_card=True)
-    except Exception as e:
-        log(f"corpus unavailable: {e}")
-        return ""
-
-
-def waiting(worker, why):
-    """Record that a worker is blocked rather than working, so progress reports say so."""
-    if why is None:
-        _waiting.pop(worker, None)
-    else:
-        _waiting[worker] = why
-
-
-def worker_publish(worker, state):
-    """Publish a structured state code for a worker by name (work order §13).
-
-    `flint()` runs at module level and only knows the worker's name, not the Worker
-    object; the BucketClock registry is how a wall-time bucket gets banked there.
-    A missing clock (a test harness that never built a Worker) is ignored."""
-    clock = _worker_clocks.get(worker)
-    if clock is not None:
-        clock.enter(state)
-
-
-def forget_worker(worker):
-    """Drop everything this worker's last task left behind.
-
-    Every one of these maps is keyed by worker name and outlives the task that filled it.
-    A worker that finished a turn on a paid stand-in kept `_ran_on`; one whose wait was cut
-    short by a stop kept `_waiting`; a killed turn kept `_active_turns` and `_turn_logs`.
-    The next task then reported the previous task's model, the previous task's reason for
-    not working, and a round counter read out of a log that had stopped growing."""
-    for book in (_waiting, _ran_on, _active_turns, _turn_logs, _held):
-        book.pop(worker, None)
-    with _study_lock:
-        for book in (_study_calls, _edit_calls, _request_calls, _charges):
-            book.pop(worker, None)
-
-
-def live_workers(workers):
-    """The names of workers that are still running, for reports that must not quote a dead one."""
-    return {w.name for w in workers if w.is_alive()}
-
-
-def count_study(worker, n=0, reset=False):
-    """Study-tool calls made by one worker's turns since its attempt began."""
-    with _study_lock:
-        if reset:
-            return _study_calls.pop(worker, 0)
-        _study_calls[worker] = _study_calls.get(worker, 0) + n
-        return _study_calls[worker]
-
-
-def count_usd(worker, usd=0.0, reset=False):
-    """What one worker's turns have been charged since its attempt began."""
-    with _study_lock:
-        if reset:
-            return round(_charges.pop(worker, 0.0), 6)
-        _charges[worker] = round(_charges.get(worker, 0.0) + usd, 6)
-        return _charges[worker]
-
-
-def count_edits(worker, n=0, reset=False):
-    """Edit calls one worker's turns made since its attempt began.
-
-    An attempt that ends with no diff means two different things. A model that called edit_file
-    and still changed nothing got it wrong; a model that never reached an edit ran out of the
-    rounds this harness gave it. Only the first is the model's failure."""
-    with _study_lock:
-        if reset:
-            return _edit_calls.pop(worker, 0)
-        _edit_calls[worker] = _edit_calls.get(worker, 0) + n
-        return _edit_calls[worker]
-
-
-def count_requests(worker, n=0, reset=False):
-    """API request starts attributable to this worker's current task."""
-    with _study_lock:
-        if reset:
-            return _request_calls.pop(worker, 0)
-        n = max(0, int(n or 0))
-        _request_calls[worker] = _request_calls.get(worker, 0) + n
-        if n:
-            with _run_lock:
-                _run["requests_started"] = _run.get("requests_started", 0) + n
-        return _request_calls[worker]
-
-
-def mit_arm(c, rng=random):
-    """Which side of the MIT-corpus experiment an attempt is on: "on" (excerpts in the prompt
-    and the study tool), "off" (neither), or "none" when there is no corpus to test."""
-    if not c.get("corpus_db") or not Path(c["corpus_db"]).expanduser().is_file():
-        return "none"
-    # A repository that does not want lecture excerpts in its prompts says so once, here. The
-    # experiment's own switch does not mean that: with mit_experiment disabled every attempt is
-    # on the corpus side, which is how 187 of 189 studio attempts got excerpts.
-    if not c.get("inject_corpus", True):
-        return "off"
-    exp = c.get("mit_experiment") or {}
-    if not exp.get("enabled", True):
-        return "on"
-    return "on" if rng.random() < float(exp.get("share_on", 0.5)) else "off"
-
-
-# ------------------------------------------------------------------ flint
-
-class CapReached(Exception):
-    pass
-
-
-class NoCredits(Exception):
-    pass
-
-
-class StepLimit(Exception):
-    pass
-
-
-class ModelError(RuntimeError):
-    """The model answered badly: malformed, empty or crashed turn."""
-
-
-class ReviewFormatError(ModelError):
-    """An invalid review is not an implementation failure."""
-
-
-FAST_IMPLEMENTER = """Perform this small, fully specified edit.
-YOUR TASK: {title}
-PROJECT GOAL AND RULES
-{goal}
-
-{context}
-
-TASK CONTRACT
-{spec}
-Follow repository instructions and the contract. Change only what the task requires.
-Do not commit, switch branches, merge or reset Git. Do not weaken existing tests.
-No network calls from code or tests, credentials, or live orders.
-Run `{test_cmd}` and report the changes and result in under 150 words.
-The supervisor will independently test and review the result.
-"""
-
-
-class AgentTimeout(Exception):
-    """A role exceeded its wall-clock budget; partial work still needs verification."""
-
-    def __init__(self, role, model, timeout, logfile):
-        self.role, self.model = role, model
-        self.timeout, self.logfile = timeout, logfile
-        super().__init__(f"agent_timeout: {role} on {model} exceeded {timeout}s; log: {logfile}")
-
-
-class ExplorationExhausted(Exception):
-    """A turn spent 70% of its rounds without editing and was stopped early (work order §2)."""
-
-
-def turn_timeout(c, role):
-    return c.get("role_timeouts", {}).get(role, c.get("turn_timeout", 1800))
-
-
-class Stopped(RuntimeError):
-    """The run was stopped mid-turn. The model did not fail and is not scored for it."""
-
-
-class ProviderDown(Exception):
-    """The model's providers are unavailable; not a judgement of its quality."""
-
-    def __init__(self, model, msg):
-        super().__init__(msg)
-        self.model = model
-
-
-class ProviderBusy(ProviderDown):
-    """The model is rate-limited upstream: it works, but another model should take this turn."""
-
-
-class ModelGone(ProviderDown):
-    """This API key cannot use the model at all (403/404). Waiting will not bring it back."""
-
-
-class RequestBudget(RuntimeError):
-    """The bounded task or run pilot has spent its allotted requests."""
-
-
-class ModelPoolExhausted(RuntimeError):
-    """Every candidate model is excluded on this task/role; a person must wake or requeue."""
-
-
 def rest(ledger, e):
     """Rest the model behind a ProviderDown; returns a phrase for the log."""
     busy, gone = isinstance(e, ProviderBusy), isinstance(e, ModelGone)
@@ -2210,261 +1698,183 @@ def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
     return out.strip()
 
 
-# ------------------------------------------------------------------ roles
-
-PERSONAS = {
-    "builder": "Build what a user of this project would reach for next. Choose the features "
-               "with the most value toward the goal and make them real.",
-    "inventor": "Propose at least one idea nobody asked for that would make the owner say "
-                "'oh, that's clever': a new capability, mechanic, tool or insight that fits the "
-                "goal. Unusual is welcome; a gimmick that does not serve the goal is not.",
-    "scholar": "Use the study corpus (the study tool searches MIT OpenCourseWare lecture cards, "
-               "slides, notes, problem sets and transcripts on deep learning and machine learning, probability, matrix calculus, discrete math and combinatorics, algorithms and Python, mathematical finance, fintech, blockchain, risk and decision analysis, venture finance, microeconomics, game theory, public finance, perception and psychology, math for computer science, cryptography (interactive proofs, SNARGs), poker strategy, semiconductor microfabrication, game design, plus past code "
-               "reviews; MIT OCW Courses/agent-skills/FLINT-INDEX.md maps topics to lectures). "
-               "Propose tasks that apply a specific technique from it to this project, and name "
-               "the course, lecture and source page in the detail.",
-    "hardener": "Find where the project is fragile: unhandled inputs, missing tests, wrong "
-                "assumptions, past review findings. Propose fixes that make the next features "
-                "safer to build.",
-    "refiner": "Make what already exists markedly better: faster, simpler, clearer, more "
-               "pleasant to use. Remove friction a user would notice.",
-}
-
-def persona_text(name, c):
-    """A persona's stance, with the MIT topic index as a path the planner can actually open."""
-    text = PERSONAS[name]
-    if name == "scholar":
-        try:
-            import mit_corpus
-            index = Path(c.get("corpus_root") or mit_corpus.corpus_root()).expanduser() / mit_corpus.SKILLS / "FLINT-INDEX.md"
-            if index.is_file():
-                text = text.replace("MIT OCW Courses/agent-skills/FLINT-INDEX.md", str(index))
-        except Exception:
-            pass
-    return text
+def study(q, c, k=None):
+    """MIT OCW excerpts for a prompt: lecture cards, then source pages, as absolute paths.
+    Empty unless a lecture card matches, since tangential pages only distract small models.
+    Local BM25 — costs no API quota."""
+    if not c.get("corpus_db") or not Path(c["corpus_db"]).expanduser().is_file():
+        return ""
+    try:
+        import mit_corpus
+        return mit_corpus.study(q, k or c.get("corpus_k", 4), Path(c["corpus_db"]).expanduser(),
+                                c.get("corpus_root"), max_chars=1200, require_card=True)
+    except Exception as e:
+        log(f"corpus unavailable: {e}")
+        return ""
 
 
-ARCHITECT = """You are the ARCHITECT in an agent swarm. The task below may be code, writing,
-translation, data or research; design whatever structure its own substance needs — files, sections,
-plans, schemas, source/target pairs — not just code modules.
+def waiting(worker, why):
+    """Record that a worker is blocked rather than working, so progress reports say so."""
+    if why is None:
+        _waiting.pop(worker, None)
+    else:
+        _waiting[worker] = why
 
-PROJECT GOAL
-{goal}
 
-TASK
-{title}
-{detail}
+def worker_publish(worker, state):
+    """Publish a structured state code for a worker by name (work order §13).
 
-{corpus}
+    `flint()` runs at module level and only knows the worker's name, not the Worker
+    object; the BucketClock registry is how a wall-time bucket gets banked there.
+    A missing clock (a test harness that never built a Worker) is ignored."""
+    clock = _worker_clocks.get(worker)
+    if clock is not None:
+        clock.enter(state)
 
-Inspect the repository to understand how it is actually built before proposing
-anything. Then produce a SPEC and nothing else:
 
-1. FILES — exact paths you expect to be created or modified.
-2. BEHAVIOR — what the code must do, precisely enough that two people would
-   build the same thing.
-3. ACCEPTANCE — concrete test cases by name, each with the input and the
-   expected output. These become real tests, so they must be checkable by
-   running `{test_cmd}`.
-4. RISK — the one thing most likely to go wrong.
+def forget_worker(worker):
+    """Drop everything this worker's last task left behind.
 
-Do NOT write implementation code. Do NOT edit any file. Keep the spec under
-400 words. If the task is already satisfied by existing code, say exactly
-"ALREADY SATISFIED" and explain in one sentence."""
+    Every one of these maps is keyed by worker name and outlives the task that filled it.
+    A worker that finished a turn on a paid stand-in kept `_ran_on`; one whose wait was cut
+    short by a stop kept `_waiting`; a killed turn kept `_active_turns` and `_turn_logs`.
+    The next task then reported the previous task's model, the previous task's reason for
+    not working, and a round counter read out of a log that had stopped growing."""
+    for book in (_waiting, _ran_on, _active_turns, _turn_logs, _held):
+        book.pop(worker, None)
+    with _study_lock:
+        for book in (_study_calls, _edit_calls, _request_calls, _charges):
+            book.pop(worker, None)
 
-# The order is deliberate. A model attends most to the end of a long prompt, so the task's own
-# contract, rules and acceptance criteria go last; the goal and the reference material, which
-# were previously the freshest text in a 16.6 KB prompt, come first.
-IMPLEMENTER = """You are the IMPLEMENTER in an agent swarm. The task may be code, writing,
-translation, data or research — produce whatever artifact it asks for and verify it the way the
-supervisor can check (tests, exact file content, or the configured checks).
-YOUR TASK: {title}
 
-PROJECT GOAL
-{goal}
+def live_workers(workers):
+    """The names of workers that are still running, for reports that must not quote a dead one."""
+    return {w.name for w in workers if w.is_alive()}
 
-{context}
 
-{playbook}
+def count_study(worker, n=0, reset=False):
+    """Study-tool calls made by one worker's turns since its attempt began."""
+    with _study_lock:
+        if reset:
+            return _study_calls.pop(worker, 0)
+        _study_calls[worker] = _study_calls.get(worker, 0) + n
+        return _study_calls[worker]
 
-{corpus}
-{previous}
 
-Implement this task in the current repository. It is a checkout of the swarm's
-trunk, which already contains the swarm's earlier accepted work: build on it.
+def count_usd(worker, usd=0.0, reset=False):
+    """What one worker's turns have been charged since its attempt began."""
+    with _study_lock:
+        if reset:
+            return round(_charges.pop(worker, 0.0), 6)
+        _charges[worker] = round(_charges.get(worker, 0.0) + usd, 6)
+        return _charges[worker]
 
-Within the task's intent you have creative latitude. If a cleaner design or a
-small extra touch makes the result genuinely better for the person using it,
-do it and test it. Creativity that serves the goal is rewarded; scope creep
-and churn are not.
 
-Rules that are not negotiable:
-- Your change must leave `{test_cmd}` passing. While you work, run the narrowest
-  test that covers what you changed — the context pack above names the module,
-  e.g. `python3 -m unittest tests.test_table_games -q`. The supervisor runs the
-  whole command afterwards, so you do not have to.
-- Do not delete, skip, relax or weaken any existing test to get a green run.
-  If an existing test is genuinely wrong, leave it failing and say so.
-- Add tests that prove the new behavior, including at least one edge case.
-- Change as little as possible outside what the task needs.
-- Do not commit, switch branches, merge or reset Git; the supervisor manages Git.
-- No network calls from code or tests, no credentials, no placing of live orders.
-- If a known algorithm or technique applies and a study tool is available, look it up.
+def count_edits(worker, n=0, reset=False):
+    """Edit calls one worker's turns made since its attempt began.
 
-THE TASK, IN FULL — this contract controls the scope, and its acceptance
-criteria are what the reviewer will check:
-{spec}
+    An attempt that ends with no diff means two different things. A model that called edit_file
+    and still changed nothing got it wrong; a model that never reached an edit ran out of the
+    rounds this harness gave it. Only the first is the model's failure."""
+    with _study_lock:
+        if reset:
+            return _edit_calls.pop(worker, 0)
+        _edit_calls[worker] = _edit_calls.get(worker, 0) + n
+        return _edit_calls[worker]
 
-When done, print a summary under 150 words: what you changed and the final
-result of `{test_cmd}`."""
 
-ADVERSARY = """You are the ADVERSARY in an agent swarm. The change below may be code, writing,
-translation, data or research; judge it against what the task actually asked for, whatever kind of
-artifact that is, and prove real defects with a failing test when it is code.
-Another agent just wrote this change. Your job is to find what is wrong with it,
-not to be agreeable.
+def count_requests(worker, n=0, reset=False):
+    """API request starts attributable to this worker's current task."""
+    with _study_lock:
+        if reset:
+            return _request_calls.pop(worker, 0)
+        n = max(0, int(n or 0))
+        _request_calls[worker] = _request_calls.get(worker, 0) + n
+        if n:
+            with _run_lock:
+                _run["requests_started"] = _run.get("requests_started", 0) + n
+        return _request_calls[worker]
 
-PROJECT GOAL
-{goal}
 
-SPEC
-{spec}
+def mit_arm(c, rng=random):
+    """Which side of the MIT-corpus experiment an attempt is on: "on" (excerpts in the prompt
+    and the study tool), "off" (neither), or "none" when there is no corpus to test."""
+    if not c.get("corpus_db") or not Path(c["corpus_db"]).expanduser().is_file():
+        return "none"
+    # A repository that does not want lecture excerpts in its prompts says so once, here. The
+    # experiment's own switch does not mean that: with mit_experiment disabled every attempt is
+    # on the corpus side, which is how 187 of 189 studio attempts got excerpts.
+    if not c.get("inject_corpus", True):
+        return "off"
+    exp = c.get("mit_experiment") or {}
+    if not exp.get("enabled", True):
+        return "on"
+    return "on" if rng.random() < float(exp.get("share_on", 0.5)) else "off"
 
-DIFF
-{diff}
+# ------------------------------------------------------------------ flint
 
-{corpus}
+class CapReached(Exception):
+    pass
 
-Look specifically for: off-by-one and boundary errors; unhandled errors and nil
-or None paths; concurrency and shared-state bugs; silent precision loss; tests
-that assert almost nothing; tests that were weakened or removed to force a pass;
-behavior that satisfies the letter of the spec but not its intent.
 
-If you find a real defect, WRITE A TEST THAT FAILS because of it, and leave that
-test in the repository. Then print "REJECT: <one line>".
+class NoCredits(Exception):
+    pass
 
-If after genuinely trying you cannot break it, print "APPROVE: <one line>".
-Do not approve merely because the suite is green — the suite is what you are
-auditing. Do not rewrite the implementation or commit changes.
-Your final response must be exactly one line starting APPROVE: or REJECT:."""
 
-JUDGE = """You are the JUDGE for an autonomous agent swarm. The change below
-already passed the supervisor's checks and an adversarial reviewer and has landed. Score
-it so the swarm learns which agents and ideas to reinforce.
+class StepLimit(Exception):
+    pass
 
-PROJECT GOAL
-{goal}
-{priorities}
-TASK
-{title}
-{detail}
 
-REVIEWER VERDICT
-{verdict}
+class ModelError(RuntimeError):
+    """The model answered badly: malformed, empty or crashed turn."""
 
-DIFF
-{diff}
 
-Score each from 0 to 10:
-- impact: how much closer this moves the project to its goal.
-- creativity: originality that serves the goal, such as a new capability, a
-  clever mechanism or an elegant simplification. Novelty that does not serve
-  the goal scores low.
-- quality: correctness, clarity, and how tightly the tests pin the behavior.
-Calibrate: solid routine work scores 4 to 6. Reserve 8 and above for work that
-unlocks something new or is notably elegant. Set breakthrough to true only if
-this changes what the project can do; expect that for fewer than 1 in 10 changes.
+class ReviewFormatError(ModelError):
+    """An invalid review is not an implementation failure."""
 
-Give one lesson: a general, actionable sentence that would help a future agent
-working in this repository (advice, not a summary of this change). Suggest up to
-two follow-up tasks this change makes possible, with acceptance criteria.
+class AgentTimeout(Exception):
+    """A role exceeded its wall-clock budget; partial work still needs verification."""
 
-You may read files to check your judgement. Output ONLY this JSON:
-{{"impact": 0, "creativity": 0, "quality": 0, "goal_item": 0, "breakthrough": false, "why": "one sentence", "lesson": "one sentence", "follow_ups": [{{"title": "...", "detail": "..."}}]}}"""
+    def __init__(self, role, model, timeout, logfile):
+        self.role, self.model = role, model
+        self.timeout, self.logfile = timeout, logfile
+        super().__init__(f"agent_timeout: {role} on {model} exceeded {timeout}s; log: {logfile}")
 
-PRIORITIES = """
-THE GOAL'S ORDERED PRIORITIES — 1 is what matters most:
-{items}
-Set "goal_item" to the number of the priority this change serves, or 0 if it
-serves none of them. Judge honestly: useful work that serves nothing on this
-list is still 0.
-"""
 
-PLANNER = """You are the PLANNER for an autonomous agent swarm that works around the clock.
+class ExplorationExhausted(Exception):
+    """A turn spent 70% of its rounds without editing and was stopped early (work order §2)."""
 
-The goal below may ask for software, content, analysis, translations, or everyday work — take it as written, whatever it is. A task does not have to be code to be worth proposing: documentation, copy, translations, data and research belong in the queue too, provided each lands as a concrete, verifiable artifact.
 
-PROJECT GOAL
-{goal}
-{priorities}
-YOUR STANCE THIS ROUND: {persona_name}
-{persona}
+def turn_timeout(c, role):
+    return c.get("role_timeouts", {}).get(role, c.get("turn_timeout", 1800))
 
-ALREADY LANDED ON THE SWARM'S TRUNK (newest first)
-{landed}
 
-BREAKTHROUGHS TO BUILD ON
-{breakthroughs}
+class Stopped(RuntimeError):
+    """The run was stopped mid-turn. The model did not fail and is not scored for it."""
 
-{playbook}
 
-{corpus}
+class ProviderDown(Exception):
+    """The model's providers are unavailable; not a judgement of its quality."""
 
-ALREADY PROPOSED OR ATTEMPTED — do not propose any of these again, in any wording:
-{seen}
+    def __init__(self, model, msg):
+        super().__init__(msg)
+        self.model = model
 
-The repository in front of you is the swarm's trunk. Inspect it (at most {steps}
-tool calls), compare it with the goal, then propose the next {n} tasks.
 
-Rules:
-- Each task must be completable in one focused sitting (well under 25 tool
-  calls) and verifiable by running `{test_cmd}`.
-- One concern per task: a title or detail joined by "+" or "and" across distinct
-  checks or features is several tasks wearing one title. If describing the work
-  honestly needs "and"/"+" to join unrelated concerns, propose them as separate
-  tasks instead.
-- Put concrete acceptance criteria in the detail: inputs, expected behavior and
-  the tests that prove it.
-- Tasks run one after another on top of accepted work, but each must be
-  valuable and testable on its own.
-- Nothing that needs credentials, live trading, or network access to real services.
-{serves_rule}
-Output ONLY a JSON array, no prose around it:
-[{{"title": "...", "detail": "...", "kind": "feature|bugfix|test|refactor"{serves_field}}}]"""
+class ProviderBusy(ProviderDown):
+    """The model is rate-limited upstream: it works, but another model should take this turn."""
 
-PLANNER_SERVES = """- Every task must serve one of the goal's numbered priorities, and say which in
-  "serves". A task that serves none of them will be dropped. At least half of
-  this batch must serve priority 1: that is what the goal says matters most, and
-  it is where nothing has landed.
-"""
 
-DECOMPOSER = """You are the DECOMPOSER in an agent swarm. This task timed out or failed repeatedly.
-Split it into 2 or 3 smaller tasks that together achieve it, each small enough
-to succeed as a verified increment. Subtasks execute in array order: each depends
-on the preceding subtask landing successfully. Do not assume unlanded work exists.
+class ModelGone(ProviderDown):
+    """This API key cannot use the model at all (403/404). Waiting will not bring it back."""
 
-The task may be code, writing, translation, data or research — split it into whatever
-units its own substance suggests, not just code units. A language or content task
-splits into sections, documents, or source/target pairs rather than functions.
 
-PROJECT GOAL
-{goal}
+class RequestBudget(RuntimeError):
+    """The bounded task or run pilot has spent its allotted requests."""
 
-TASK
-{title}
-{detail}
 
-WHY THE ATTEMPTS FAILED
-{notes}
-
-Inspect the repository briefly first. The first subtask should be the smallest step that
-makes real progress. Each subtask must be verifiable by running `{test_cmd}` and
-have concrete acceptance criteria. If the task is impossible or misguided,
-output [].
-
-Output ONLY a JSON array, no prose around it:
-[{{"title": "...", "detail": "...", "kind": "feature|bugfix|test|refactor"}}]"""
-
+class ModelPoolExhausted(RuntimeError):
+    """Every model in the pool is asleep or has failed enough times this run (work order §2)."""
 
 # ------------------------------------------------------------------ gate
 
@@ -2502,137 +1912,6 @@ def run_gate(cwd, c):
     if c.get("_gate_log"):
         Path(c["_gate_log"]).write_text(f"command: {c['test_cmd']}\nexit: {rc}\n{out}")
     return rc == 0, out[-4000:]
-
-
-ASSERT_CALL = re.compile(
-    r"\b(assert\w*(?:\.\w+)*|expect|require|should\w*|t\.(?:Error|Fatal)f?)\b")
-# Directory names too common to identify anything: "games" is not what "games/reversi" means.
-GENERIC_DIR = frozenset({"", ".", "/", "src", "lib", "app", "test", "tests", "spec", "specs",
-                         "games", "site", "docs", "scripts", "static", "public", "assets"})
-
-
-def assert_counts(lines):
-    """How many times each assertion function is called across these lines."""
-    counts = {}
-    for line in lines:
-        for m in ASSERT_CALL.finditer(line):
-            counts[m.group(1)] = counts.get(m.group(1), 0) + 1
-    return counts
-
-
-def identifiers(path):
-    """The names that stand for this path in code: the path, its directory, and their names."""
-    p = Path(path)
-    out = {str(path), p.name, p.stem}
-    parent = p.parent
-    if str(parent) not in GENERIC_DIR:
-        out |= {str(parent), parent.name}
-    return {x for x in out if x and x not in GENERIC_DIR}
-
-
-def deleted_paths(diff):
-    """Every name that identifies something this diff deletes."""
-    out, pending = set(), None
-    for line in diff.splitlines():
-        if line.startswith("diff --git "):
-            pending = line.split(" b/", 1)[-1].strip()
-        elif line.startswith("deleted file mode") and pending:
-            out |= identifiers(pending)
-            pending = None
-    return out
-
-
-def test_hunks(diff):
-    """[(path, deleted, [hunk lines])] for the test files this diff touches."""
-    files, path, deleted, is_test, hunks = [], None, False, False, None
-
-    def close():
-        if is_test and path:
-            files.append((path, deleted, hunks))
-    for line in diff.splitlines():
-        if line.startswith("diff --git "):
-            close()
-            path = line.split(" b/", 1)[-1].strip()
-            low = path.lower()
-            is_test = any(m in low for m in ("test", "spec_", "_spec"))
-            deleted, hunks = False, []
-        elif line.startswith("deleted file mode"):
-            deleted = True
-        elif line.startswith("@@") and is_test:
-            hunks.append([])
-        elif is_test and hunks and line[:1] in ("+", "-", " "):
-            hunks[-1].append(line)
-    close()
-    return files
-
-
-def names_deleted(line, gone):
-    """True when this line refers to something the diff deletes.
-
-    A test that loads games/star-catcher/game.js writes it as
-    path.join(__dirname, '..', 'games', 'star-catcher', 'game.js'), so the slug is what can be
-    matched, not the joined path."""
-    return any(re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", line) for name in gone)
-
-
-def names_its_source(test_path, gone):
-    """True when a deleted test file is named after something else the diff deletes.
-
-    tests/test_reversi.py deleted alongside games/reversi/ is one removal, not a weakening;
-    tests/test_core.py deleted while the code stays is the clearest weakening there is."""
-    stem = Path(test_path).stem.lower()
-    return any(len(name) >= 3 and name.lower() in stem for name in gone)
-
-
-def weakened_tests(diff, allow_test_changes=False):
-    """Assertions this diff took out of test files that are still meant to exist.
-
-    The old check counted every removed line containing "assert" under any path containing
-    "test". All four hits across 189 studio attempts were legitimate, and this check carries the
-    heaviest penalty in the ledger (weight 6) and hangs the model on the rafters, so a false
-    positive punishes a model for doing what the owner asked:
-
-      - two attempts deleted games/reversi/ and games/star-catcher/ and the assertions that
-        loaded them, which is what "remove star catcher and reversi" means;
-      - one was the owner's own removal request, again;
-      - one changed `assert.equal(b[112], 3)` to `assert.equal(b[80], 3)` — an assertion edited
-        to match an 8x15 board, not an assertion removed.
-
-    So: count per assertion function, treat a removal paired with an addition of the same
-    function in the same hunk as an edit, skip hunks that remove code for files the diff deletes,
-    and skip a test file deleted alongside the source it tested.
-    """
-    if allow_test_changes:
-        return 0                       # the owner authorised this; the adversary is told so
-    total, all_gone = 0, deleted_paths(diff)
-    for path, deleted, hunks in test_hunks(diff):
-        # A file cannot be its own deleted source, or every deleted test file would excuse itself.
-        gone = all_gone - identifiers(path)
-        if deleted:
-            if names_its_source(path, gone):
-                continue               # the test went with the code it tested
-            # A test file deleted while the code it tests stays is the plainest weakening there
-            # is, so every assertion it took with it counts.
-            for lines in hunks:
-                total += sum(assert_counts([l[1:] for l in lines if l.startswith("-")]).values())
-            continue
-        for lines in hunks:
-            minus = [l[1:] for l in lines if l.startswith("-")]
-            plus = [l[1:] for l in lines if l.startswith("+")]
-            if gone and any(names_deleted(l, gone) for l in minus):
-                continue               # this hunk removes the use of something that is gone
-            back = assert_counts(plus)
-            for name, n in assert_counts(minus).items():
-                total += max(0, n - back.get(name, 0))
-    return total
-
-
-def last_error(output):
-    lines = [l.strip() for l in output.splitlines() if l.strip()]
-    for l in reversed(lines):
-        if re.search(r"error|fail|assert|exception|panic", l, re.I):
-            return l[:200]
-    return lines[-1][:200] if lines else "no output"
 
 
 # ------------------------------------------------------------------ trunk
@@ -4555,186 +3834,6 @@ def free_tool_models():
 
 # ------------------------------------------------------------------ setup
 
-def detect_test_cmd(repo):
-    """How to test this repository, or None. A folder that only holds projects (no manifest of
-    its own) is searched one level down: a single project there is used, several are ambiguous
-    and left to the owner, since testing the wrong one would reject every task."""
-    repo = Path(repo)
-    cmd = project_test_cmd(repo)
-    if cmd:
-        return cmd
-    found = sub_projects(repo)
-    if len(found) == 1:
-        name, cmd = found[0]
-        log(f"no project at the top level; testing the only one inside it: {name}")
-        return f"cd {shlex.quote(name)} && {cmd}"
-    return None
-
-
-def embedded_repos(repo):
-    """Directories one level inside repo that are Git repositories of their own.
-
-    Git never stores an embedded repository's files in its parent, so those directories come
-    out EMPTY in every worktree the swarm builds. The swarm cannot read or change that code
-    from here: it has to be pointed at the inner repository instead."""
-    return [d.name for d in _subdirs(repo) if (d / ".git").exists()]
-
-
-def _subdirs(repo):
-    try:
-        return sorted(d for d in Path(repo).iterdir() if d.is_dir() and not d.name.startswith("."))
-    except OSError:
-        return []
-
-
-def sub_projects(repo):
-    """[(directory name, its test command)] for projects one level inside repo, skipping
-    embedded repositories, whose code a worktree of this repository would not contain."""
-    gone = set(embedded_repos(repo))
-    return [(d.name, cmd) for d in _subdirs(repo) if d.name not in gone
-            for cmd in [project_test_cmd(d)] if cmd]
-
-
-def test_cmd_hint(repo):
-    """What to tell someone whose repository the swarm cannot test by itself."""
-    repo, lines = Path(repo), []
-    for name in embedded_repos(repo):
-        lines += [f"  {name}/ is its own Git repository, so its code is not part of {repo.name} "
-                  f"and never appears in the swarm's worktrees.",
-                  f"  Point the swarm at it directly:",
-                  f"    swarm grind {shlex.quote(str(repo / name))} --goal '...'"]
-    found = sub_projects(repo)
-    if found:
-        lines.append("  Projects inside it, and how each would be tested:")
-        lines += [f"    --test-cmd 'cd {shlex.quote(n)} && {c}'" for n, c in found]
-        lines.append("  Point the swarm at one of those directories instead, or pass one of the above.")
-    if not lines:
-        lines = ["  Nothing recognisable to test (no go.mod, package.json, pyproject.toml, "
-                 "Cargo.toml or Makefile test target).",
-                 "  Pass the command you run yourself, e.g. --test-cmd 'go test ./...'"]
-    return "\n".join(lines)
-
-
-def test_cmds(repo):
-    """Every way this directory could be tested, best guess first: [(what found it, command)].
-
-    A repository with code in two languages matches more than once — a Go service with a
-    Python notebook beside it — so the runner-up is worth showing when the first choice
-    turns out to be the wrong one."""
-    repo, out = Path(repo), []
-    if (repo / "go.mod").exists():
-        out.append(("go.mod", "go test ./..."))
-    if (repo / "Cargo.toml").exists():
-        out.append(("Cargo.toml", "cargo test -q"))
-    pkg = repo / "package.json"
-    if pkg.exists():
-        try:
-            test = json.loads(pkg.read_text()).get("scripts", {}).get("test", "")
-        except (OSError, json.JSONDecodeError):
-            test = ""
-        if test and "no test specified" not in test:
-            if (repo / "pnpm-lock.yaml").exists():
-                out.append(("package.json", "pnpm install --frozen-lockfile --silent && pnpm test"))
-            elif (repo / "yarn.lock").exists():
-                out.append(("package.json", "yarn install --frozen-lockfile --silent && yarn test"))
-            elif (repo / "package-lock.json").exists():
-                out.append(("package.json", "npm ci --silent --no-audit --no-fund && npm test --silent"))
-            else:
-                out.append(("package.json", "npm install --silent --no-audit --no-fund && npm test --silent"))
-    found = next((f for f in ("pyproject.toml", "pytest.ini", "setup.cfg", "tests")
-                  if (repo / f).exists()), None)
-    if found:
-        r = subprocess.run(["python3", "-c", "import pytest"], capture_output=True)
-        out.append((found, "python3 -m pytest -q" if r.returncode == 0
-                    else "python3 -m unittest discover -q"))
-    mk = repo / "Makefile"
-    if mk.exists() and re.search(r"^test:", mk.read_text(errors="replace"), re.M):
-        out.append(("Makefile", "make test"))
-    return out
-
-
-def project_test_cmd(repo):
-    cmds = test_cmds(repo)
-    return cmds[0][1] if cmds else None
-
-
-def other_test_cmds(repo, current):
-    """Ways to test this repository other than the one that just failed, as printable lines."""
-    repo = Path(repo)
-    rows = [(what, cmd) for what, cmd in test_cmds(repo) if cmd != current]
-    rows += [(f"{name}/", f"cd {shlex.quote(name)} && {cmd}") for name, cmd in sub_projects(repo)
-             if f"cd {shlex.quote(name)} && {cmd}" != current]
-    if not rows:
-        return ""
-    lines = ["\n  Other ways this repository could be tested:"]
-    lines += [f"    --test-cmd {shlex.quote(cmd)}   (found {what})" for what, cmd in rows]
-    return "\n".join(lines)
-
-
-def scaffold(path, goal):
-    """A new Git repository for a problem that has no codebase yet."""
-    d = Path(path).expanduser().resolve()
-    d.mkdir(parents=True, exist_ok=True)
-    if (d / ".git").exists():
-        return d
-    (d / "tests").mkdir(exist_ok=True)
-    (d / "README.md").write_text(f"# {d.name}\n\n{goal}\n")
-    (d / "GOAL.md").write_text(f"# Goal\n\n{goal}\n")
-    (d / ".gitignore").write_text("__pycache__/\n*.pyc\n.venv/\nnode_modules/\n.pytest_cache/\ndist/\nbuild/\n")
-    (d / "tests" / "__init__.py").write_text("")
-    (d / "tests" / "test_smoke.py").write_text(
-        "import unittest\n\n\nclass Smoke(unittest.TestCase):\n"
-        "    def test_suite_runs(self):\n        self.assertTrue(True)\n\n\n"
-        "if __name__ == \"__main__\":\n    unittest.main()\n")
-    env = {**os.environ, **GIT_IDENT}
-    for args in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "swarm: scaffold"]):
-        subprocess.run(["git", *args], cwd=d, check=True, capture_output=True, env=env)
-    return d
-
-
-def configure(repo, test_cmd=None):
-    repo = Path(repo).expanduser().resolve()
-    if subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
-                      capture_output=True).returncode != 0:
-        sys.exit(f"{repo} needs a Git repository with at least one commit.\n"
-                 f"  git -C '{repo}' init && git -C '{repo}' add -A && git -C '{repo}' commit -m baseline")
-    c = load_cfg()
-    if c.get("repo") != str(repo):
-        branch = subprocess.run(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
-                                capture_output=True, text=True).stdout.strip()
-        c.update(repo=str(repo), base_branch=branch if branch and branch != "HEAD" else "main")
-        c["test_cmd"] = test_cmd or detect_test_cmd(repo) or "__TEST_CMD__"
-    elif test_cmd:
-        c["test_cmd"] = test_cmd
-    c["python"] = python_for(c)
-    save_cfg(c)
-    if c["test_cmd"].startswith("__"):
-        sys.exit(f"could not detect how to test {repo}.\n{test_cmd_hint(repo)}")
-    log(f"target {repo} on {c['base_branch']}; tests: {c['test_cmd']}")
-
-
-def why_unrunnable(cmd):
-    """Why a test command could not run at all, as a line to append to an error, or "".
-
-    Judged from the command itself: its output only says "not found", which is equally true of
-    a missing interpreter and of prose passed by mistake. Only a single program can be checked,
-    so a compound shell command is left alone."""
-    if re.search(r"[|&;<>()`]|\$\(", cmd):
-        return ""
-    try:
-        first = shlex.split(cmd)[0]
-    except (ValueError, IndexError):
-        return ""
-    if shutil.which(first):
-        return ""
-    if not re.fullmatch(r"[\w.+-]+(/[\w.+-]+)*", first):
-        return ("\n  --test-cmd takes a shell command that runs the tests, not a description of "
-                "the work; the goal goes in --goal.")
-    instead = {"python": "python3", "pip": "pip3"}.get(first)
-    return (f"\n  `{first}` is not installed or not on PATH"
-            + (f" — macOS ships `{instead}`, not `{first}`." if instead else "."))
-
-
 # Every key the swarm reads. Anything else in a config is a typo or something that was
 # renamed, and both fail silently: the setting simply never takes effect.
 KNOWN_KEYS = frozenset({
@@ -5577,166 +4676,6 @@ def cmd_grind(a):
 
 
 # ------------------------------------------------------------------ surroundings (swarm init)
-
-# Repository shapes that tell `swarm init` what a bare worktree will be missing and therefore
-# what provisioning hooks it needs. Keyed by marker file; `name` is shown to the human.
-RUNTIME_MARKERS = [
-    ("requirements.txt", "python deps"),
-    ("pyproject.toml", "python deps"),
-    ("Pipfile", "python deps"),
-    ("package.json", "node deps"),
-    ("Gemfile", "ruby deps"),
-    ("go.mod", "go deps"),
-    ("Cargo.toml", "rust deps"),
-    ("build.gradle", "gradle deps"),
-    ("pom.xml", "maven deps"),
-    ("composer.json", "php deps"),
-    ("mix.exs", "elixir deps"),
-]
-
-# Marker -> proven installer command for a bare checkout. Verified against the dj-bot repo,
-# whose postinstall writes a fix-ups shim that a fresh npm ci needs in place before `npm run
-# check` can resolve "@strudel/core".
-PROV_RECIPES = [
-    (("package.json",), "npm ci --silent --no-audit --no-fund"),
-    (("requirements.txt", "pyproject.toml", "Pipfile"), {
-        "requirements.txt": ("python3 -m venv .venv && "
-                             ".venv/bin/python -m pip install -q -r requirements.txt"),
-        "pyproject.toml": ("python3 -m venv .venv && "
-                           ".venv/bin/python -m pip install -q -e ."),
-        "Pipfile": ("python3 -m venv .venv && "
-                    ".venv/bin/python -m pip install -q pipenv && "
-                    ".venv/bin/pipenv install --dev"),
-    }),
-    (("Gemfile",), "bundle install"),
-    (("go.mod",), "go mod download"),
-    (("Cargo.toml",), "cargo build"),
-    (("build.gradle", "pom.xml"), "mvn -q -DskipTests dependency:go-offline"),
-    (("composer.json",), "composer install --quiet"),
-    (("mix.exs",), "mix deps.get"),
-]
-
-
-def probe_surroundings(repo):
-    """A machine-readable snapshot of what a bare worktree of `repo` will lack.
-
-    Returns {"nested": [...], "runtime": {"python": bool, "node": bool, ...},
-    "venv": bool, "node_modules": bool, "gitignore": [...]}. Language markers are
-    searched one level deep as well as at the top: several swarm targets keep their whole
-    project (package.json, requirements.txt) under a subdirectory like `spike/` or
-    `server/`, and a bare worktree loses `node_modules/` wherever it lives. This is what
-    `swarm init` drops next to its tuned config, and what the baseline gate reads to fail
-    fast when the gate needs something no prov hook installs."""
-    repo = Path(repo)
-    one_deep = [p for p in repo.iterdir() if p.is_dir() and not p.name.startswith(".")
-                and not (p / ".git").exists()]
-    nested = [d.name for d in sorted(p for p in repo.iterdir() if p.is_dir() and (p / ".git").exists())]
-    gitignore = []
-    gi = repo / ".gitignore"
-    if gi.is_file():
-        for line in gi.read_text(errors="replace").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                gitignore.append(line)
-    # The marker file exists if it is at the top level OR one level down in any subdir.
-    deps = {}
-    subdirs = {}
-    for name, _ in RUNTIME_MARKERS:
-        deps[name] = (repo / name).is_file() or any((d / name).is_file() for d in one_deep)
-        if deps[name] and not (repo / name).is_file():
-            subdirs[name] = next(d.name for d in one_deep if (d / name).is_file())
-    node_modules = (repo / "node_modules").exists() or any(
-        (d / "node_modules").exists() for d in one_deep)
-    return {
-        "nested": nested,
-        "nested_sources": {d.name: str(d.resolve()) for d in sorted(
-            p for p in repo.iterdir() if p.is_dir() and (p / ".git").exists())},
-        "runtime": deps,
-        "subdirs": subdirs,
-        "venv": (repo / ".venv").exists(),
-        "node_modules": node_modules,
-        "gitignore": gitignore,
-    }
-
-
-def build_prov_block(s, test_cmd):
-    """The prov hooks a fresh worktree needs, from the surroundings probe.
-
-    Two sources: the language markers (requiring an install that the test command itself
-    may not perform), and the nested repositories listed by the probe (each one is absent
-    from a bare worktree and must be bootstrapped by a hook). If the test command already
-    runs the same install (an npm ci before npm run check, say), that recipe is skipped —
-    the hook list stays minimal and idempotent. Skip tokens are per-language so an "npm
-    ci" gate does not suppress the python-requirements hook and vice versa."""
-    # A recipe is skipped when the gate already performs that language's install.
-    # Keyed by marker file so "npm ci ..." in the gate skips the npm marker without
-    # touching the python one, and vice versa.
-    SKIP_HINTS = {
-        "package.json": (r"\bnpm\s+(?:ci|install)\b",),
-        # Only skip the venv recipe when the gate itself *creates* the venv. Merely
-        # referencing .venv/bin/python in the gate is a consumer, not an installer —
-        # dj-bot's gate runs `.venv/bin/python -m pytest` yet has no .venv in a fresh
-        # worktree, and skipping here is exactly the red-baseline bug this fixes.
-        "requirements.txt": (r"\bpython3?\s+-m\s+venv\b",),
-        "pyproject.toml": (r"\bpython3?\s+-m\s+venv\b",),
-        "Pipfile": (r"\bpython3?\s+-m\s+venv\b",),
-        "Gemfile": (r"\bbundle\s+install\b",),
-        "go.mod": (r"\bgo\s+mod\s+download\b",),
-        "Cargo.toml": (r"\bcargo\s+(?:build|fetch)\b",),
-        "build.gradle": (r"\b(?:mvn|gradle|gradlew)\b",),
-        "pom.xml": (r"\bmvn\b",),
-        "composer.json": (r"\bcomposer\s+install\b",),
-        "mix.exs": (r"\bmix\s+deps\.get\b",),
-    }
-    hooks, skipped = [], []
-    for markers, recipe_spec in PROV_RECIPES:
-        marker = next((m for m in markers if s["runtime"].get(m)), None)
-        if marker is None:
-            continue
-        hints = SKIP_HINTS.get(marker, ())
-        if any(re.search(pattern, test_cmd) for pattern in hints):
-            skipped.append(marker)
-            continue
-        recipe = recipe_spec[marker] if isinstance(recipe_spec, dict) else recipe_spec
-        # A marker found one level down (dj-bot keeps spike/package.json + spike/node_modules)
-        # needs the recipe to run inside that subdirectory, or npm ci at the root has no
-        # manifest to install. Default is the repo root ("cd . && ..." is a no-op).
-        sub = s.get("subdirs", {}).get(marker, ".")
-        if sub == ".":
-            hooks.append(recipe)
-        else:
-            hooks.append(f"cd {shlex.quote(sub)} && {recipe}")
-        skipped.append(marker)
-    for name in s.get("nested", []):
-        source = s.get("nested_sources", {}).get(name, name)
-        hooks.append(f"git clone --quiet {shlex.quote(source)} {shlex.quote('./' + name)}")
-        skipped.append(f"nested {name}")
-    return {"hooks": hooks, "env": {}, "timeout": 1800, "_skipped": skipped}
-
-
-def render_surroundings(repo, slug, s, config_path, existing=None):
-    """A human-readable map of the repo's surroundings, to a string."""
-    lines = [f"repo:            {repo} ({git_branch(repo)})",
-             f"config:          {config_path}"]
-    if s.get("nested"):
-        lines.append(f"nested repos:    {', '.join(s['nested'])}  (absent from every worktree)")
-    runtime = [k for k, v in s.get("runtime", {}).items() if v]
-    lines.append("runtime deps:    " + (", ".join(runtime) if runtime else "none detected"))
-    if s.get("venv"):
-        lines.append("venv:            present (.venv)")
-    if s.get("node_modules"):
-        lines.append("node_modules:    present (not in git — fresh worktrees lack it)")
-    for marker, sub in sorted((s.get("subdirs") or {}).items()):
-        lines.append(f"{marker}:        under {sub}/ — installs must cd there (prov handles this)")
-    if s.get("gitignore"):
-        lines.append("gitignored:      " + ", ".join(sorted(s["gitignore"])[:8]))
-    if existing:
-        prov = existing.get("prov") or {}
-        lines.append(f"prov hooks:      {len(prov.get('hooks', []))} configured")
-        if prov.get("hooks"):
-            lines.append("  (re-run `swarm init <repo>` to refresh)")
-    return "\n".join(lines)
-
 
 def cmd_init(a):
     """Write a tuned config for a repository, or report on one that already exists.
