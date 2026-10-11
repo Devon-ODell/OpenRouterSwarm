@@ -68,6 +68,11 @@ except ImportError:  # pragma: no cover - exercised by bridge.py / direct swarmd
                             Stopped, ProviderDown, ProviderBusy, ModelGone,
                             RequestBudget, ModelPoolExhausted)
 
+try:  # attempt_runner resolves against the same module identity as the daemon
+    from . import attempt_runner
+except ImportError:  # pragma: no cover - exercised by bridge.py / direct swarmd.py execution
+    import attempt_runner
+
 # ------------------------------------------------------------------ P2 extracted leaves
 #
 # prompts / task_rules / context_builder / verification / provisioning hold the code;
@@ -1419,6 +1424,13 @@ class Tally:
                 self.drain.set()
 
 
+def _attempt_deps():
+    """The daemon services an attempt uses, read now so a test's patch of any of them bites."""
+    return attempt_runner.AttemptDeps(
+        log=log, journal=journal, notify=notify, git=git, trunk_name=trunk_name,
+        state=STATE)
+
+
 class Worker(threading.Thread):
     def __init__(self, idx, c, q, budget, stop, ledger=None, tally=None):
         super().__init__(daemon=True, name=f"w{idx}")
@@ -1474,6 +1486,9 @@ class Worker(threading.Thread):
             budget = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
                             owner_window=c.get("owner_window", ["00:00", "00:00"]))
         return c, budget
+
+    def runner(self):
+        return attempt_runner.AttemptRunner(self, _attempt_deps())
 
     def pick(self, exclude=(), role="implementer", c=None):
         """Implementers by Thompson sampling. Reviewers and judges come from the
@@ -2059,24 +2074,7 @@ class Worker(threading.Thread):
 
     def judge(self, task, goal, diff, verdict, model, avoid=(), c=None,
               attempt_budget=None):
-        c, attempt_budget = self._attempt_inputs(c, attempt_budget)
-        items = goal_items(goal)
-        priorities = PRIORITIES.format(
-            items="\n".join(f"{i}. {t}" for i, t in enumerate(items, 1))) if items else ""
-        try:
-            out = self.call("judge", JUDGE.format(
-                goal=goal, priorities=priorities, title=task["title"],
-                detail=task["detail"], verdict=verdict,
-                diff=diff[:c.get("max_diff", 24000)]),
-                self.wt, c["steps"].get("judge", 4), model, avoid, c=c,
-                attempt_budget=attempt_budget)
-        except Exception as e:  # the change already landed; never lose it to a judge failure
-            log(f"judge unavailable ({type(e).__name__}); accepted work remains unscored", self.name)
-            return None
-        scores = parse_scores(out)
-        if scores is None:
-            log(f"judge {model} returned no usable JSON; accepted work remains unscored", self.name)
-        return scores
+        return self.runner().judge(task, goal, diff, verdict, model, avoid, c, attempt_budget)
 
     def _reinforce(self, task, stage, info, c=None, attempt_budget=None):
         c, attempt_budget = self._attempt_inputs(c, attempt_budget)
@@ -2144,51 +2142,13 @@ class Worker(threading.Thread):
         log(f"{task['id']}: {stage}, reward {r:.2f}{' ★ BREAKTHROUGH' if breakthrough else ''}", self.name)
 
     def follow_up(self, task, scores, r, breakthrough, c=None):
-        """Recursion on success: strong work spawns the next step it made possible."""
-        c = self._attempt_config(c)
-        if c.get("roadmap_file"):
-            return  # Future packets are dispatched only by their recorded roadmap gates.
-        if not scores or not (breakthrough or r >= 0.75):
-            return
-        if len(self.q.pending()) >= c.get("max_queue", 20):
-            return
-        for f in scores.get("follow_ups", [])[:2 if breakthrough else 1]:
-            t = self.q.add(f["title"], f["detail"], "feature", persona=task.get("persona"),
-                           planner_model=task.get("planner_model"), parent=task["id"],
-                           priority=2 if breakthrough else 0, origin="follow_up",
-                           depth=task.get("depth", 0))
-            if t:
-                log(f"follow-up queued: {t['title']}", self.name)
+        return self.runner().follow_up(task, scores, r, breakthrough, c)
 
     def celebrate(self, task, r, scores, impl, c=None):
-        c = self._attempt_config(c)
-        s = scores or {}
-        entry = (f"\n## {dt.datetime.now():%Y-%m-%d %H:%M} — {task['title']}\n\n"
-                 f"reward {r:.2f} · impact {s.get('impact', '?')} · creativity {s.get('creativity', '?')}"
-                 f" · quality {s.get('quality', '?')} · implementer `{impl}`"
-                 f" · persona {task.get('persona', 'human')}\n\n{s.get('why', '')}\n\n"
-                 f"Lesson: {s.get('lesson', '')}\n")
-        with open(STATE / "BREAKTHROUGHS.md", "a") as f:
-            f.write(entry)
-        log(f"★ BREAKTHROUGH: {task['title']} ({impl})", self.name)
-        notify(c, "breakthrough", task["title"])
+        return self.runner().celebrate(task, r, scores, impl, c)
 
     def hang(self, task, stage, info, impl, c=None):
-        """Faulty code goes up on the rafters, under its author's name: shown to every
-        later implementer and planner, written to RAFTERS.md, and announced."""
-        c = self._attempt_config(c)
-        base = getattr(self, "review_base", None) or trunk_name(c)
-        _, diff = git(["diff", "--unified=0", base, self.branch, "--"], cwd=c["repo"])
-        what = defect(stage, info.get("artifact"), info.get("pitfall", ""))
-        code = exhibit(diff, stage)
-        self.ledger.hang(impl, task, stage, what, code, info.get("artifact", ""))
-        with open(STATE / "RAFTERS.md", "a") as f:
-            f.write(f"\n## {dt.datetime.now():%Y-%m-%d %H:%M} — `{impl}` {CRIME[stage]}\n\n"
-                    f"Task: {task['title']}  \nDefect: {what}  \nBranch: `{self.branch}`"
-                    + (f"  \nEvidence: {info['artifact']}" if info.get("artifact") else "")
-                    + (f"\n\n```diff\n{code}\n```\n" if code else "\n"))
-        log(f"HUNG FROM THE RAFTERS: {impl} {CRIME[stage]} — {what[:140]}", self.name)
-        notify(c, "hung from the rafters", f"{impl}: {what[:120]}")
+        return self.runner().hang(task, stage, info, impl, c)
 
     def _cleanup(self, c=None):
         c = self._attempt_config(c)
@@ -2196,13 +2156,7 @@ class Worker(threading.Thread):
                                  git=git, owns_branch=self.own_branch)
 
     def strand(self, task, how):
-        """Park what depends on a task that can no longer finish, and say so loudly."""
-        titles = self.q.strand(task["id"], f"prerequisite '{task['title'][:80]}' {how}")
-        if titles:
-            log(f"'{task['title'][:60]}' {how}; parked {len(titles)} task(s) that depended on it: "
-                + "; ".join(t[:50] for t in titles), self.name)
-            journal("stranded", id=task["id"], title=task["title"], how=how, parked=titles)
-        return titles
+        return self.runner().strand(task, how)
 
     def decompose(self, task, goal, avoid=(), c=None, attempt_budget=None):
         """Split after a timeout or repeated failure, within the recursion limits.
@@ -2262,26 +2216,12 @@ class Worker(threading.Thread):
         return added
 
     def retry_split(self, task, goal, model, avoid, why, c=None, attempt_budget=None):
-        """One more decomposition on a different model. Returns 0 once that has been tried."""
-        if avoid:
-            log(f"'{task['title']}' was not split: {why} from {model} as well", self.name)
-            journal("split_failed", id=task["id"], title=task["title"], why=why,
-                    models=[*avoid, model])
-            return 0
-        log(f"decomposer {model}: {why}; trying another model before giving up on "
-            f"'{task['title']}'", self.name)
-        return self.decompose(task, goal, avoid={*avoid, model}, c=c,
-                              attempt_budget=attempt_budget)
+        return self.runner().retry_split(task, goal, model, avoid, why, c, attempt_budget)
 
     # -- loop --------------------------------------------------------------
 
     def scope_violations(self):
-        scope = (self.task or {}).get("allowed_paths")
-        if not scope:
-            return []
-        _, names = git(["diff", "--cached", "--name-only", "--no-renames", "-z", self.review_base],
-                       cwd=self.wt, check=True)
-        return [p for p in names.split("\0") if p and not path_allowed(p, scope)]
+        return self.runner().scope_violations()
 
     def run(self):
         while not self.stop.is_set() and not self.tally.drain.is_set():
