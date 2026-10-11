@@ -22,6 +22,7 @@ sandbox; it contains accidents, not a determined attacker.
 """
 import argparse, datetime as dt, fcntl, hashlib, json, os, plistlib, random, re, shlex, shutil, signal
 import subprocess, sys, threading, time, traceback, uuid
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from dotenv import load_dotenv
@@ -1981,7 +1982,7 @@ def prov_block(c):
     p = c.get("prov") or {}
     if isinstance(p, list):
         p = {"hooks": [h for h in p if isinstance(h, str)]}
-    elif not isinstance(p, dict):
+    elif not isinstance(p, Mapping):
         return {"hooks": [], "env": {}, "timeout": 1200}
     hooks = [h for h in p.get("hooks") or [] if isinstance(h, str) and h.strip()]
     env = {k: str(v) for k, v in (p.get("env") or {}).items() if v is not None}
@@ -2443,7 +2444,31 @@ class Worker(threading.Thread):
 
     # -- helpers -----------------------------------------------------------
 
-    def pick(self, exclude=(), role="implementer"):
+    def _attempt_config(self, c=None):
+        """Return the supplied attempt config, or freeze one for a direct entry."""
+        if c is None:
+            # The live dict is rewritten in-place under this same lock. Freeze it while
+            # holding the lock so a second worker cannot yield a mixed/partial snapshot.
+            with _cfg_lock:
+                return ConfigSnapshot(values=self.c, mtime=config_mtime()).values
+        return c
+
+    def _attempt_inputs(self, c=None, budget=None):
+        """Return immutable config and pacing policy for one attempt entry.
+
+        ``run()`` always supplies both values from the snapshot taken immediately after
+        claim.  The fallback keeps the long-standing direct-call test/API surface useful:
+        callers entering ``do_task`` or an individual helper outside the worker loop get a
+        fresh snapshot, never the mutable live dict itself.  Nothing is stored on the
+        worker, so concurrent attempts cannot replace each other's view.
+        """
+        c = self._attempt_config(c)
+        if budget is None:
+            budget = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
+                            owner_window=c.get("owner_window", ["00:00", "00:00"]))
+        return c, budget
+
+    def pick(self, exclude=(), role="implementer", c=None):
         """Implementers by Thompson sampling. Reviewers and judges come from the
         same posterior, excluding the implementer so nobody grades their own work.
 
@@ -2453,26 +2478,29 @@ class Worker(threading.Thread):
 
         When every free model is resting, a paid stand-in keeps the attempt alive rather
         than abandoning work already done — but only while the day's budget allows."""
-        m = self.ledger.pick("implementer", pool(self.c, role), exclude=exclude)
+        c = self._attempt_config(c)
+        m = self.ledger.pick("implementer", pool(c, role), exclude=exclude)
         if m is not None:
             return m
-        left = spend_left(self.c)
+        left = spend_left(c)
         if left is not None and left <= 0:
             return None
-        return next((p for p in paid_pool(self.c) if p not in set(exclude)), None)
+        return next((p for p in paid_pool(c) if p not in set(exclude)), None)
 
-    def select_implementer(self, failed):
+    def select_implementer(self, failed, c=None):
         """An implementer for this attempt, or None when none is usable.
 
         `failed` is the set of models the task/model circuit breaker already excluded on
         this task. `pick()` is given those exclusions directly (the ledger only sees the
         arms it is allowed), so a proven-bad pairing is never redrawn for the same task.
         """
-        return self.pick(failed, role="implementer")
+        c = self._attempt_config(c)
+        return self.pick(failed, role="implementer", c=c)
 
-    def no_review(self):
+    def no_review(self, c=None):
         """Models the owner has barred from reviewing (config `reviewer_exclude`)."""
-        return set(self.c.get("reviewer_exclude") or ())
+        c = self._attempt_config(c)
+        return set(c.get("reviewer_exclude") or ())
 
     def excluded_models(self, role=None):
         """Models the task/model circuit breaker has excluded from `role` on this task.
@@ -2506,23 +2534,24 @@ class Worker(threading.Thread):
             out.add(f.get("model"))
         return out
 
-    def call(self, role, prompt, cwd, steps, model, avoid=()):
+    def call(self, role, prompt, cwd, steps, model, avoid=(), c=None, attempt_budget=None):
         """One role turn. If the model is busy or down, the turn goes to another model (never
         one in `avoid`, so nobody grades their own work) instead of abandoning the attempt.
         A role that edits files is handed over only while it has changed nothing, so partial
         work is never finished by a different author. self.last_model names the model that
         took the turn last, whether or not it succeeded."""
+        c, attempt_budget = self._attempt_inputs(c, attempt_budget)
         self.last_model = model
         self.last_role = role
-        task_cap = max(0, int(self.c.get("task_request_cap") or 0))
-        run_cap = max(0, int(self.c.get("run_request_cap") or 0))
+        task_cap = max(0, int(c.get("task_request_cap") or 0))
+        run_cap = max(0, int(c.get("run_request_cap") or 0))
         prior_task_requests = int((self.task or {}).get("requests_spent") or 0)
         # Turn size comes from measured latency, not configured hope (work order §2):
         # `effective_steps` caps the round count so a final edit, tests and a final answer
         # still fit inside the wall-clock timeout. Fast-execution tasks keep their small
         # budget on top of the request caps.
         if getattr(self, "execution_class", "standard") != "fast" and role not in READ_ONLY_ROLES:
-            steps = effective_steps(role, model, turn_timeout(self.c, role), steps, self.ledger)
+            steps = effective_steps(role, model, turn_timeout(c, role), steps, self.ledger)
         limits = [int(steps)]
         if task_cap:
             limits.append(task_cap - prior_task_requests - count_requests(self.name))
@@ -2534,24 +2563,24 @@ class Worker(threading.Thread):
                      prior_task_requests + count_requests(self.name) >= task_cap else "run")
             raise RequestBudget(f"{scope} request budget exhausted before {role}")
         if self.evidence:
-            if self.role_calls >= self.c.get("max_role_calls", 10):
+            if self.role_calls >= c.get("max_role_calls", 10):
                 raise ModelError("per-attempt role-call budget exhausted")
             self.role_calls += 1
             self.evidence.record(role, role_calls=self.role_calls, active_model=model)
             self.evidence.write(f"prompt-{self.role_calls:02d}-{role}.txt", prompt)
-        c = dict(self.c, study=False) if getattr(self, "mit", None) == "off" else self.c
+        turn_c = dict(c, study=False) if getattr(self, "mit", None) == "off" else c
         if self.task and self.task.get("allowed_paths"):
-            c = dict(c, _allowed_paths=self.task["allowed_paths"])
+            turn_c = dict(turn_c, _allowed_paths=self.task["allowed_paths"])
         if getattr(self, "execution_class", "standard") == "fast":
-            c = dict(c, study=False)
+            turn_c = dict(turn_c, study=False)
             if role in ("implementer", "repair"):
                 steps = min(steps, 4)
-                c["role_timeouts"] = dict(c.get("role_timeouts", {}), **{role: 300})
+                turn_c["role_timeouts"] = dict(turn_c.get("role_timeouts", {}), **{role: 300})
         # Tell the model its effective request and time budget (work order §2). A turn
         # sized from measured latency is only useful if the model knows the round count it
         # is measured against and the wall clock it must finish inside.
         budget_line = (f"\n\nTURN BUDGET: this role gets at most {steps} model round(s) and "
-                       f"{turn_timeout(c, role)}s of wall time. Leave time for the final edit, "
+                       f"{turn_timeout(turn_c, role)}s of wall time. Leave time for the final edit, "
                        f"the tests and your final answer; stop reading early.")
         prompt = prompt + budget_line
         self.doing = f"{role} with {model}"
@@ -2562,7 +2591,7 @@ class Worker(threading.Thread):
         while True:
             self.doing = f"{role} with {model}"
             try:
-                out = flint(prompt, cwd, c, role, self.name, self.budget, steps, model)
+                out = flint(prompt, cwd, turn_c, role, self.name, attempt_budget, steps, model)
                 # A paid stand-in may have taken the turn. Credit the model that actually
                 # answered, or the bandit learns from work another model did: a model with
                 # no paid twin would be scored for every turn `paid_stand_in` handed away.
@@ -2588,8 +2617,9 @@ class Worker(threading.Thread):
                 tried.add(model)
                 if editing and self.snapshot()[0] != before:
                     raise
-                nxt = self.pick(set(avoid) | tried | (self.no_review() if role == "adversary" else set()),
-                                role=role)
+                nxt = self.pick(set(avoid) | tried |
+                                (self.no_review(c) if role == "adversary" else set()),
+                                role=role, c=c)
                 if nxt is None:
                     raise
                 log(f"handing {role} to {nxt}", self.name)
@@ -2603,16 +2633,17 @@ class Worker(threading.Thread):
             self.evidence.write(f"response-{self.role_calls:02d}-{role}.txt", out)
         return out
 
-    def ensure_worktree(self, task):
+    def ensure_worktree(self, task, c=None):
         # Every attempt gets its own branch from trunk: never reset a user's
         # checkout or discard a previous attempt's changes.
-        ensure_trunk(self.c)
+        c = self._attempt_config(c)
+        ensure_trunk(c)
         name = f"{task['id']}-{uuid.uuid4().hex[:8]}"
         self.branch = f"swarm/{name}"
         self.wt = wt_root() / name
         self.wt.parent.mkdir(parents=True, exist_ok=True)
-        git(["worktree", "add", "-b", self.branch, str(self.wt), trunk_name(self.c)],
-            cwd=self.c["repo"], check=True)
+        git(["worktree", "add", "-b", self.branch, str(self.wt), trunk_name(c)],
+            cwd=c["repo"], check=True)
 
     def adopt_retained(self, task, wd):
         """Re-apply work an interrupted attempt left behind, or None.
@@ -2647,7 +2678,8 @@ class Worker(threading.Thread):
 
     # -- one task ----------------------------------------------------------
 
-    def do_task(self, task, goal):
+    def do_task(self, task, goal, c=None, attempt_budget=None):
+        c, attempt_budget = self._attempt_inputs(c, attempt_budget)
         self.task, self.stage, self.wt = task, "error", None
         self.doing, self.started = "starting", time.time()
         self.evidence, self.role_calls, self.gate_count = None, 0, 0
@@ -2664,7 +2696,7 @@ class Worker(threading.Thread):
         forget_worker(self.name)
         note, info = "attempt interrupted before completion", {}
         try:
-            self.stage, note, info = self._attempt(task, goal, info)
+            self.stage, note, info = self._attempt(task, goal, info, c, attempt_budget)
         except AgentTimeout as exc:
             self.stage, note = "agent_timeout", str(exc)
         except ExplorationExhausted as exc:
@@ -2687,7 +2719,7 @@ class Worker(threading.Thread):
             if self.evidence:
                 self.evidence.finish(self.stage, note)
             try:
-                self._cleanup()
+                self._cleanup(c)
             except Exception as exc:
                 # Preserve the outcome and artifact if shutdown/Git prevents cleanup.
                 log(f"cleanup deferred for {self.branch}: {exc}", self.name)
@@ -2696,7 +2728,7 @@ class Worker(threading.Thread):
                               failure_class(self.stage, note, edited=info.get("edit_calls")))
         if info.get("implementer"):
             try:
-                self._reinforce(task, self.stage, info)
+                self._reinforce(task, self.stage, info, c, attempt_budget)
             except Exception as exc:
                 journal("learning_error", id=task["id"], err=str(exc), stage=self.stage)
                 log(f"learning update failed; task outcome retained: {exc}", self.name)
@@ -2715,26 +2747,27 @@ class Worker(threading.Thread):
                     persona=task.get("persona"), origin=task.get("origin", "human"))
         return self.stage == "accepted", note
 
-    def gate(self, label):
+    def gate(self, label, c=None):
         """Run configured commands and retain supervisor-owned evidence."""
+        c = self._attempt_config(c)
         self.gate_count += 1
         self.doing = f"running the tests ({label})"
         self.publish(TESTING)
-        commands = [self.c["test_cmd"], *self.c.get("validation_commands", [])]
+        commands = [c["test_cmd"], *c.get("validation_commands", [])]
         if label != "baseline":
             commands += (self.task or {}).get("verification_commands", [])
         commands = list(dict.fromkeys(commands))
         evidence, passed = [], True
         for i, command in enumerate(commands):
             name = f"gate-{self.gate_count:02d}-{label}-{i}.log"
-            config = dict(self.c, test_cmd=command, _gate_log=str(self.evidence.path / name))
+            config = dict(c, test_cmd=command, _gate_log=str(self.evidence.path / name))
             started = time.monotonic()
             try:
                 if i == 0 and not self.worktree_provisioned:
                     # Every attempt begins in a bare worktree. Provision it once, before the
                     # baseline, then retain those dependencies through candidate/repair gates.
                     prov_ok, prov_output = run_prov_hooks(
-                        self.c, self.wt, "attempt", log_on_ok=True)
+                        c, self.wt, "attempt", log_on_ok=True)
                     if not prov_ok:
                         ok, output = False, f"provisioning failed:\n{prov_output}"
                     else:
@@ -2762,17 +2795,20 @@ class Worker(threading.Thread):
         _, diff = git(["diff", "--cached", "--unified=3", self.review_base], cwd=self.wt, check=True)
         return tree, diff
 
-    def review(self, tree, diff, tests, model, avoid=(), allow_test_changes=False):
+    def review(self, tree, diff, tests, model, avoid=(), allow_test_changes=False,
+               c=None, attempt_budget=None):
+        c, attempt_budget = self._attempt_inputs(c, attempt_budget)
         self.evidence.record("reviewing", reviewed_tree=tree, reviewer=model)
         self.publish(REVIEWING)
         note = ("\nThe owner authorised test changes for this task; check that the changes to "
                 "existing tests match what was asked, and reject them if they do not.\n"
                 if allow_test_changes else "")
         prompt = REVIEW.format(contract=json.dumps(self.contract, indent=2), tree=tree,
-                               tests=tests, diff=diff[:self.c.get("max_diff", 24000)]) + note
+                               tests=tests, diff=diff[:c.get("max_diff", 24000)]) + note
         prompt += getattr(self, "_review_format_hint", "")
         try:
-            raw = self.call("adversary", prompt, self.wt, self.c["steps"]["adversary"], model, avoid)
+            raw = self.call("adversary", prompt, self.wt, c["steps"]["adversary"], model,
+                            avoid, c=c, attempt_budget=attempt_budget)
             after, _ = self.snapshot()
             if after != tree:
                 raise ModelError("reviewer modified the candidate it was asked to inspect")
@@ -2786,7 +2822,7 @@ class Worker(threading.Thread):
             raise ModelError("reviewer modified the candidate it was asked to inspect")
         return review
 
-    def reviewed(self, tree, diff, tests, adv, impl, allowed):
+    def reviewed(self, tree, diff, tests, adv, impl, allowed, c=None, attempt_budget=None):
         """(review, reviewer, error) for this candidate, retrying a reviewer that cannot
         produce a readable verdict.
 
@@ -2797,13 +2833,15 @@ class Worker(threading.Thread):
         same test output go to another reviewer, and only a run of reviewers that all fail
         ends the attempt. It costs the repair budget nothing — no repair is warranted while
         nothing has yet been said about the code."""
-        tries = max(1, min(3, 1 + int(self.c.get("max_review_formats", 2))))
+        c, attempt_budget = self._attempt_inputs(c, attempt_budget)
+        tries = max(1, min(3, 1 + int(c.get("max_review_formats", 2))))
         tried, err = set(), None
         self._review_format_hint = ""
         for n in range(tries):
             try:
                 review = self.review(tree, diff, tests, adv, avoid={impl} | tried,
-                                     allow_test_changes=allowed)
+                                     allow_test_changes=allowed, c=c,
+                                     attempt_budget=attempt_budget)
                 return review, (self.last_model or adv), None
             except (ModelError, StepLimit) as exc:
                 ran, err = self.last_model or adv, exc
@@ -2814,11 +2852,11 @@ class Worker(threading.Thread):
                 tried.add(ran)
                 self.evidence.record("review_unreadable", reviewer=ran, tried=n + 1,
                                      reason=str(exc)[:300])
-                nxt = self.pick(tried | {impl} | self.no_review(), role="adversary")
+                nxt = self.pick(tried | {impl} | self.no_review(c), role="adversary", c=c)
                 if n == tries - 1:
                     return None, ran, exc
                 if nxt is None:
-                    if not isinstance(exc, ReviewFormatError) or ran == impl or ran in self.no_review():
+                    if not isinstance(exc, ReviewFormatError) or ran == impl or ran in self.no_review(c):
                         return None, ran, exc
                     nxt = ran  # Same independent reviewer may correct its own JSON, bounded above.
                     tried.discard(ran)
@@ -2830,8 +2868,9 @@ class Worker(threading.Thread):
                 adv = nxt
         return None, adv, err
 
-    def _attempt(self, task, goal, info):
-        c, w = self.c, self.name
+    def _attempt(self, task, goal, info, c=None, attempt_budget=None):
+        c, attempt_budget = self._attempt_inputs(c, attempt_budget)
+        w = self.name
         if task.get("kind") == "harness":
             return "refused", "target a separate harness checkout; live harness editing is disabled", info
         try:
@@ -2846,7 +2885,7 @@ class Worker(threading.Thread):
                     origin=task.get("origin"), gap=gap)
             return "out_of_scope", gap, info
         log(f"claim {task['id']} — {task['title']}", w)
-        self.ensure_worktree(task)
+        self.ensure_worktree(task, c)
         wd = self.wt
         # Named for the task, not the worker. `attempts/w0` was overwritten by every task that
         # worker took, so a parked task's evidence was gone by the time anyone looked for it —
@@ -2873,7 +2912,7 @@ class Worker(threading.Thread):
             self.evidence.record("baseline_cached", base_commit=self.review_base,
                                  at=cached["at"], key=key)
         else:
-            ok, output = self.gate("baseline")
+            ok, output = self.gate("baseline", c)
             baseline_cache(key, passed=ok)
         _, dirty = git(["status", "--porcelain"], cwd=wd, check=True)
         if not ok or dirty:
@@ -2892,7 +2931,7 @@ class Worker(threading.Thread):
         # Lessons shown to this implementer share the attempt's reward (see Ledger.credit).
         info["lessons"] = [l["id"] for l in lessons + pitfalls if l.get("kind") in ("lesson", "pitfall")]
         failed = self.excluded_models(role="implementer")
-        impl = self.select_implementer(failed)
+        impl = self.select_implementer(failed, c)
         if impl is None and failed:
             # Every candidate implementer has failed this task/role within the exclusion
             # window. Do not cycle back to an excluded model (work order §5): park with
@@ -2911,8 +2950,8 @@ class Worker(threading.Thread):
             spec += "\nARCHITECT NOTES (the contract still controls scope):\n" + self.call(
                 "architect", ARCHITECT.format(goal=goal, title=task["title"], detail=task["detail"],
                  corpus=corpus, test_cmd=c["test_cmd"]), wd, c["steps"]["architect"],
-                 self.pick({impl}, role="architect") or impl,
-                avoid={impl})
+                 self.pick({impl}, role="architect", c=c) or impl,
+                avoid={impl}, c=c, attempt_budget=attempt_budget)
         # What earlier attempts hit, as lines to act on. Parent handoffs stay artifacts on disk,
         # not mutable model memory, so only their outcome is repeated here.
         lines = attempt_lines(task)
@@ -2932,7 +2971,8 @@ class Worker(threading.Thread):
                     goal=goal, spec=spec, previous=previous, corpus=corpus, test_cmd=c["test_cmd"],
                     context=context, title=task["title"][:200],
                     playbook=format_playbook(lessons, pitfalls, named_paths(task, kin))),
-                    wd, c["steps"]["implementer"], impl)
+                    wd, c["steps"]["implementer"], impl, c=c,
+                    attempt_budget=attempt_budget)
                 self.evidence.write("implementation.txt", handoff)
             except AgentTimeout:
                 self.evidence.record("timeout_recovery", note="verify partial implementation through normal gates")
@@ -2943,7 +2983,7 @@ class Worker(threading.Thread):
                 return "model_error", str(exc), info
             # After a handoff the model that actually wrote the code is its author.
             impl = info["implementer"] = self.last_model or impl
-        adv = self.pick({impl} | self.no_review(), role="adversary") or impl
+        adv = self.pick({impl} | self.no_review(c), role="adversary", c=c) or impl
         info["reviewer"] = adv
         info["same_model_review"] = adv == impl
         seen = set()
@@ -2969,13 +3009,14 @@ class Worker(threading.Thread):
                 return ("weakened_tests",
                         f"{lost} existing assertion(s) removed with nothing in their place; "
                         "manual review required", info)
-            ok, tests = self.gate(f"candidate-{cycle}")
+            ok, tests = self.gate(f"candidate-{cycle}", c)
             after, _ = self.snapshot()
             if after != tree:
                 return "rejected", "test command modified the candidate; fix test isolation/ignored files", info
             review = None
             if ok:
-                review, adv, exc = self.reviewed(tree, diff, tests, adv, impl, allowed)
+                review, adv, exc = self.reviewed(tree, diff, tests, adv, impl, allowed,
+                                                 c, attempt_budget)
                 info["reviewer"] = adv          # the model that answered, or failed to
                 if exc is not None:
                     return ("review_format_error" if isinstance(exc, ReviewFormatError) else "review_error"), str(exc), info
@@ -2996,7 +3037,8 @@ class Worker(threading.Thread):
             try:
                 handoff = self.call("repair", REPAIR.format(contract=json.dumps(self.contract, indent=2),
                                     failure=failure, test_cmd=c["test_cmd"], context=context), wd,
-                                    c["steps"].get("repair", c["steps"]["implementer"]), impl, avoid={adv})
+                                    c["steps"].get("repair", c["steps"]["implementer"]), impl,
+                                    avoid={adv}, c=c, attempt_budget=attempt_budget)
                 self.evidence.write(f"repair-{cycle + 1}.txt", handoff)
             except AgentTimeout:
                 # Work order §6: a repair that times out may have made things worse. Keep the
@@ -3027,7 +3069,7 @@ class Worker(threading.Thread):
              f"swarm: {task['title']}\n\nSwarm-Task: {task['id']}\n"
              f"Swarm-Implementer: {impl}\nSwarm-Reviewer: {adv}\nSwarm-Strategy: {strategy}"], cwd=wd, check=True)
         self._review_model, self._author = adv, impl
-        landed, why = self.integrate()
+        landed, why = self.integrate(c, attempt_budget)
         if not landed:
             return "conflict", why, info
         _, info["commit"] = git(["rev-parse", "HEAD"], cwd=wd, check=True)
@@ -3043,19 +3085,21 @@ class Worker(threading.Thread):
         # secretly spending flint's minimum one request.
         info["judge"], info["scores"] = None, None
         if int(c["steps"].get("judge", 0)) > 0:
-            info["judge"] = self.pick({impl, adv}, role="judge") or adv
+            info["judge"] = self.pick({impl, adv}, role="judge", c=c) or adv
             _, landed_diff = git(["diff", "--unified=3", self.review_base, "HEAD"], cwd=wd)
             info["scores"] = self.judge(task, goal, landed_diff,
                                         "APPROVE: " + str((info.get("review") or {}).get("summary", "")),
-                                        info["judge"], avoid={impl, adv})
+                                        info["judge"], avoid={impl, adv}, c=c,
+                                        attempt_budget=attempt_budget)
             info["judge"] = self.last_model or info["judge"]
             if info["scores"]:
                 self.evidence.write("judge.json", info["scores"])
         return "accepted", f"integrated {info['commit']} on {trunk_name(c)}; handoff: {self.evidence.path / 'HANDOFF.md'}", info
 
-    def integrate(self):
+    def integrate(self, c=None, attempt_budget=None):
         """Review/test a rebased candidate before compare-and-swap of swarm trunk."""
-        c, t = self.c, trunk_name(self.c)
+        c, attempt_budget = self._attempt_inputs(c, attempt_budget)
+        t = trunk_name(c)
         for _ in range(2):
             _, old = git(["rev-parse", t], cwd=c["repo"], check=True)
             rc, _ = git(["merge-base", "--is-ancestor", old, "HEAD"], cwd=self.wt)
@@ -3068,13 +3112,14 @@ class Worker(threading.Thread):
                 tree, diff = self.snapshot()
                 if self.scope_violations():
                     return False, "rebased candidate changed paths outside allowed_paths"
-                ok, output = self.gate("rebased")
+                ok, output = self.gate("rebased", c)
                 after, _ = self.snapshot()
                 if not ok or after != tree or weakened_tests(
                         diff, allow_test_changes=bool(self.task.get("allow_test_changes"))):
                     return False, "rebased candidate failed verification or changed during tests"
-                review, _, error = self.reviewed(tree, diff, output, self._review_model,
-                                                self._author, bool(self.task.get("allow_test_changes")))
+                review, _, error = self.reviewed(
+                    tree, diff, output, self._review_model, self._author,
+                    bool(self.task.get("allow_test_changes")), c, attempt_budget)
                 if error:
                     raise error
                 if review["verdict"] != "approve":
@@ -3094,7 +3139,9 @@ class Worker(threading.Thread):
                     return True, ""
         return False, "trunk kept moving; retained candidate for a later attempt"
 
-    def judge(self, task, goal, diff, verdict, model, avoid=()):
+    def judge(self, task, goal, diff, verdict, model, avoid=(), c=None,
+              attempt_budget=None):
+        c, attempt_budget = self._attempt_inputs(c, attempt_budget)
         items = goal_items(goal)
         priorities = PRIORITIES.format(
             items="\n".join(f"{i}. {t}" for i, t in enumerate(items, 1))) if items else ""
@@ -3102,8 +3149,9 @@ class Worker(threading.Thread):
             out = self.call("judge", JUDGE.format(
                 goal=goal, priorities=priorities, title=task["title"],
                 detail=task["detail"], verdict=verdict,
-                diff=diff[:self.c.get("max_diff", 24000)]),
-                self.wt, self.c["steps"].get("judge", 4), model, avoid)
+                diff=diff[:c.get("max_diff", 24000)]),
+                self.wt, c["steps"].get("judge", 4), model, avoid, c=c,
+                attempt_budget=attempt_budget)
         except Exception as e:  # the change already landed; never lose it to a judge failure
             log(f"judge unavailable ({type(e).__name__}); accepted work remains unscored", self.name)
             return None
@@ -3112,7 +3160,8 @@ class Worker(threading.Thread):
             log(f"judge {model} returned no usable JSON; accepted work remains unscored", self.name)
         return scores
 
-    def _reinforce(self, task, stage, info):
+    def _reinforce(self, task, stage, info, c=None, attempt_budget=None):
+        c, attempt_budget = self._attempt_inputs(c, attempt_budget)
         L, impl = self.ledger, info["implementer"]
         if stage != "accepted" and failure_class(stage, info.get("note", ""),
                                                  edited=info.get("edit_calls")) in ("harness", "review_format"):
@@ -3129,7 +3178,7 @@ class Worker(threading.Thread):
             # A reviewer that cannot deliver a verdict wastes the implementer's work.
             L.update("implementer", info["reviewer"], 0.0, weight=PENALTY_WEIGHT["model_error"])
             log(f"reviewer {info['reviewer']} failed to deliver a verdict; penalised", self.name)
-        items = goal_items(read_goal(self.c))
+        items = goal_items(read_goal(c))
         info["goal_item"] = int((scores or {}).get("goal_item") or 0) if items else None
         r = reward(stage, scores, nov, repairs=info.get("repairs", 0),
                    goal_weight=goal_item_weight(info["goal_item"], items))
@@ -3162,10 +3211,10 @@ class Worker(threading.Thread):
                 L.update("implementer", impl, 1.0, weight=BREAKTHROUGH_WEIGHT)
                 if task.get("persona"):
                     L.update("persona", task["persona"], 1.0, weight=BREAKTHROUGH_WEIGHT)
-                self.celebrate(task, r, scores, impl)
-            self.follow_up(task, scores, r, breakthrough)
+                self.celebrate(task, r, scores, impl, c)
+            self.follow_up(task, scores, r, breakthrough, c)
         elif stage in FAULTY:
-            self.hang(task, stage, info, impl)
+            self.hang(task, stage, info, impl, c)
         elif info.get("pitfall"):
             L.add_lesson(info["pitfall"], "pitfall", task["id"], 0.5)
         info["reward"] = r
@@ -3176,13 +3225,14 @@ class Worker(threading.Thread):
                 breakthrough=breakthrough)
         log(f"{task['id']}: {stage}, reward {r:.2f}{' ★ BREAKTHROUGH' if breakthrough else ''}", self.name)
 
-    def follow_up(self, task, scores, r, breakthrough):
+    def follow_up(self, task, scores, r, breakthrough, c=None):
         """Recursion on success: strong work spawns the next step it made possible."""
-        if self.c.get("roadmap_file"):
+        c = self._attempt_config(c)
+        if c.get("roadmap_file"):
             return  # Future packets are dispatched only by their recorded roadmap gates.
         if not scores or not (breakthrough or r >= 0.75):
             return
-        if len(self.q.pending()) >= self.c.get("max_queue", 20):
+        if len(self.q.pending()) >= c.get("max_queue", 20):
             return
         for f in scores.get("follow_ups", [])[:2 if breakthrough else 1]:
             t = self.q.add(f["title"], f["detail"], "feature", persona=task.get("persona"),
@@ -3192,7 +3242,8 @@ class Worker(threading.Thread):
             if t:
                 log(f"follow-up queued: {t['title']}", self.name)
 
-    def celebrate(self, task, r, scores, impl):
+    def celebrate(self, task, r, scores, impl, c=None):
+        c = self._attempt_config(c)
         s = scores or {}
         entry = (f"\n## {dt.datetime.now():%Y-%m-%d %H:%M} — {task['title']}\n\n"
                  f"reward {r:.2f} · impact {s.get('impact', '?')} · creativity {s.get('creativity', '?')}"
@@ -3202,13 +3253,14 @@ class Worker(threading.Thread):
         with open(STATE / "BREAKTHROUGHS.md", "a") as f:
             f.write(entry)
         log(f"★ BREAKTHROUGH: {task['title']} ({impl})", self.name)
-        notify(self.c, "breakthrough", task["title"])
+        notify(c, "breakthrough", task["title"])
 
-    def hang(self, task, stage, info, impl):
+    def hang(self, task, stage, info, impl, c=None):
         """Faulty code goes up on the rafters, under its author's name: shown to every
         later implementer and planner, written to RAFTERS.md, and announced."""
-        base = getattr(self, "review_base", None) or trunk_name(self.c)
-        _, diff = git(["diff", "--unified=0", base, self.branch, "--"], cwd=self.c["repo"])
+        c = self._attempt_config(c)
+        base = getattr(self, "review_base", None) or trunk_name(c)
+        _, diff = git(["diff", "--unified=0", base, self.branch, "--"], cwd=c["repo"])
         what = defect(stage, info.get("artifact"), info.get("pitfall", ""))
         code = exhibit(diff, stage)
         self.ledger.hang(impl, task, stage, what, code, info.get("artifact", ""))
@@ -3218,20 +3270,21 @@ class Worker(threading.Thread):
                     + (f"  \nEvidence: {info['artifact']}" if info.get("artifact") else "")
                     + (f"\n\n```diff\n{code}\n```\n" if code else "\n"))
         log(f"HUNG FROM THE RAFTERS: {impl} {CRIME[stage]} — {what[:140]}", self.name)
-        notify(self.c, "hung from the rafters", f"{impl}: {what[:120]}")
+        notify(c, "hung from the rafters", f"{impl}: {what[:120]}")
 
-    def _cleanup(self):
+    def _cleanup(self, c=None):
         """Keep every attempt's work on its branch; remove the worktree if configured."""
+        c = self._attempt_config(c)
         if not self.wt or not Path(self.wt).exists():
             return
-        repo, t = self.c["repo"], trunk_name(self.c)
+        repo, t = c["repo"], trunk_name(c)
         if self.stage != "accepted" and self.own_branch():
             git(["add", "-A"], cwd=self.wt)
             rc, _ = git(["diff", "--cached", "--quiet"], cwd=self.wt)
             if rc == 1:
                 git(["commit", "-q", "--no-verify", "-m",
                      f"swarm (not accepted: {self.stage}): {self.task['title']}"], cwd=self.wt)
-        if self.c.get("keep_worktrees", True):
+        if c.get("keep_worktrees", True):
             return
         git(["worktree", "remove", "--force", str(self.wt)], cwd=repo)
         _, ahead = git(["rev-list", "--count", f"{t}..{self.branch}"], cwd=repo)
@@ -3247,19 +3300,19 @@ class Worker(threading.Thread):
             journal("stranded", id=task["id"], title=task["title"], how=how, parked=titles)
         return titles
 
-    def decompose(self, task, goal, avoid=()):
+    def decompose(self, task, goal, avoid=(), c=None, attempt_budget=None):
         """Split after a timeout or repeated failure, within the recursion limits.
 
         A split that returns no subtasks strands the task and everything waiting on it, so one
         empty answer is retried on a different model before the task is given up on."""
-        c = self.c
+        c, attempt_budget = self._attempt_inputs(c, attempt_budget)
         if c.get("roadmap_file"):
             return 0  # A coordinator must repoint dependencies before splitting a packet.
         # Between attempts: not the last attempt's evidence, role-call budget or MIT arm.
         self.evidence, self.mit = None, None
         self.execution_class = "standard"
         model = (self.ledger.pick("planner", pool(c, "decomposer"), exclude=set(avoid))
-                 or self.pick(set(avoid), role="decomposer"))
+                 or self.pick(set(avoid), role="decomposer", c=c))
         if model is None:
             return 0
         with _view_lock:
@@ -3269,11 +3322,13 @@ class Worker(threading.Thread):
                     goal=goal, title=task["title"], detail=task["detail"], test_cmd=c["test_cmd"],
                     notes="\n---\n".join(task.get("notes", [])) or task.get("note", "")
                     or task.get("harness_note", "")),
-                    view, c["steps"].get("decomposer", 6), model)
+                    view, c["steps"].get("decomposer", 6), model, c=c,
+                    attempt_budget=attempt_budget)
             except (StepLimit, ModelError, AgentTimeout) as e:
                 self.ledger.update("planner", model, 0.0)
                 log(f"decomposer {model} failed ({type(e).__name__}) on '{task['title']}'", self.name)
-                return self.retry_split(task, goal, model, avoid, f"{type(e).__name__}")
+                return self.retry_split(task, goal, model, avoid, f"{type(e).__name__}",
+                                        c, attempt_budget)
         subtasks = json_array(out)
         if subtasks is None:
             self.ledger.update("planner", model, 0.0)
@@ -3294,14 +3349,15 @@ class Worker(threading.Thread):
             added += 1
             dependencies = [child["id"]]
         if not added:
-            return self.retry_split(task, goal, model, avoid, "no usable subtasks")
+            return self.retry_split(task, goal, model, avoid, "no usable subtasks",
+                                    c, attempt_budget)
         moved = self.q.repoint(task["id"], dependencies[0])
         log(f"split '{task['title']}' into {added} smaller task(s)"
             + (f"; {moved} waiting task(s) moved to the last child" if moved else ""), self.name)
         journal("split", id=task["id"], title=task["title"], added=added, model=model, repointed=moved)
         return added
 
-    def retry_split(self, task, goal, model, avoid, why):
+    def retry_split(self, task, goal, model, avoid, why, c=None, attempt_budget=None):
         """One more decomposition on a different model. Returns 0 once that has been tried."""
         if avoid:
             log(f"'{task['title']}' was not split: {why} from {model} as well", self.name)
@@ -3310,7 +3366,8 @@ class Worker(threading.Thread):
             return 0
         log(f"decomposer {model}: {why}; trying another model before giving up on "
             f"'{task['title']}'", self.name)
-        return self.decompose(task, goal, avoid={*avoid, model})
+        return self.decompose(task, goal, avoid={*avoid, model}, c=c,
+                              attempt_budget=attempt_budget)
 
     # -- loop --------------------------------------------------------------
 
@@ -3335,6 +3392,16 @@ class Worker(threading.Thread):
                 self.clock.enter(IDLE)
                 self.stop.wait(20)
                 continue
+            # One claim, one immutable view. A different worker may reload the live dict and
+            # retune the daemon budget while this task is running; neither change reaches this
+            # attempt. Budget still reads the shared on-disk request counters, so accounting is
+            # not forked — only the pacing policy is frozen.
+            with _cfg_lock:
+                snapshot = ConfigSnapshot(values=self.c, mtime=config_mtime())
+            c = snapshot.values
+            attempt_budget = Budget(
+                cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
+                owner_window=c.get("owner_window", ["00:00", "00:00"]))
             # A4 handoff 2026-10-02: an attempt without a persona skips the role
             # shaping that makes prompts accurate, and ~half the audit's effort ran
             # that way. Planner tasks always carry one; human-origin tasks default
@@ -3344,8 +3411,8 @@ class Worker(threading.Thread):
                 journal("persona_default", id=task["id"],
                         from_origin=task.get("origin", "human"))
             try:
-                goal = read_goal(self.c)
-                ok, note = self.do_task(task, goal)
+                goal = read_goal(c)
+                ok, note = self.do_task(task, goal, c, attempt_budget)
                 # A timeout only forces a split when there was work to be too big for. With no
                 # diff there is nothing to divide, and the timeout is ours, not the task's.
                 final = self.q.release(task["id"], ok, note, failure_class=self.failure_class,
@@ -3363,7 +3430,7 @@ class Worker(threading.Thread):
                         exploration_failures=final.get("exploration_failures") if final else None,
                         worker=self.name, requests=getattr(self, "attempt_requests", 0), note=note[:300])
                 if final and final.get("status") == "split":
-                    if not self.decompose(final, goal):
+                    if not self.decompose(final, goal, c=c, attempt_budget=attempt_budget):
                         self.strand(final, "was split into no subtasks")
                 elif final and final.get("status") == "parked":
                     self.strand(final, "was parked after repeated failures")
@@ -3375,17 +3442,17 @@ class Worker(threading.Thread):
                 # 22 of these in one day, ten minutes each, while the local count read
                 # 1025/1000 and OpenRouter reported fewer requests used. Ask before sleeping,
                 # and sleep no longer than the interval at which the next ask is due.
-                if recheck_allowance(self.c, self.budget):
+                if recheck_allowance(c, attempt_budget):
                     continue
-                self.stop.wait(min(600, allowance_recheck(self.c) or 600))
+                self.stop.wait(min(600, allowance_recheck(c) or 600))
             except ProviderDown as e:
                 self.q.release(task["id"], False, f"provider unavailable: {str(e)[:200]}", defer=30,
                                failure_class="harness")
-                if self.pick() is None:
+                if self.pick(c=c) is None:
                     # No model can take a turn. Sleep until the first one is back, not blindly.
-                    _, until = next_wake(self.ledger, self.c)
+                    _, until = next_wake(self.ledger, c)
                     wait = max(30, min(300, until - time.time()))
-                    log(f"{all_resting(self.ledger, self.c)}; task deferred, next try in {wait:.0f}s", self.name)
+                    log(f"{all_resting(self.ledger, c)}; task deferred, next try in {wait:.0f}s", self.name)
                 else:
                     wait = 30
                     log(f"no other model could take over from {e.model}; task deferred, next try in 30s", self.name)
@@ -3408,7 +3475,8 @@ class Worker(threading.Thread):
                 final = self.q.release(task["id"], False, str(e)[:400], failure_class="harness")
                 if final and final.get("status") == "split":
                     try:
-                        self.decompose(final, read_goal(self.c))
+                        self.decompose(final, read_goal(c), c=c,
+                                       attempt_budget=attempt_budget)
                     except Exception as exc:
                         log(f"could not split '{final['title']}': {exc}", self.name)
                 self.stop.wait(30)

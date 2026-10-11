@@ -349,7 +349,7 @@ class EmptySplitTests(unittest.TestCase):
         w = self.worker()
         used = []
 
-        def call(role, prompt, wd, steps, model, avoid=()):
+        def call(role, prompt, wd, steps, model, avoid=(), c=None, attempt_budget=None):
             used.append(model)
             return "[]" if len(used) == 1 else json.dumps(
                 [{"title": "Rune Garden M1a", "detail": "half of it", "kind": "feature"}])
@@ -363,7 +363,7 @@ class EmptySplitTests(unittest.TestCase):
         w = self.worker()
         used = []
 
-        def call(role, prompt, wd, steps, model, avoid=()):
+        def call(role, prompt, wd, steps, model, avoid=(), c=None, attempt_budget=None):
             used.append(model)
             return "[]"
         with patch.object(w, "call", side_effect=call), patch.object(swarmd, "refresh_view",
@@ -380,7 +380,7 @@ class EmptySplitTests(unittest.TestCase):
         w = self.worker()
         used = []
 
-        def call(role, prompt, wd, steps, model, avoid=()):
+        def call(role, prompt, wd, steps, model, avoid=(), c=None, attempt_budget=None):
             used.append(model)
             if len(used) == 1:
                 raise swarmd.ModelError("no answer")
@@ -394,7 +394,7 @@ class EmptySplitTests(unittest.TestCase):
         w = self.worker(models=["a:free"])
         used = []
 
-        def call(role, prompt, wd, steps, model, avoid=()):
+        def call(role, prompt, wd, steps, model, avoid=(), c=None, attempt_budget=None):
             used.append(model)
             return "[]"
         with patch.object(w, "call", side_effect=call), patch.object(swarmd, "refresh_view",

@@ -330,7 +330,7 @@ class DrainTests(unittest.TestCase):
         w = swarmd.Worker(0, c, q, Mock(), threading.Event(), tally=tally)
         done = []
 
-        def do_task(task, goal):
+        def do_task(task, goal, c=None, attempt_budget=None):
             done.append(task["id"])
             swarmd.drain(tally)         # the signal arrives mid-task
             return True, "landed"

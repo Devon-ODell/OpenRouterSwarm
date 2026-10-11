@@ -290,7 +290,12 @@ class ProvisioningTests(unittest.TestCase):
             self.assertTrue(worker.gate("baseline")[0])
             self.assertTrue(worker.gate("candidate-0")[0])
             self.assertTrue(worker.gate("candidate-1")[0])
-        prov.assert_called_once_with(c, self.repo, "attempt", log_on_ok=True)
+        prov.assert_called_once()
+        snap, repo, phase = prov.call_args.args
+        self.assertEqual(dict(snap), {**c, "models": tuple(c["models"]),
+                                      "validation_commands": tuple(c["validation_commands"])})
+        self.assertEqual((repo, phase), (self.repo, "attempt"))
+        self.assertEqual(prov.call_args.kwargs, {"log_on_ok": True})
         self.assertEqual(gate.call_count, 3)
 
     def test_sync_trunk_uses_provisioned_gate(self):
