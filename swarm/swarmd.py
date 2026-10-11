@@ -43,7 +43,7 @@ import sandbox                          # noqa: E402
 import swallow                          # noqa: E402
 from workflow import validate_scope, path_allowed
 from runtime_context import (RepoPaths, ConfigSnapshot, RunState, EventSink,  # noqa: E402
-                             ProcessRegistry, RuntimeContext)
+                             ProcessRegistry, RuntimeContext, TurnBook)
 try:  # one class identity for package imports; script mode keeps the historical top-level path
     from .task_queue import (JsonlTaskStore, TaskPolicy, TaskQueue, TaskTransition)  # noqa: E402
 except ImportError:  # pragma: no cover - exercised by bridge.py / direct swarmd.py execution
@@ -182,16 +182,17 @@ _processes = set()
 _stop = threading.Event()
 _sync_failed = {}
 _study_lock = threading.Lock()
-_study_calls = {}
-_edit_calls = {}      # worker -> edit_file/write_file calls its turns made this attempt
-_request_calls = {}   # worker -> actual request starts observed in its turn logs
-_charges = {}         # worker -> dollars its turns were charged this attempt
+_turns = TurnBook(lock=_study_lock)   # per-worker turn accounting; the RuntimeContext carries this same book
+_study_calls = _turns.study_calls
+_edit_calls = _turns.edit_calls
+_request_calls = _turns.request_calls
+_charges = _turns.charges
 _held = {}            # worker -> when it last said it was waiting for the allowance
 _waiting = {}         # worker -> why it is not working, or absent while it is
 _worker_clocks = {}   # worker -> its BucketClock for wall-time buckets (§13)
-_ran_on = {}          # worker -> the model its last turn actually ran on, once a stand-in took it
-_active_turns = {}   # worker -> live role and actual routed model
-_turn_logs = {}      # worker -> the log the live turn is writing, for its round counter
+_ran_on = _turns.ran_on
+_active_turns = _turns.active_turns
+_turn_logs = _turns.turn_logs
 _run = {}
 _run_lock = threading.RLock()
 _progress_seen = {}
@@ -448,7 +449,8 @@ def _build_context(c, slug, state, logs):
         events=EventSink(paths, run_state),
         run_state=run_state,
         processes=ProcessRegistry(stop=stop),
-        stop=stop)
+        stop=stop,
+        turns=_turns)
 
 
 def wt_root():
@@ -1192,20 +1194,12 @@ def live_workers(workers):
 
 def count_study(worker, n=0, reset=False):
     """Study-tool calls made by one worker's turns since its attempt began."""
-    with _study_lock:
-        if reset:
-            return _study_calls.pop(worker, 0)
-        _study_calls[worker] = _study_calls.get(worker, 0) + n
-        return _study_calls[worker]
+    return agent_turn.count_study(_turns, worker, n, reset)
 
 
 def count_usd(worker, usd=0.0, reset=False):
     """What one worker's turns have been charged since its attempt began."""
-    with _study_lock:
-        if reset:
-            return round(_charges.pop(worker, 0.0), 6)
-        _charges[worker] = round(_charges.get(worker, 0.0) + usd, 6)
-        return _charges[worker]
+    return agent_turn.count_usd(_turns, worker, usd, reset)
 
 
 def count_edits(worker, n=0, reset=False):
@@ -1214,24 +1208,12 @@ def count_edits(worker, n=0, reset=False):
     An attempt that ends with no diff means two different things. A model that called edit_file
     and still changed nothing got it wrong; a model that never reached an edit ran out of the
     rounds this harness gave it. Only the first is the model's failure."""
-    with _study_lock:
-        if reset:
-            return _edit_calls.pop(worker, 0)
-        _edit_calls[worker] = _edit_calls.get(worker, 0) + n
-        return _edit_calls[worker]
+    return agent_turn.count_edits(_turns, worker, n, reset)
 
 
 def count_requests(worker, n=0, reset=False):
     """API request starts attributable to this worker's current task."""
-    with _study_lock:
-        if reset:
-            return _request_calls.pop(worker, 0)
-        n = max(0, int(n or 0))
-        _request_calls[worker] = _request_calls.get(worker, 0) + n
-        if n:
-            with _run_lock:
-                _run["requests_started"] = _run.get("requests_started", 0) + n
-        return _request_calls[worker]
+    return agent_turn.count_requests(_turns, worker, n, reset, run=_run, run_lock=_run_lock)
 
 
 def mit_arm(c, rng=random):

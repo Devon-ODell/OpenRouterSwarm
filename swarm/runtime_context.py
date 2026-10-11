@@ -257,6 +257,21 @@ class ProcessRegistry:
         return self._stopping.is_set()
 
 
+class TurnBook:
+    """Per-worker turn accounting for one repository's daemon: what each worker's turns made,
+    cost and ran on during its current attempt. Every map is keyed by worker name."""
+
+    def __init__(self, lock: threading.Lock | None = None) -> None:
+        self.lock = lock if lock is not None else threading.Lock()
+        self.study_calls: dict = {}
+        self.edit_calls: dict = {}      # worker -> edit_file/write_file calls its turns made this attempt
+        self.request_calls: dict = {}   # worker -> actual request starts observed in its turn logs
+        self.charges: dict = {}         # worker -> dollars its turns were charged this attempt
+        self.ran_on: dict = {}          # worker -> the model its last turn actually ran on, once a stand-in took it
+        self.active_turns: dict = {}    # worker -> live role and actual routed model
+        self.turn_logs: dict = {}       # worker -> the log the live turn is writing, for its round counter
+
+
 @dataclass
 class RuntimeContext:
     """Everything one repository's daemon instance needs, handed explicitly to new
@@ -269,3 +284,4 @@ class RuntimeContext:
     run_state: RunState        # replaces _run / _run_lock
     processes: ProcessRegistry  # replaces _processes / _process_lock
     stop: threading.Event       # replaces _stop
+    turns: TurnBook = field(default_factory=TurnBook)  # replaces the per-worker turn counter globals

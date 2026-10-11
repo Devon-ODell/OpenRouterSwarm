@@ -283,3 +283,47 @@ def excluded_models(task, role=None, *, now):
             continue
         out.add(f.get("model"))
     return out
+
+
+def count_study(turns, worker, n=0, reset=False):
+    """Study-tool calls made by one worker's turns since its attempt began."""
+    with turns.lock:
+        if reset:
+            return turns.study_calls.pop(worker, 0)
+        turns.study_calls[worker] = turns.study_calls.get(worker, 0) + n
+        return turns.study_calls[worker]
+
+
+def count_usd(turns, worker, usd=0.0, reset=False):
+    """What one worker's turns have been charged since its attempt began."""
+    with turns.lock:
+        if reset:
+            return round(turns.charges.pop(worker, 0.0), 6)
+        turns.charges[worker] = round(turns.charges.get(worker, 0.0) + usd, 6)
+        return turns.charges[worker]
+
+
+def count_edits(turns, worker, n=0, reset=False):
+    """Edit calls one worker's turns made since its attempt began.
+
+    An attempt that ends with no diff means two different things. A model that called edit_file
+    and still changed nothing got it wrong; a model that never reached an edit ran out of the
+    rounds this harness gave it. Only the first is the model's failure."""
+    with turns.lock:
+        if reset:
+            return turns.edit_calls.pop(worker, 0)
+        turns.edit_calls[worker] = turns.edit_calls.get(worker, 0) + n
+        return turns.edit_calls[worker]
+
+
+def count_requests(turns, worker, n=0, reset=False, *, run, run_lock):
+    """API request starts attributable to this worker's current task."""
+    with turns.lock:
+        if reset:
+            return turns.request_calls.pop(worker, 0)
+        n = max(0, int(n or 0))
+        turns.request_calls[worker] = turns.request_calls.get(worker, 0) + n
+        if n:
+            with run_lock:
+                run["requests_started"] = run.get("requests_started", 0) + n
+        return turns.request_calls[worker]
