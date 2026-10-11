@@ -1335,10 +1335,16 @@ class GuardTests(SwarmBase):
 class SandboxTests(unittest.TestCase):
     @unittest.skipUnless(sandbox.available(), "sandbox-exec cannot run here (unavailable or nested)")
     def test_gate_cannot_write_outside_its_worktree_or_read_env_files(self):
-        with tempfile.TemporaryDirectory() as td:
+        # Probes that do not depend on where this checkout lives: a fresh worktree under
+        # /private/tmp is itself sandbox-writable, and a fresh checkout has no .env at all.
+        outside = Path.home() / f".sandbox-probe-{uuid.uuid4().hex}"
+        writable = [Path(p).resolve() for p in ("/private/tmp", "/private/var/folders")]
+        if any(outside.resolve().is_relative_to(w) for w in writable):
+            self.skipTest("HOME is under a sandbox-writable directory here")
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as secrets:
             wt = Path(td)
-            outside = Path(__file__).resolve().parent / f".sandbox-probe-{uuid.uuid4().hex}"
-            env_file = Path(__file__).resolve().parent.parent / ".env"
+            env_file = Path(secrets) / ".env"
+            env_file.write_text("OPENROUTER_API_KEY=probe-not-a-real-key\n")
             try:
                 ok, out = swarmd.run_gate(wt, {"sandbox": True, "test_cmd":
                                                f"touch '{outside}'; echo ok > inside.txt; cat '{env_file}'"})

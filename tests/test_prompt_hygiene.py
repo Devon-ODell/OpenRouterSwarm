@@ -105,7 +105,10 @@ class InjectCorpusTests(unittest.TestCase):
 
     def test_the_studio_config_has_it_off(self):
         """The finish line for the studio: no excerpts, for any attempt."""
-        c = json.loads((Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.json").read_text())
+        path = Path(swarmd.HERE) / "configs" / "openRouter-Studio-ab0a4a.json"
+        if not path.is_file():
+            self.skipTest("the studio's tuned config is per-machine (swarm/configs/ is gitignored)")
+        c = json.loads(path.read_text())
         self.assertIs(c["inject_corpus"], False)
         self.assertEqual(swarmd.mit_arm(c), "off")
 
