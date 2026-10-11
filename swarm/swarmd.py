@@ -73,6 +73,11 @@ try:  # attempt_runner resolves against the same module identity as the daemon
 except ImportError:  # pragma: no cover - exercised by bridge.py / direct swarmd.py execution
     import attempt_runner
 
+try:  # worker resolves against the same module identity as the daemon
+    from . import worker as worker_loop
+except ImportError:  # pragma: no cover - exercised by bridge.py / direct swarmd.py execution
+    import worker as worker_loop
+
 # ------------------------------------------------------------------ P2 extracted leaves
 #
 # prompts / task_rules / context_builder / verification / provisioning hold the code;
@@ -1443,283 +1448,25 @@ def _attempt_deps():
         run_gate=run_gate, run_prov_hooks=run_prov_hooks)
 
 
-class Worker(threading.Thread):
-    def __init__(self, idx, c, q, budget, stop, ledger=None, tally=None):
-        super().__init__(daemon=True, name=f"w{idx}")
-        self.idx, self.c, self.q, self.budget, self.stop = idx, c, q, budget, stop
-        self.ledger = ledger or Ledger(STATE / "learn.json")
-        self.tally = tally or Tally()
-        self.branch = f"swarm/w{idx}"
-        self.wt = None
-        self.stage = None
-        self.task = None
-        self.last_model = None
-        self.last_role = None
-        self.agent_timed_out = False
-        self.worktree_provisioned = False
-        self.failure_class = "task"
-        self.state = None                 # structured state code (work order §13)
-        self.clock = BucketClock()        # wall-time buckets by state
-        _worker_clocks[self.name] = self.clock
+def _worker_deps():
+    """The daemon services the worker loop uses, read now so a test's patch of any of them bites."""
+    return worker_loop.WorkerDeps(
+        log=log, journal=journal, watch_config=watch_config, read_goal=read_goal,
+        recheck_allowance=recheck_allowance, allowance_recheck=allowance_recheck,
+        next_wake=next_wake, all_resting=all_resting, describe_error=describe_error,
+        forget_worker=forget_worker, config_mtime=config_mtime, cfg_lock=_cfg_lock,
+        run=_run, new_ledger=lambda: Ledger(STATE / "learn.json"), new_tally=Tally,
+        clocks=_worker_clocks)
 
-    def publish(self, state):
-        """Record a structured state transition, for the wall-time buckets and the panel.
 
-        `self.doing` remains human prose; `state` is the machine-readable bucket the
-        panel and reports accumulate. Every transition banks the previous bucket, so the
-        buckets' total approximates the run's wall time (work order §13)."""
-        if state not in WALL_BUCKETS:
-            raise ValueError(f"unknown worker state {state!r}")
-        self.state = state
-        self.clock.enter(state)
+class Worker(worker_loop.Worker):
+    """The worker loop bound to this daemon's services and attempt runner."""
 
-    # -- helpers -----------------------------------------------------------
-
-    def _attempt_config(self, c=None):
-        """Return the supplied attempt config, or freeze one for a direct entry."""
-        if c is None:
-            # The live dict is rewritten in-place under this same lock. Freeze it while
-            # holding the lock so a second worker cannot yield a mixed/partial snapshot.
-            with _cfg_lock:
-                return ConfigSnapshot(values=self.c, mtime=config_mtime()).values
-        return c
-
-    def _attempt_inputs(self, c=None, budget=None):
-        """Return immutable config and pacing policy for one attempt entry.
-
-        ``run()`` always supplies both values from the snapshot taken immediately after
-        claim.  The fallback keeps the long-standing direct-call test/API surface useful:
-        callers entering ``do_task`` or an individual helper outside the worker loop get a
-        fresh snapshot, never the mutable live dict itself.  Nothing is stored on the
-        worker, so concurrent attempts cannot replace each other's view.
-        """
-        c = self._attempt_config(c)
-        if budget is None:
-            budget = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
-                            owner_window=c.get("owner_window", ["00:00", "00:00"]))
-        return c, budget
+    def services(self):
+        return _worker_deps()
 
     def runner(self):
         return attempt_runner.AttemptRunner(self, _attempt_deps())
-
-    def pick(self, exclude=(), role="implementer", c=None):
-        """Implementers by Thompson sampling. Reviewers and judges come from the
-        same posterior, excluding the implementer so nobody grades their own work.
-
-        `role` is the job this model is being drawn for, so `role_models` can keep a model
-        out of the roles it is bad at while leaving it in the ones it is good at. The
-        posterior is still the implementer's: one model's record is one record.
-
-        When every free model is resting, a paid stand-in keeps the attempt alive rather
-        than abandoning work already done — but only while the day's budget allows."""
-        return self.runner().pick(exclude, role, c)
-
-    def select_implementer(self, failed, c=None):
-        """An implementer for this attempt, or None when none is usable.
-
-        `failed` is the set of models the task/model circuit breaker already excluded on
-        this task. `pick()` is given those exclusions directly (the ledger only sees the
-        arms it is allowed), so a proven-bad pairing is never redrawn for the same task.
-        """
-        return self.runner().select_implementer(failed, c)
-
-    def no_review(self, c=None):
-        """Models the owner has barred from reviewing (config `reviewer_exclude`)."""
-        return self.runner().no_review(c)
-
-    def excluded_models(self, role=None):
-        """Models the task/model circuit breaker has excluded from `role` on this task.
-
-        One timeout, incomplete response, length termination or no-edit exhaustion on a task
-        excludes that model from that task/role for the rest of the run or 24 hours (work
-        order §5). A provider-busy handoff before any edit stays cheap and does not poison
-        the pairing, so those failures are not recorded as exclusions. A harness timeout is
-        still an exclusion: the pairing demonstrably cannot deliver inside the budget, so the
-        next implementation attempt must use another model.
-        """
-        return self.runner().excluded_models(role)
-
-    def call(self, role, prompt, cwd, steps, model, avoid=(), c=None, attempt_budget=None):
-        return self.runner().call(role, prompt, cwd, steps, model, avoid, c, attempt_budget)
-
-    def ensure_worktree(self, task, c=None):
-        return self.runner().ensure_worktree(task, c)
-
-    def adopt_retained(self, task, wd):
-        return self.runner().adopt_retained(task, wd)
-
-    def own_branch(self):
-        return self.runner().own_branch()
-
-    # -- one task ----------------------------------------------------------
-
-    def do_task(self, task, goal, c=None, attempt_budget=None):
-        outcome = self.runner().run(task, goal, c, attempt_budget)
-        return outcome.accepted, outcome.note
-
-    def gate(self, label, c=None):
-        """Run configured commands and retain supervisor-owned evidence."""
-        return self.runner().gate(label, c)
-
-    def snapshot(self):
-        return self.runner().snapshot()
-
-    def review(self, tree, diff, tests, model, avoid=(), allow_test_changes=False,
-               c=None, attempt_budget=None):
-        return self.runner().review(tree, diff, tests, model, avoid, allow_test_changes,
-                                    c, attempt_budget)
-
-    def reviewed(self, tree, diff, tests, adv, impl, allowed, c=None, attempt_budget=None):
-        return self.runner().reviewed(tree, diff, tests, adv, impl, allowed, c,
-                                      attempt_budget)
-
-    def _attempt(self, task, goal, info, c=None, attempt_budget=None):
-        return self.runner()._attempt(task, goal, info, c, attempt_budget)
-
-    def integrate(self, c=None, attempt_budget=None):
-        return self.runner().integrate(c, attempt_budget)
-
-    def judge(self, task, goal, diff, verdict, model, avoid=(), c=None,
-              attempt_budget=None):
-        return self.runner().judge(task, goal, diff, verdict, model, avoid, c, attempt_budget)
-
-    def _reinforce(self, task, stage, info, c=None, attempt_budget=None):
-        return self.runner()._reinforce(task, stage, info, c, attempt_budget)
-
-    def follow_up(self, task, scores, r, breakthrough, c=None):
-        return self.runner().follow_up(task, scores, r, breakthrough, c)
-
-    def celebrate(self, task, r, scores, impl, c=None):
-        return self.runner().celebrate(task, r, scores, impl, c)
-
-    def hang(self, task, stage, info, impl, c=None):
-        return self.runner().hang(task, stage, info, impl, c)
-
-    def _cleanup(self, c=None):
-        return self.runner()._cleanup(c)
-
-    def strand(self, task, how):
-        return self.runner().strand(task, how)
-
-    def decompose(self, task, goal, avoid=(), c=None, attempt_budget=None):
-        return self.runner().decompose(task, goal, avoid, c, attempt_budget)
-
-    def retry_split(self, task, goal, model, avoid, why, c=None, attempt_budget=None):
-        return self.runner().retry_split(task, goal, model, avoid, why, c, attempt_budget)
-
-    # -- loop --------------------------------------------------------------
-
-    def scope_violations(self):
-        return self.runner().scope_violations()
-
-    def run(self):
-        while not self.stop.is_set() and not self.tally.drain.is_set():
-            # Between tasks, never inside one: an edited config reaches this run without a
-            # restart, and a restart is what killed 54 attempts in this window.
-            watch_config(self.c, self.budget)
-            run_cap = max(0, int(self.c.get("run_request_cap") or 0))
-            requests_left = max(0, run_cap - int(_run.get("requests_started", 0))) if run_cap else None
-            task = self.q.claim(requests_left=requests_left)
-            if not task:
-                self.doing, self.state = None, IDLE
-                self.clock.enter(IDLE)
-                self.stop.wait(20)
-                continue
-            # One claim, one immutable view. A different worker may reload the live dict and
-            # retune the daemon budget while this task is running; neither change reaches this
-            # attempt. Budget still reads the shared on-disk request counters, so accounting is
-            # not forked — only the pacing policy is frozen.
-            with _cfg_lock:
-                snapshot = ConfigSnapshot(values=self.c, mtime=config_mtime())
-            c = snapshot.values
-            attempt_budget = Budget(
-                cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
-                owner_window=c.get("owner_window", ["00:00", "00:00"]))
-            # A4 handoff 2026-10-02: an attempt without a persona skips the role
-            # shaping that makes prompts accurate, and ~half the audit's effort ran
-            # that way. Planner tasks always carry one; human-origin tasks default
-            # to "builder" so no attempt burns unshaped, and the journal records it.
-            if not task.get("persona"):
-                task["persona"] = "builder"
-                journal("persona_default", id=task["id"],
-                        from_origin=task.get("origin", "human"))
-            try:
-                goal = read_goal(c)
-                ok, note = self.do_task(task, goal, c, attempt_budget)
-                # A timeout only forces a split when there was work to be too big for. With no
-                # diff there is nothing to divide, and the timeout is ours, not the task's.
-                final = self.q.release(task["id"], ok, note, failure_class=self.failure_class,
-                                       split_now=self.agent_timed_out and self.stage != "agent_timeout",
-                                       park=self.stage in ("out_of_scope", "request_budget", "model_pool_exhausted"),
-                                       requests=getattr(self, "attempt_requests", 0),
-                                       failed_model=(self.last_model if not ok and self.failure_class in
-                                                     ("harness", "model") else None),
-                                       failed_role=self.last_role, ledger=self.ledger,
-                                       turn_seconds=round(max(0, time.time() - (getattr(self, "started", 0) or time.time())), 1),
-                                       role_turns=getattr(self, "role_calls", 0) or 0, stage=self.stage)
-                journal("task", id=task["id"], title=task["title"], ok=ok, stage=self.stage,
-                        failure_class=None if ok else self.failure_class,
-                        status=final.get("status") if final else None,
-                        exploration_failures=final.get("exploration_failures") if final else None,
-                        worker=self.name, requests=getattr(self, "attempt_requests", 0), note=note[:300])
-                if final and final.get("status") == "split":
-                    if not self.decompose(final, goal, c=c, attempt_budget=attempt_budget):
-                        self.strand(final, "was split into no subtasks")
-                elif final and final.get("status") == "parked":
-                    self.strand(final, "was parked after repeated failures")
-                self.tally.finished()
-            except CapReached:
-                log("quota/window pause — deferring task", self.name)
-                self.q.release(task["id"], False, "quota/window pause", defer=60,
-                               failure_class="harness")
-                # 22 of these in one day, ten minutes each, while the local count read
-                # 1025/1000 and OpenRouter reported fewer requests used. Ask before sleeping,
-                # and sleep no longer than the interval at which the next ask is due.
-                if recheck_allowance(c, attempt_budget):
-                    continue
-                self.stop.wait(min(600, allowance_recheck(c) or 600))
-            except ProviderDown as e:
-                self.q.release(task["id"], False, f"provider unavailable: {str(e)[:200]}", defer=30,
-                               failure_class="harness")
-                if self.pick(c=c) is None:
-                    # No model can take a turn. Sleep until the first one is back, not blindly.
-                    _, until = next_wake(self.ledger, c)
-                    wait = max(30, min(300, until - time.time()))
-                    log(f"{all_resting(self.ledger, c)}; task deferred, next try in {wait:.0f}s", self.name)
-                else:
-                    wait = 30
-                    log(f"no other model could take over from {e.model}; task deferred, next try in 30s", self.name)
-                self.stop.wait(wait)
-            except NoCredits as e:
-                log(f"out of credits: {e}", self.name)
-                self.q.release(task["id"], False, "no credits")
-                self.stop.set()
-            except Exception as e:
-                if self.stop.is_set():
-                    self.q.release(task["id"], False, "run stopped; changes retained", defer=1,
-                                   failure_class="harness")
-                    return
-                described = describe_error(e)
-                log(f"error on {task['id']}: {described['kind']}: {described['err']}", self.name)
-                journal("error", id=task["id"], tb=traceback.format_exc()[-1200:], **described)
-                # A turn that timed out is still a failed attempt: let it split like any other,
-                # or the task is shelved with no smaller pieces to try.
-                # An unexpected exception in the supervisor is ours, not the task's.
-                final = self.q.release(task["id"], False, str(e)[:400], failure_class="harness")
-                if final and final.get("status") == "split":
-                    try:
-                        self.decompose(final, read_goal(c), c=c,
-                                       attempt_budget=attempt_budget)
-                    except Exception as exc:
-                        log(f"could not split '{final['title']}': {exc}", self.name)
-                self.stop.wait(30)
-            finally:
-                # Between tasks a worker is not working on anything. `task` and `started` used
-                # to keep the last task's values while the worker sat in claim(), so the panel
-                # showed a finished task as still running with an elapsed time that kept
-                # climbing — the single most misleading line the status ever printed.
-                self.task, self.started, self.doing = None, 0, None
-                forget_worker(self.name)
 
 
 # ------------------------------------------------------------------ planning

@@ -116,13 +116,17 @@ class AttemptConfigSnapshotTests(unittest.TestCase):
 
     def test_attempt_helpers_cannot_reach_the_live_config_or_reload_it(self):
         """Keep live config access at the claim/direct-entry boundaries."""
-        tree = ast.parse(textwrap.dedent(inspect.getsource(swarmd.Worker)))
+        # The worker loop may live in a base class (swarm/worker.py) with swarmd.Worker binding
+        # it to the daemon, so check every class the worker is built from.
+        classes = [k for k in swarmd.Worker.__mro__ if k.__module__ not in ("threading", "builtins")]
         boundary = {"__init__", "_attempt_config", "_attempt_inputs", "run"}
         forbidden_calls = {"cfg", "load_cfg", "watch_config", "config_mtime"}
         violations = []
         # getsource() of a class parses to a module holding one ClassDef; its methods are in
         # that node's body. Iterating tree.body here once checked no method at all.
-        methods = [n for n in tree.body[0].body if isinstance(n, ast.FunctionDef)]
+        methods = [n for k in classes
+                   for n in ast.parse(textwrap.dedent(inspect.getsource(k))).body[0].body
+                   if isinstance(n, ast.FunctionDef)]
         self.assertGreater(len(methods), 3)
         for method in methods:
             if method.name in boundary:
