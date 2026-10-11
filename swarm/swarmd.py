@@ -1437,7 +1437,10 @@ def _attempt_deps():
         baseline_key=baseline_key, context_pack=context_pack, count_edits=count_edits,
         kin_text=kin_text, mark_progress=mark_progress, mit_arm=mit_arm, study=study,
         checked_out_at=checked_out_at, trunk_locked=trunk_locked,
-        count_study=count_study, count_usd=count_usd, forget_worker=forget_worker)
+        count_study=count_study, count_usd=count_usd, forget_worker=forget_worker,
+        paid_pool=paid_pool, spend_left=spend_left, ensure_trunk=ensure_trunk,
+        wt_root=wt_root, take_resume=take_resume,
+        run_gate=run_gate, run_prov_hooks=run_prov_hooks)
 
 
 class Worker(threading.Thread):
@@ -1509,9 +1512,7 @@ class Worker(threading.Thread):
 
         When every free model is resting, a paid stand-in keeps the attempt alive rather
         than abandoning work already done — but only while the day's budget allows."""
-        c = self._attempt_config(c)
-        return agent_turn.pick_model(self.ledger, c, exclude, role,
-                                     pool=pool, paid_pool=paid_pool, spend_left=spend_left)
+        return self.runner().pick(exclude, role, c)
 
     def select_implementer(self, failed, c=None):
         """An implementer for this attempt, or None when none is usable.
@@ -1520,13 +1521,11 @@ class Worker(threading.Thread):
         this task. `pick()` is given those exclusions directly (the ledger only sees the
         arms it is allowed), so a proven-bad pairing is never redrawn for the same task.
         """
-        c = self._attempt_config(c)
-        return self.pick(failed, role="implementer", c=c)
+        return self.runner().select_implementer(failed, c)
 
     def no_review(self, c=None):
         """Models the owner has barred from reviewing (config `reviewer_exclude`)."""
-        c = self._attempt_config(c)
-        return set(c.get("reviewer_exclude") or ())
+        return self.runner().no_review(c)
 
     def excluded_models(self, role=None):
         """Models the task/model circuit breaker has excluded from `role` on this task.
@@ -1538,22 +1537,19 @@ class Worker(threading.Thread):
         still an exclusion: the pairing demonstrably cannot deliver inside the budget, so the
         next implementation attempt must use another model.
         """
-        return agent_turn.excluded_models(self.task, role, now=time.time())
+        return self.runner().excluded_models(role)
 
     def call(self, role, prompt, cwd, steps, model, avoid=(), c=None, attempt_budget=None):
         return self.runner().call(role, prompt, cwd, steps, model, avoid, c, attempt_budget)
 
     def ensure_worktree(self, task, c=None):
-        c = self._attempt_config(c)
-        self.branch, self.wt = workspace.create_worktree(
-            c, task["id"], git=git, ensure_trunk=ensure_trunk, worktrees=wt_root)
+        return self.runner().ensure_worktree(task, c)
 
     def adopt_retained(self, task, wd):
-        return workspace.adopt_retained(task, wd, take_resume=take_resume, git=git,
-                                        log=log, journal=journal, worker=self.name)
+        return self.runner().adopt_retained(task, wd)
 
     def own_branch(self):
-        return workspace.owns_branch(self.wt, self.branch, git=git)
+        return self.runner().own_branch()
 
     # -- one task ----------------------------------------------------------
 
@@ -1563,25 +1559,10 @@ class Worker(threading.Thread):
 
     def gate(self, label, c=None):
         """Run configured commands and retain supervisor-owned evidence."""
-        c = self._attempt_config(c)
-        self.gate_count += 1
-        self.doing = f"running the tests ({label})"
-        self.publish(TESTING)
-        commands = [c["test_cmd"], *c.get("validation_commands", [])]
-        if label != "baseline":
-            commands += (self.task or {}).get("verification_commands", [])
-        commands = list(dict.fromkeys(commands))
-        evidence, passed, self.worktree_provisioned = verification.run_gate_commands(
-            c, self.wt, commands, label, self.gate_count, self.evidence.path,
-            self.worktree_provisioned,
-            run_gate=run_gate, run_prov_hooks=run_prov_hooks, mark_progress=mark_progress)
-        self.evidence.write(f"gate-{self.gate_count:02d}.json", evidence)
-        self.evidence.record("verifying", gate=label, gates=evidence)
-        return passed, json.dumps(evidence, indent=2)
+        return self.runner().gate(label, c)
 
     def snapshot(self):
-        return workspace.snapshot(self.wt, self.branch, self.review_base, git=git,
-                                  owns_branch=self.own_branch, error=ModelError)
+        return self.runner().snapshot()
 
     def review(self, tree, diff, tests, model, avoid=(), allow_test_changes=False,
                c=None, attempt_budget=None):
@@ -1615,9 +1596,7 @@ class Worker(threading.Thread):
         return self.runner().hang(task, stage, info, impl, c)
 
     def _cleanup(self, c=None):
-        c = self._attempt_config(c)
-        return workspace.cleanup(c, self.wt, self.branch, self.stage, self.task,
-                                 git=git, owns_branch=self.own_branch)
+        return self.runner()._cleanup(c)
 
     def strand(self, task, how):
         return self.runner().strand(task, how)

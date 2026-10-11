@@ -15,7 +15,7 @@ from typing import Any, Callable
 from learn import (BREAKTHROUGH_WEIGHT, CRIME, FAULTY, PENALTY_WEIGHT, defect, exhibit,
                    format_playbook, is_breakthrough, json_array, novelty, parse_scores,
                    reward, weight)
-from metrics import ACTIVE_MODEL, REVIEWING
+from metrics import ACTIVE_MODEL, REVIEWING, TESTING
 from pacing import effective_steps
 from prompts import (ARCHITECT, DECOMPOSER, FAST_IMPLEMENTER, IMPLEMENTER, JUDGE,
                      PRIORITIES, REPAIR)
@@ -38,6 +38,12 @@ try:  # same module identity as the daemon's workspace
     from . import workspace
 except ImportError:  # pragma: no cover - script mode
     import workspace
+
+try:  # same module identity as the daemon's
+    from . import agent_turn, verification
+except ImportError:  # pragma: no cover - script mode
+    import agent_turn
+    import verification
 
 
 @dataclass(frozen=True)
@@ -76,6 +82,13 @@ class AttemptDeps:
     count_study: Callable      # = count_study
     count_usd: Callable        # = count_usd
     forget_worker: Callable    # = forget_worker
+    paid_pool: Callable        # = paid_pool
+    spend_left: Callable       # = spend_left
+    ensure_trunk: Callable     # = ensure_trunk
+    wt_root: Callable          # = wt_root    (the function itself)
+    take_resume: Callable      # = take_resume
+    run_gate: Callable         # = run_gate
+    run_prov_hooks: Callable   # = run_prov_hooks
 
 
 # The stage vocabulary is closed: failure_class(), TASK_STAGES, HARNESS_STAGES and every
@@ -859,3 +872,93 @@ class AttemptRunner:
             implementer=info.get("implementer"), reviewer=info.get("reviewer"),
             commit=info.get("commit"), requests=w.attempt_requests,
             evidence_path=evidence, scores=info.get("scores"))
+
+    def pick(self, exclude=(), role="implementer", c=None):
+        """Implementers by Thompson sampling. Reviewers and judges come from the
+        same posterior, excluding the implementer so nobody grades their own work.
+
+        `role` is the job this model is being drawn for, so `role_models` can keep a model
+        out of the roles it is bad at while leaving it in the ones it is good at. The
+        posterior is still the implementer's: one model's record is one record.
+
+        When every free model is resting, a paid stand-in keeps the attempt alive rather
+        than abandoning work already done — but only while the day's budget allows."""
+        w, d = self.w, self.d
+        c = w._attempt_config(c)
+        return agent_turn.pick_model(w.ledger, c, exclude, role,
+                                     pool=d.pool, paid_pool=d.paid_pool, spend_left=d.spend_left)
+
+    def select_implementer(self, failed, c=None):
+        """An implementer for this attempt, or None when none is usable.
+
+        `failed` is the set of models the task/model circuit breaker already excluded on
+        this task. `pick()` is given those exclusions directly (the ledger only sees the
+        arms it is allowed), so a proven-bad pairing is never redrawn for the same task.
+        """
+        w, d = self.w, self.d
+        c = w._attempt_config(c)
+        return w.pick(failed, role="implementer", c=c)
+
+    def no_review(self, c=None):
+        """Models the owner has barred from reviewing (config `reviewer_exclude`)."""
+        w, d = self.w, self.d
+        c = w._attempt_config(c)
+        return set(c.get("reviewer_exclude") or ())
+
+    def excluded_models(self, role=None):
+        """Models the task/model circuit breaker has excluded from `role` on this task.
+
+        One timeout, incomplete response, length termination or no-edit exhaustion on a task
+        excludes that model from that task/role for the rest of the run or 24 hours (work
+        order §5). A provider-busy handoff before any edit stays cheap and does not poison
+        the pairing, so those failures are not recorded as exclusions. A harness timeout is
+        still an exclusion: the pairing demonstrably cannot deliver inside the budget, so the
+        next implementation attempt must use another model.
+        """
+        w, d = self.w, self.d
+        return agent_turn.excluded_models(w.task, role, now=time.time())
+
+    def ensure_worktree(self, task, c=None):
+        w, d = self.w, self.d
+        c = w._attempt_config(c)
+        w.branch, w.wt = workspace.create_worktree(
+            c, task["id"], git=d.git, ensure_trunk=d.ensure_trunk, worktrees=d.wt_root)
+
+    def adopt_retained(self, task, wd):
+        w, d = self.w, self.d
+        return workspace.adopt_retained(task, wd, take_resume=d.take_resume, git=d.git,
+                                        log=d.log, journal=d.journal, worker=w.name)
+
+    def own_branch(self):
+        w, d = self.w, self.d
+        return workspace.owns_branch(w.wt, w.branch, git=d.git)
+
+    def gate(self, label, c=None):
+        """Run configured commands and retain supervisor-owned evidence."""
+        w, d = self.w, self.d
+        c = w._attempt_config(c)
+        w.gate_count += 1
+        w.doing = f"running the tests ({label})"
+        w.publish(TESTING)
+        commands = [c["test_cmd"], *c.get("validation_commands", [])]
+        if label != "baseline":
+            commands += (w.task or {}).get("verification_commands", [])
+        commands = list(dict.fromkeys(commands))
+        evidence, passed, w.worktree_provisioned = verification.run_gate_commands(
+            c, w.wt, commands, label, w.gate_count, w.evidence.path,
+            w.worktree_provisioned,
+            run_gate=d.run_gate, run_prov_hooks=d.run_prov_hooks, mark_progress=d.mark_progress)
+        w.evidence.write(f"gate-{w.gate_count:02d}.json", evidence)
+        w.evidence.record("verifying", gate=label, gates=evidence)
+        return passed, json.dumps(evidence, indent=2)
+
+    def snapshot(self):
+        w, d = self.w, self.d
+        return workspace.snapshot(w.wt, w.branch, w.review_base, git=d.git,
+                                  owns_branch=w.own_branch, error=ModelError)
+
+    def _cleanup(self, c=None):
+        w, d = self.w, self.d
+        c = w._attempt_config(c)
+        return workspace.cleanup(c, w.wt, w.branch, w.stage, w.task,
+                                 git=d.git, owns_branch=w.own_branch)
