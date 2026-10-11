@@ -1,10 +1,14 @@
-"""Verification helpers: weakened-test detection and failure output reading.
+"""Verification helpers: weakened-test detection, failure output reading and gate execution.
 
-Extracted from swarmd (P2), partial — the gate runners themselves (run_gate,
-baseline cache, provisioning hooks) stay in swarmd until P7. Pure functions of
-their parameters; no module reads swarmd globals.
+Extracted from the daemon (P2, P7). Pure functions of their parameters; no module reads
+daemon globals.
 """
+import hashlib
+import json
 import re
+import subprocess
+import time
+from collections.abc import Mapping
 from pathlib import Path
 
 ASSERT_CALL = re.compile(
@@ -136,5 +140,149 @@ def last_error(output):
         if re.search(r"error|fail|assert|exception|panic", l, re.I):
             return l[:200]
     return lines[-1][:200] if lines else "no output"
+
+
+# ------------------------------------------------------------------ gate
+
+def baseline_key(c, commit):
+    """What a cached baseline pass is a pass *of*: this commit and these exact commands."""
+    parts = [str(commit), c.get("test_cmd", ""), *(c.get("validation_commands") or [])]
+    return hashlib.sha1("\n".join(parts).encode()).hexdigest()
+
+
+def baseline_cache(key, passed=None, ttl=86_400, *, state):
+    """Read or record that trunk at this commit passed its own gate.
+
+    Every attempt ran the full suite before the model started, and the studio's suite takes 105
+    seconds. Nothing about trunk changed between one attempt and the next, so most of those runs
+    proved the same thing over again.
+    """
+    path = state / "baseline.json"
+    if passed is None:
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if row.get("key") != key or not row.get("passed"):
+            return None
+        return row if time.time() - row.get("at", 0) < ttl else None
+    row = {"key": key, "passed": bool(passed), "at": time.time()}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(row))
+    tmp.replace(path)
+    return row
+
+
+def run_gate(cwd, c, *, sandboxed, sh, clean_env):
+    cmd = sandboxed(c["test_cmd"], cwd, c)
+    rc, out = sh(cmd, cwd=cwd, timeout=c.get("test_timeout", 900), env=clean_env())
+    if c.get("_gate_log"):
+        Path(c["_gate_log"]).write_text(f"command: {c['test_cmd']}\nexit: {rc}\n{out}")
+    return rc == 0, out[-4000:]
+
+
+# ------------------------------------------------------------------ provisioning
+#
+# A fresh git worktree contains exactly the files git tracks: no node_modules/, no .venv,
+# no vendored deps, no nested-repo content. A test gate that needs any of those fails on
+# a bare checkout before a single model request, which is how the dj-bot swarm spent its
+# whole shift red-baselined with "Cannot find package '@strudel/core'" and "every task
+# would be rejected". The `prov` config block fixes that: it is a list of shell hooks the
+# swarm runs inside each fresh worktree (and the _view) before the gate, so a checkout in
+# a new codespace or on a new laptop reaches green by itself.
+
+
+def prov_block(c):
+    """The provisioning section of the live config, normalised."""
+    p = c.get("prov") or {}
+    if isinstance(p, list):
+        p = {"hooks": [h for h in p if isinstance(h, str)]}
+    elif not isinstance(p, Mapping):
+        return {"hooks": [], "env": {}, "timeout": 1200}
+    hooks = [h for h in p.get("hooks") or [] if isinstance(h, str) and h.strip()]
+    env = {k: str(v) for k, v in (p.get("env") or {}).items() if v is not None}
+    return {"hooks": hooks, "env": env, "timeout": int(p.get("timeout", 1200) or 1200)}
+
+
+def run_prov_hooks(c, wd, label, env_extra=None, log_on_ok=False, *,
+                   prov_block, sh, clean_env, log):
+    """Run every provisioning hook in `wd` (a fresh worktree or the _view).
+
+    Hooks are allowed to write anywhere: provisioning must install packages, which the
+    sandbox would refuse, so it runs unsandboxed. The only thing we guarantee is that a
+    hook that fails stops the attempt with its output attached (so the agent never sees a
+    red gate it cannot explain) and that hook output is attributed to `label` in the log.
+    Returns (ok, output). Never raises for a failing hook.
+    """
+    prov = prov_block(c)
+    if not prov["hooks"]:
+        return True, ""
+    # Package-manager installs don't need the daemon's own secrets (OPENROUTER_API_KEY and
+    # friends); clean_env() is what run_gate() already uses for the same reason.
+    env = {**clean_env(), **prov["env"]}
+    if env_extra:
+        env.update(env_extra)
+    out = []
+    for i, hook in enumerate(prov["hooks"], 1):
+        log(f"prov [{label}] hook {i}/{len(prov['hooks'])}: {hook[:140]}")
+        try:
+            rc, o = sh(hook, cwd=str(wd), timeout=prov["timeout"], env=env)
+        except Exception as e:
+            out.append(f"[hook {i}] {hook[:140]}\n{type(e).__name__}: {e}")
+            log(f"prov [{label}] hook {i} raised {type(e).__name__}: {e}")
+            return False, "\n".join(out)[-4000:]
+        out.append(f"[hook {i}] exit {rc}: {hook[:140]}\n{o}".strip())
+        if rc != 0:
+            log(f"prov [{label}] hook {i} failed (exit {rc})")
+            return False, "\n".join(out)[-4000:]
+        if log_on_ok:
+            log(f"prov [{label}] hook {i} ok")
+    return True, "\n".join(out)[-4000:]
+
+
+def run_gate_with_prov(c, wd, label, *, run_prov_hooks, run_gate):
+    """Provision `wd`, then run its gate. Packaging deps into every worktree is exactly
+    what a pre-flight baseline is for, so this is the one gate runner that provisions
+    first. Returns (ok, output) like run_gate. If there is nothing to provision this is
+    exactly run_gate — the gate itself is what decides whether `wd` is real."""
+    ok, out = run_prov_hooks(c, wd, label, log_on_ok=True)
+    if not ok:
+        return False, f"provisioning failed:\n{out}"
+    return run_gate(wd, c)
+
+
+def run_gate_commands(c, wd, commands, label, gate_no, evidence_dir, provisioned, *,
+                      run_gate, run_prov_hooks, mark_progress):
+    """Run configured commands in `wd` and retain supervisor-owned evidence.
+
+    Provisions once before the first command, keeps the dependencies across candidate and
+    repair gates, and returns (evidence, passed, provisioned)."""
+    evidence, passed = [], True
+    for i, command in enumerate(commands):
+        name = f"gate-{gate_no:02d}-{label}-{i}.log"
+        config = dict(c, test_cmd=command, _gate_log=str(evidence_dir / name))
+        started = time.monotonic()
+        try:
+            if i == 0 and not provisioned:
+                # Every attempt begins in a bare worktree. Provision it once, before the
+                # baseline, then retain those dependencies through candidate/repair gates.
+                prov_ok, prov_output = run_prov_hooks(
+                    c, wd, "attempt", log_on_ok=True)
+                if not prov_ok:
+                    ok, output = False, f"provisioning failed:\n{prov_output}"
+                else:
+                    provisioned = True
+                    ok, output = run_gate(wd, config)
+            else:
+                ok, output = run_gate(wd, config)
+        except subprocess.TimeoutExpired:
+            ok, output = False, "verification command timed out"
+            Path(config["_gate_log"]).write_text(f"command: {command}\n{output}\n")
+        row = {"command": command, "passed": ok, "log": name,
+               "seconds": round(time.monotonic() - started, 3), "tail": output}
+        evidence.append(row)
+        mark_progress("verification completed")
+        passed = passed and ok
+    return evidence, passed, provisioned
 
 

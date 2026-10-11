@@ -76,6 +76,11 @@ from context_builder import (CODE_PATH, GAME_DIR, DEFINITION,  # noqa: E402
 from verification import (ASSERT_CALL, GENERIC_DIR, assert_counts, identifiers,  # noqa: E402
                           deleted_paths, test_hunks, names_deleted, names_its_source,
                           weakened_tests, last_error)
+
+try:  # verification resolves against the same module identity as the daemon
+    from . import verification
+except ImportError:  # pragma: no cover - exercised by bridge.py / direct swarmd.py execution
+    import verification
 from provisioning import (RUNTIME_MARKERS, PROV_RECIPES, embedded_repos, _subdirs, sub_projects,  # noqa: E402
                           test_cmd_hint, test_cmds, project_test_cmd, other_test_cmds,
                           why_unrunnable, probe_surroundings, build_prov_block,
@@ -1395,39 +1400,15 @@ class ModelPoolExhausted(RuntimeError):
 # ------------------------------------------------------------------ gate
 
 def baseline_key(c, commit):
-    """What a cached baseline pass is a pass *of*: this commit and these exact commands."""
-    parts = [str(commit), c.get("test_cmd", ""), *(c.get("validation_commands") or [])]
-    return hashlib.sha1("\n".join(parts).encode()).hexdigest()
+    return verification.baseline_key(c, commit)
 
 
 def baseline_cache(key, passed=None, ttl=86_400):
-    """Read or record that trunk at this commit passed its own gate.
-
-    Every attempt ran the full suite before the model started, and the studio's suite takes 105
-    seconds. Nothing about trunk changed between one attempt and the next, so most of those runs
-    proved the same thing over again."""
-    path = STATE / "baseline.json"
-    if passed is None:
-        try:
-            row = json.loads(path.read_text())
-        except (OSError, ValueError):
-            return None
-        if row.get("key") != key or not row.get("passed"):
-            return None
-        return row if time.time() - row.get("at", 0) < ttl else None
-    row = {"key": key, "passed": bool(passed), "at": time.time()}
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(row))
-    tmp.replace(path)
-    return row
+    return verification.baseline_cache(key, passed=passed, ttl=ttl, state=STATE)
 
 
 def run_gate(cwd, c):
-    cmd = sandboxed(c["test_cmd"], cwd, c)
-    rc, out = sh(cmd, cwd=cwd, timeout=c.get("test_timeout", 900), env=clean_env())
-    if c.get("_gate_log"):
-        Path(c["_gate_log"]).write_text(f"command: {c['test_cmd']}\nexit: {rc}\n{out}")
-    return rc == 0, out[-4000:]
+    return verification.run_gate(cwd, c, sandboxed=sandboxed, sh=sh, clean_env=clean_env)
 
 
 # ------------------------------------------------------------------ trunk
@@ -1450,61 +1431,17 @@ def trunk_locked():
 
 
 def prov_block(c):
-    """The provisioning section of the live config, normalised."""
-    p = c.get("prov") or {}
-    if isinstance(p, list):
-        p = {"hooks": [h for h in p if isinstance(h, str)]}
-    elif not isinstance(p, Mapping):
-        return {"hooks": [], "env": {}, "timeout": 1200}
-    hooks = [h for h in p.get("hooks") or [] if isinstance(h, str) and h.strip()]
-    env = {k: str(v) for k, v in (p.get("env") or {}).items() if v is not None}
-    return {"hooks": hooks, "env": env, "timeout": int(p.get("timeout", 1200) or 1200)}
+    return verification.prov_block(c)
 
 
 def run_prov_hooks(c, wd, label, env_extra=None, log_on_ok=False):
-    """Run every provisioning hook in `wd` (a fresh worktree or the _view).
-
-    Hooks are allowed to write anywhere: provisioning must install packages, which the
-    sandbox would refuse, so it runs unsandboxed. The only thing we guarantee is that a
-    hook that fails stops the attempt with its output attached (so the agent never sees a
-    red gate it cannot explain) and that hook output is attributed to `label` in the log.
-    Returns (ok, output). Never raises for a failing hook.
-    """
-    prov = prov_block(c)
-    if not prov["hooks"]:
-        return True, ""
-    # Package-manager installs don't need the daemon's own secrets (OPENROUTER_API_KEY and
-    # friends); clean_env() is what run_gate() already uses for the same reason.
-    env = {**clean_env(), **prov["env"]}
-    if env_extra:
-        env.update(env_extra)
-    out = []
-    for i, hook in enumerate(prov["hooks"], 1):
-        log(f"prov [{label}] hook {i}/{len(prov['hooks'])}: {hook[:140]}")
-        try:
-            rc, o = sh(hook, cwd=str(wd), timeout=prov["timeout"], env=env)
-        except Exception as e:
-            out.append(f"[hook {i}] {hook[:140]}\n{type(e).__name__}: {e}")
-            log(f"prov [{label}] hook {i} raised {type(e).__name__}: {e}")
-            return False, "\n".join(out)[-4000:]
-        out.append(f"[hook {i}] exit {rc}: {hook[:140]}\n{o}".strip())
-        if rc != 0:
-            log(f"prov [{label}] hook {i} failed (exit {rc})")
-            return False, "\n".join(out)[-4000:]
-        if log_on_ok:
-            log(f"prov [{label}] hook {i} ok")
-    return True, "\n".join(out)[-4000:]
+    return verification.run_prov_hooks(c, wd, label, env_extra=env_extra, log_on_ok=log_on_ok,
+                                       prov_block=prov_block, sh=sh, clean_env=clean_env, log=log)
 
 
 def run_gate_with_prov(c, wd, label):
-    """Provision `wd`, then run its gate. Packaging deps into every worktree is exactly
-    what a pre-flight baseline is for, so this is the one gate runner that provisions
-    first. Returns (ok, output) like run_gate. If there is nothing to provision this is
-    exactly run_gate — the gate itself is what decides whether `wd` is real."""
-    ok, out = run_prov_hooks(c, wd, label, log_on_ok=True)
-    if not ok:
-        return False, f"provisioning failed:\n{out}"
-    return run_gate(wd, c)
+    return verification.run_gate_with_prov(c, wd, label,
+                                           run_prov_hooks=run_prov_hooks, run_gate=run_gate)
 
 
 def ensure_trunk(c):
@@ -2134,32 +2071,10 @@ class Worker(threading.Thread):
         if label != "baseline":
             commands += (self.task or {}).get("verification_commands", [])
         commands = list(dict.fromkeys(commands))
-        evidence, passed = [], True
-        for i, command in enumerate(commands):
-            name = f"gate-{self.gate_count:02d}-{label}-{i}.log"
-            config = dict(c, test_cmd=command, _gate_log=str(self.evidence.path / name))
-            started = time.monotonic()
-            try:
-                if i == 0 and not self.worktree_provisioned:
-                    # Every attempt begins in a bare worktree. Provision it once, before the
-                    # baseline, then retain those dependencies through candidate/repair gates.
-                    prov_ok, prov_output = run_prov_hooks(
-                        c, self.wt, "attempt", log_on_ok=True)
-                    if not prov_ok:
-                        ok, output = False, f"provisioning failed:\n{prov_output}"
-                    else:
-                        self.worktree_provisioned = True
-                        ok, output = run_gate(self.wt, config)
-                else:
-                    ok, output = run_gate(self.wt, config)
-            except subprocess.TimeoutExpired:
-                ok, output = False, "verification command timed out"
-                Path(config["_gate_log"]).write_text(f"command: {command}\n{output}\n")
-            row = {"command": command, "passed": ok, "log": name,
-                   "seconds": round(time.monotonic() - started, 3), "tail": output}
-            evidence.append(row)
-            mark_progress("verification completed")
-            passed = passed and ok
+        evidence, passed, self.worktree_provisioned = verification.run_gate_commands(
+            c, self.wt, commands, label, self.gate_count, self.evidence.path,
+            self.worktree_provisioned,
+            run_gate=run_gate, run_prov_hooks=run_prov_hooks, mark_progress=mark_progress)
         self.evidence.write(f"gate-{self.gate_count:02d}.json", evidence)
         self.evidence.record("verifying", gate=label, gates=evidence)
         return passed, json.dumps(evidence, indent=2)
