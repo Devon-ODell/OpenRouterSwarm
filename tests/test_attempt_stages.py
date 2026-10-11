@@ -255,6 +255,27 @@ class AttemptStageFaultTests(RepoCase):
         self.assertIn("baseline tests failed", note)
         self.assertEqual(swarmd.failure_class(w.stage, note), "harness")
 
+    def test_baseline_dirty_worktree_also_spends_no_model_calls(self):
+        """The other branch of the baseline return: the gate passes but the test
+        command dirties the worktree (tracked or unignored change). `_attempt`
+        returns 'baseline' before any model call, with the same note wording."""
+        # test_cmd passes but creates a file in its own cwd (the worktree): the
+        # untouched baseline worktree is clean at the gate, then dirty at the
+        # post-gate status check.
+        c = self.cfg(test_cmd="touch dirty.txt && test -f dirty.txt")
+        w = self.worker(c)
+
+        def fake(prompt, cwd, c_, role, *a):
+            raise AssertionError("flint must not be called when the baseline is dirty")
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "baseline")
+        self.assertEqual(w.role_calls, 0)      # no model call was spent
+        self.assertIn("changed tracked/unignored files", note)
+        self.assertEqual(swarmd.failure_class(w.stage, note), "harness")
+
     def test_tests_failed_when_the_candidate_fails_the_gate(self):
         # test_cmd passes on the untouched checkout and fails once the
         # implementer's file exists: the baseline gate is green, the candidate
