@@ -144,5 +144,36 @@ class ReinforceTests(unittest.TestCase):
         self.assertEqual(last.args[1], "w")
 
 
+class OneRunnerPerAttemptTests(unittest.TestCase):
+    """An attempt calls back through its worker dozens of times; it must not rebuild the runner
+    (and re-snapshot every daemon service) on each call."""
+
+    def test_a_whole_attempt_builds_its_services_once(self):
+        from tests.test_attempt_stages import RepoCase, review
+        from unittest.mock import patch
+
+        case = RepoCase("setUp")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                (cwd / "feature.txt").write_text("settings\n")
+                return "done"
+            return review(prompt) if role == "adversary" else "done"
+
+        w = case.worker()
+        built = []
+        real = swarmd._attempt_deps
+        with patch.object(swarmd, "flint", side_effect=fake), \
+                patch.object(swarmd, "_attempt_deps", lambda: built.append(1) or real()):
+            ok, note = w.do_task({"id": "t1", "title": "Add a settings screen",
+                                  "detail": "show the volume slider", "kind": "feature",
+                                  "origin": "human", "acceptance": ["the slider appears"]}, "goal")
+        self.assertTrue(ok, note)
+        self.assertEqual(len(built), 1)
+        self.assertIsNone(getattr(w, "_attempt_runner", None))
+
+
 if __name__ == "__main__":
     unittest.main()

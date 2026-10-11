@@ -115,7 +115,14 @@ class Worker(threading.Thread):
         return c, budget
 
     def do_task(self, task, goal, c=None, attempt_budget=None):
-        outcome = self.runner().run(task, goal, c, attempt_budget)
+        # One runner, and so one snapshot of the daemon's services, for the whole attempt. The
+        # attempt calls back through the worker dozens of times (snapshot, gate, call, ...);
+        # each of those used to rebuild the runner and re-read every daemon global.
+        self._attempt_runner = runner = self.runner()
+        try:
+            outcome = runner.run(task, goal, c, attempt_budget)
+        finally:
+            self._attempt_runner = None
         return outcome.accepted, outcome.note
 
     # -- loop --------------------------------------------------------------
@@ -233,7 +240,8 @@ class Worker(threading.Thread):
 
 def _forward(name):
     def method(self, *args, **kwargs):
-        return getattr(self.runner(), name)(*args, **kwargs)
+        runner = getattr(self, "_attempt_runner", None) or self.runner()
+        return getattr(runner, name)(*args, **kwargs)
     method.__name__ = method.__qualname__ = name
     return method
 
