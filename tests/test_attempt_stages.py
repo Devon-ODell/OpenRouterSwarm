@@ -295,6 +295,37 @@ class AttemptStageFaultTests(RepoCase):
         self.assertEqual(w.stage, "tests_failed")
         self.assertEqual(swarmd.failure_class(w.stage, note), "task")
 
+    def test_tests_failed_exhausts_the_repair_middle(self):
+        """The same gate failure with a repair budget: the candidate fails, the
+        repair role gets a real turn, the repaired candidate still fails, and the
+        attempt returns tests_failed only after the repair budget is exhausted.
+        This is the gate/review/repair middle P0.1 said must be exercised."""
+        c = self.cfg(test_cmd="test ! -f feature.txt", max_repairs=1)
+        w = self.worker(c)
+        repair_turns = []
+
+        def fake(prompt, cwd, c_, role, *a):
+            if role == "implementer":
+                (cwd / "feature.txt").write_text("settings\n")
+                return "done"
+            if role == "repair":
+                repair_turns.append(role)
+                # A repair that does not remove the failing file: the next
+                # candidate fails the gate again, consuming the budget.
+                return "I attempted a repair"
+            return review(prompt)
+
+        with patch.object(swarmd, "flint", side_effect=fake):
+            ok, note = w.do_task(self.task(), "goal")
+        self.assertFalse(ok)
+        self.assertEqual(w.stage, "tests_failed")
+        # The repair role really ran (a flint call beyond the implementer), proving
+        # the repair middle — not just the gate — was driven.
+        self.assertEqual(len(repair_turns), 1)
+        self.assertGreaterEqual(w.role_calls, 2)
+        self.assertIn("repair budget", note)
+        self.assertEqual(swarmd.failure_class(w.stage, note), "task")
+
     def test_rejected_by_the_adversary(self):
         c = self.cfg(max_repairs=0)
         w = self.worker(c)
