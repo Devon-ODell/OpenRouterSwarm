@@ -207,7 +207,9 @@ class Worker(threading.Thread):
                 self.stop.wait(min(600, d.allowance_recheck(c) or 600))
             except ProviderDown as e:
                 self.q.release(task["id"], False, f"provider unavailable: {str(e)[:200]}", defer=30,
-                               failure_class="harness", requests=self.attempt_requests)
+                               failure_class="harness", requests=self.attempt_requests,
+                               turn_seconds=round(max(0, time.time() - (getattr(self, "started", 0) or time.time())), 1),
+                               role_turns=getattr(self, "role_calls", 0) or 0)
                 if self.pick(c=c) is None:
                     # No model can take a turn. Sleep until the first one is back, not blindly.
                     _, until = d.next_wake(self.ledger, c)

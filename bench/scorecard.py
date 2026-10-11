@@ -45,6 +45,10 @@ def score(benchmark):
     for j in journal:
         if j.get("event") == "attempt":
             attempts[j["id"]].append(j)
+        elif j.get("event") == "attempt_deferred":
+            # Stopped by a provider outage or the allowance: requests spent, no verdict.
+            attempts[j["id"]].append({**j, "stage": "deferred", "failure_class": "provider",
+                                      "implementer": j.get("model")})
 
     def family(tid):
         """The task and everything split from it."""
@@ -57,7 +61,8 @@ def score(benchmark):
         rows = [done.get(i) or pending.get(i) for i in ids]
         tries = [a for i in ids for a in attempts[i]]
         root = done.get(meta["id"]) or pending.get(meta["id"]) or {}
-        status = root.get("status") or ("pending" if meta["id"] in pending else "unknown")
+        # Anything still in the queue (fresh, retrying, deferred, held) is unfinished.
+        status = "pending" if meta["id"] in pending else (root.get("status") or "unknown")
         children = [r for r in rows[1:] if r]
         if status == "split" and children:
             status = "landed via split" if all(r.get("status") == "done" for r in children) else \

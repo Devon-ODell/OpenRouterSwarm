@@ -51,6 +51,7 @@ class DeferredRequestsTests(RepoCase):
         row = next(r for r in q.pending() if r["id"] == task["id"])
         self.assertEqual(row["requests_spent"], 8)
         self.assertEqual(row.get("attempts", 0), 0)               # an outage costs no attempt
+        self.assertEqual(row.get("role_turns"), 1)
 
 
 class BackoffIsNotModelTimeTests(RepoCase):
