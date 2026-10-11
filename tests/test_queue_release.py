@@ -173,7 +173,19 @@ class ReleaseBranchTests(ReleaseCase):
         out = q.release(t["id"], False, "every implementer is excluded", park=True,
                         failure_class="harness", stage="model_pool_exhausted")
         self.assertEqual(out["status"], "split")
+        self.assertNotIn("note", out)
+        self.assertNotIn("harness_note", out)
         self.assertEqual([r["status"] for r in swarmd._read(q.done)], ["split"])
+
+    def test_harness_park_keeps_the_reason_without_recording_a_harness_retry(self):
+        q = self.queue(max_depth=0)
+        t = self.add(q)
+        q.claim()
+        out = q.release(t["id"], False, "request budget exhausted", park=True,
+                        failure_class="harness", stage="request_budget")
+        self.assertEqual(out["status"], "parked")
+        self.assertEqual(out["note"], "request budget exhausted")
+        self.assertNotIn("harness_note", out)
 
     def test_park_on_review_format_error(self):
         q = self.queue(max_depth=2)
