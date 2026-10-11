@@ -159,3 +159,77 @@ def sync_trunk(c, *, git, ensure_trunk, locked, worktrees, run_gate_with_prov,
             return "synced"
         finally:
             git(["worktree", "remove", "--force", str(tmp)], cwd=repo)
+
+
+def create_worktree(c, task_id, *, git, ensure_trunk, worktrees):
+    # Every attempt gets its own branch from trunk: never reset a user's
+    # checkout or discard a previous attempt's changes.
+    ensure_trunk(c)
+    name = f"{task_id}-{uuid.uuid4().hex[:8]}"
+    branch = f"swarm/{name}"
+    wt = worktrees() / name
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    git(["worktree", "add", "-b", branch, str(wt), trunk_name(c)],
+        cwd=c["repo"], check=True)
+    return branch, wt
+
+
+def adopt_retained(task, wd, *, take_resume, git, log, journal, worker):
+    """Re-apply work an interrupted attempt left behind, or None.
+
+    The patch is applied to a worktree freshly branched from trunk rather than the old
+    worktree being reused: trunk has moved on, and a stale checkout is a worse starting
+    point than none. If it no longer applies, the attempt simply proceeds as normal — the
+    model writes it again, which is exactly what used to happen every time."""
+    row = take_resume(task["id"])
+    if not row:
+        return None
+    patch = Path(row.get("patch") or "")
+    if not patch.is_file():
+        return None
+    rc, out = git(["apply", "--index", "--whitespace=nowarn", str(patch)], cwd=wd)
+    if rc != 0:
+        log(f"{task['id']}: the retained work no longer applies to trunk; "
+            f"implementing it again ({out.strip()[:160]})", worker)
+        journal("resume_failed", id=task["id"], attempt=row.get("attempt"),
+                reason=out.strip()[:300])
+        git(["reset", "--hard"], cwd=wd)     # leave the worktree exactly as it was
+        return None
+    log(f"{task['id']}: re-applied {row.get('lines', '?')} lines from the interrupted "
+        f"attempt {row.get('attempt')}; verifying rather than rewriting", worker)
+    journal("resumed", id=task["id"], attempt=row.get("attempt"),
+            implementer=row.get("implementer"), lines=row.get("lines"))
+    return row
+
+
+def owns_branch(wt, branch, *, git):
+    rc, ref = git(["symbolic-ref", "-q", "HEAD"], cwd=wt)
+    return rc == 0 and ref == f"refs/heads/{branch}"
+
+
+def snapshot(wt, branch, review_base, *, git, owns_branch, error):
+    if not owns_branch():
+        raise error(f"worker switched away from {branch}")
+    git(["add", "-A"], cwd=wt, check=True)
+    _, tree = git(["write-tree"], cwd=wt, check=True)
+    _, diff = git(["diff", "--cached", "--unified=3", review_base], cwd=wt, check=True)
+    return tree, diff
+
+
+def cleanup(c, wt, branch, stage, task, *, git, owns_branch):
+    """Keep every attempt's work on its branch; remove the worktree if configured."""
+    if not wt or not Path(wt).exists():
+        return
+    repo, t = c["repo"], trunk_name(c)
+    if stage != "accepted" and owns_branch():
+        git(["add", "-A"], cwd=wt)
+        rc, _ = git(["diff", "--cached", "--quiet"], cwd=wt)
+        if rc == 1:
+            git(["commit", "-q", "--no-verify", "-m",
+                 f"swarm (not accepted: {stage}): {task['title']}"], cwd=wt)
+    if c.get("keep_worktrees", True):
+        return
+    git(["worktree", "remove", "--force", str(wt)], cwd=repo)
+    _, ahead = git(["rev-list", "--count", f"{t}..{branch}"], cwd=repo)
+    if ahead == "0":  # landed on trunk, or never produced anything
+        git(["branch", "-D", branch], cwd=repo)

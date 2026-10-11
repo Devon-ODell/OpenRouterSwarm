@@ -2042,47 +2042,16 @@ class Worker(threading.Thread):
         return out
 
     def ensure_worktree(self, task, c=None):
-        # Every attempt gets its own branch from trunk: never reset a user's
-        # checkout or discard a previous attempt's changes.
         c = self._attempt_config(c)
-        ensure_trunk(c)
-        name = f"{task['id']}-{uuid.uuid4().hex[:8]}"
-        self.branch = f"swarm/{name}"
-        self.wt = wt_root() / name
-        self.wt.parent.mkdir(parents=True, exist_ok=True)
-        git(["worktree", "add", "-b", self.branch, str(self.wt), trunk_name(c)],
-            cwd=c["repo"], check=True)
+        self.branch, self.wt = workspace.create_worktree(
+            c, task["id"], git=git, ensure_trunk=ensure_trunk, worktrees=wt_root)
 
     def adopt_retained(self, task, wd):
-        """Re-apply work an interrupted attempt left behind, or None.
-
-        The patch is applied to a worktree freshly branched from trunk rather than the old
-        worktree being reused: trunk has moved on, and a stale checkout is a worse starting
-        point than none. If it no longer applies, the attempt simply proceeds as normal — the
-        model writes it again, which is exactly what used to happen every time."""
-        row = take_resume(task["id"])
-        if not row:
-            return None
-        patch = Path(row.get("patch") or "")
-        if not patch.is_file():
-            return None
-        rc, out = git(["apply", "--index", "--whitespace=nowarn", str(patch)], cwd=wd)
-        if rc != 0:
-            log(f"{task['id']}: the retained work no longer applies to trunk; "
-                f"implementing it again ({out.strip()[:160]})", self.name)
-            journal("resume_failed", id=task["id"], attempt=row.get("attempt"),
-                    reason=out.strip()[:300])
-            git(["reset", "--hard"], cwd=wd)     # leave the worktree exactly as it was
-            return None
-        log(f"{task['id']}: re-applied {row.get('lines', '?')} lines from the interrupted "
-            f"attempt {row.get('attempt')}; verifying rather than rewriting", self.name)
-        journal("resumed", id=task["id"], attempt=row.get("attempt"),
-                implementer=row.get("implementer"), lines=row.get("lines"))
-        return row
+        return workspace.adopt_retained(task, wd, take_resume=take_resume, git=git,
+                                        log=log, journal=journal, worker=self.name)
 
     def own_branch(self):
-        rc, ref = git(["symbolic-ref", "-q", "HEAD"], cwd=self.wt)
-        return rc == 0 and ref == f"refs/heads/{self.branch}"
+        return workspace.owns_branch(self.wt, self.branch, git=git)
 
     # -- one task ----------------------------------------------------------
 
@@ -2196,12 +2165,8 @@ class Worker(threading.Thread):
         return passed, json.dumps(evidence, indent=2)
 
     def snapshot(self):
-        if not self.own_branch():
-            raise ModelError(f"worker switched away from {self.branch}")
-        git(["add", "-A"], cwd=self.wt, check=True)
-        _, tree = git(["write-tree"], cwd=self.wt, check=True)
-        _, diff = git(["diff", "--cached", "--unified=3", self.review_base], cwd=self.wt, check=True)
-        return tree, diff
+        return workspace.snapshot(self.wt, self.branch, self.review_base, git=git,
+                                  owns_branch=self.own_branch, error=ModelError)
 
     def review(self, tree, diff, tests, model, avoid=(), allow_test_changes=False,
                c=None, attempt_budget=None):
@@ -2681,23 +2646,9 @@ class Worker(threading.Thread):
         notify(c, "hung from the rafters", f"{impl}: {what[:120]}")
 
     def _cleanup(self, c=None):
-        """Keep every attempt's work on its branch; remove the worktree if configured."""
         c = self._attempt_config(c)
-        if not self.wt or not Path(self.wt).exists():
-            return
-        repo, t = c["repo"], trunk_name(c)
-        if self.stage != "accepted" and self.own_branch():
-            git(["add", "-A"], cwd=self.wt)
-            rc, _ = git(["diff", "--cached", "--quiet"], cwd=self.wt)
-            if rc == 1:
-                git(["commit", "-q", "--no-verify", "-m",
-                     f"swarm (not accepted: {self.stage}): {self.task['title']}"], cwd=self.wt)
-        if c.get("keep_worktrees", True):
-            return
-        git(["worktree", "remove", "--force", str(self.wt)], cwd=repo)
-        _, ahead = git(["rev-list", "--count", f"{t}..{self.branch}"], cwd=repo)
-        if ahead == "0":  # landed on trunk, or never produced anything
-            git(["branch", "-D", self.branch], cwd=repo)
+        return workspace.cleanup(c, self.wt, self.branch, self.stage, self.task,
+                                 git=git, owns_branch=self.own_branch)
 
     def strand(self, task, how):
         """Park what depends on a task that can no longer finish, and say so loudly."""
