@@ -6,14 +6,25 @@ through an injected AttemptDeps; it imports no daemon module and reads no daemon
 from __future__ import annotations
 
 import datetime as dt
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from learn import CRIME, defect, exhibit, parse_scores
-from prompts import JUDGE, PRIORITIES
-from task_rules import goal_items
-from workflow import path_allowed
+from learn import (BREAKTHROUGH_WEIGHT, CRIME, FAULTY, PENALTY_WEIGHT, defect, exhibit,
+                   is_breakthrough, json_array, novelty, parse_scores, reward, weight)
+from metrics import ACTIVE_MODEL, REVIEWING
+from pacing import effective_steps
+from prompts import DECOMPOSER, JUDGE, PRIORITIES
+from task_rules import failure_class, goal_item_weight, goal_items
+from workflow import REVIEW, parse_review, path_allowed
+
+try:  # one class identity with the daemon's turn errors
+    from .agent_turn import (AgentTimeout, ModelError, ProviderBusy, ProviderDown,
+                             RequestBudget, ReviewFormatError, StepLimit)
+except ImportError:  # pragma: no cover - script mode
+    from agent_turn import (AgentTimeout, ModelError, ProviderBusy, ProviderDown,
+                            RequestBudget, ReviewFormatError, StepLimit)
 
 
 @dataclass(frozen=True)
@@ -25,6 +36,18 @@ class AttemptDeps:
     git: Callable
     trunk_name: Callable
     state: Path            # the repository's state directory
+    flint: Callable       # = flint
+    rest: Callable        # = rest
+    turn_timeout: Callable     # = turn_timeout
+    count_requests: Callable   # = count_requests
+    pool: Callable             # = pool
+    refresh_view: Callable     # = refresh_view
+    read_goal: Callable        # = read_goal
+    read_only_roles: Any       # = READ_ONLY_ROLES
+    kinds: Any                 # = KINDS
+    ran_on: dict               # = _ran_on  (the dict object; mutate/read it in place)
+    run: dict                  # = _run     (the dict object)
+    view_lock: Any             # = _view_lock
 
 
 class AttemptRunner:
@@ -135,3 +158,302 @@ class AttemptRunner:
         _, names = d.git(["diff", "--cached", "--name-only", "--no-renames", "-z", w.review_base],
                          cwd=w.wt, check=True)
         return [p for p in names.split("\0") if p and not path_allowed(p, scope)]
+
+    def call(self, role, prompt, cwd, steps, model, avoid=(), c=None, attempt_budget=None):
+        """One role turn. If the model is busy or down, the turn goes to another model (never
+        one in `avoid`, so nobody grades their own work) instead of abandoning the attempt.
+        A role that edits files is handed over only while it has changed nothing, so partial
+        work is never finished by a different author. self.last_model names the model that
+        took the turn last, whether or not it succeeded."""
+        w, d = self.w, self.d
+        c, attempt_budget = w._attempt_inputs(c, attempt_budget)
+        w.last_model = model
+        w.last_role = role
+        task_cap = max(0, int(c.get("task_request_cap") or 0))
+        run_cap = max(0, int(c.get("run_request_cap") or 0))
+        prior_task_requests = int((w.task or {}).get("requests_spent") or 0)
+        # Turn size comes from measured latency, not configured hope (work order §2):
+        # `effective_steps` caps the round count so a final edit, tests and a final answer
+        # still fit inside the wall-clock timeout. Fast-execution tasks keep their small
+        # budget on top of the request caps.
+        if getattr(w, "execution_class", "standard") != "fast" and role not in d.read_only_roles:
+            steps = effective_steps(role, model, d.turn_timeout(c, role), steps, w.ledger)
+        limits = [int(steps)]
+        if task_cap:
+            limits.append(task_cap - prior_task_requests - d.count_requests(w.name))
+        if run_cap:
+            limits.append(run_cap - int(d.run.get("requests_started", 0)))
+        steps = min(limits)
+        if steps <= 0:
+            scope = ("task" if task_cap and
+                     prior_task_requests + d.count_requests(w.name) >= task_cap else "run")
+            raise RequestBudget(f"{scope} request budget exhausted before {role}")
+        if w.evidence:
+            if w.role_calls >= c.get("max_role_calls", 10):
+                raise ModelError("per-attempt role-call budget exhausted")
+            w.role_calls += 1
+            w.evidence.record(role, role_calls=w.role_calls, active_model=model)
+            w.evidence.write(f"prompt-{w.role_calls:02d}-{role}.txt", prompt)
+        turn_c = dict(c, study=False) if getattr(w, "mit", None) == "off" else c
+        if w.task and w.task.get("allowed_paths"):
+            turn_c = dict(turn_c, _allowed_paths=w.task["allowed_paths"])
+        if getattr(w, "execution_class", "standard") == "fast":
+            turn_c = dict(turn_c, study=False)
+            if role in ("implementer", "repair"):
+                steps = min(steps, 4)
+                turn_c["role_timeouts"] = dict(turn_c.get("role_timeouts", {}), **{role: 300})
+        # Tell the model its effective request and time budget (work order §2). A turn
+        # sized from measured latency is only useful if the model knows the round count it
+        # is measured against and the wall clock it must finish inside.
+        budget_line = (f"\n\nTURN BUDGET: this role gets at most {steps} model round(s) and "
+                       f"{d.turn_timeout(turn_c, role)}s of wall time. Leave time for the final edit, "
+                       f"the tests and your final answer; stop reading early.")
+        prompt = prompt + budget_line
+        w.doing = f"{role} with {model}"
+        w.publish(ACTIVE_MODEL)
+        editing = role not in d.read_only_roles and w.wt is not None and Path(cwd) == Path(w.wt)
+        before = w.snapshot()[0] if editing else None
+        tried = set()
+        while True:
+            w.doing = f"{role} with {model}"
+            try:
+                out = d.flint(prompt, cwd, turn_c, role, w.name, attempt_budget, steps, model)
+                # A paid stand-in may have taken the turn. Credit the model that actually
+                # answered, or the bandit learns from work another model did: a model with
+                # no paid twin would be scored for every turn `paid_stand_in` handed away.
+                ran = d.ran_on.pop(w.name, None)
+                if ran and ran != model:
+                    asked = model
+                    model = w.last_model = ran
+                    w.doing = f"{role} with {ran}"
+                    if w.evidence:
+                        w.evidence.record(role, role_calls=w.role_calls, active_model=ran,
+                                          stood_in_for=asked)
+                break
+            except AgentTimeout as exc:
+                w.last_model = exc.model
+                w.agent_timed_out = True
+                if w.evidence:
+                    w.evidence.record("agent_timeout", role=role, active_model=exc.model,
+                                      timeout=exc.timeout, log=str(exc.logfile))
+                d.log(str(exc), w.name)
+                raise
+            except ProviderDown as e:
+                d.log(d.rest(w.ledger, e), w.name)
+                tried.add(model)
+                if editing and w.snapshot()[0] != before:
+                    raise
+                nxt = w.pick(set(avoid) | tried |
+                             (w.no_review(c) if role == "adversary" else set()),
+                             role=role, c=c)
+                if nxt is None:
+                    raise
+                d.log(f"handing {role} to {nxt}", w.name)
+                d.journal("handoff", role=role, worker=w.name, model=model, to=nxt,
+                          busy=isinstance(e, ProviderBusy))
+                if w.evidence:
+                    w.evidence.record(role, role_calls=w.role_calls, active_model=nxt, handoff_from=model)
+                model = w.last_model = nxt
+        w.ledger.warm(model)
+        if w.evidence:
+            w.evidence.write(f"response-{w.role_calls:02d}-{role}.txt", out)
+        return out
+
+    def review(self, tree, diff, tests, model, avoid=(), allow_test_changes=False,
+               c=None, attempt_budget=None):
+        w, d = self.w, self.d
+        c, attempt_budget = w._attempt_inputs(c, attempt_budget)
+        w.evidence.record("reviewing", reviewed_tree=tree, reviewer=model)
+        w.publish(REVIEWING)
+        note = ("\nThe owner authorised test changes for this task; check that the changes to "
+                "existing tests match what was asked, and reject them if they do not.\n"
+                if allow_test_changes else "")
+        prompt = REVIEW.format(contract=json.dumps(w.contract, indent=2), tree=tree,
+                               tests=tests, diff=diff[:c.get("max_diff", 24000)]) + note
+        prompt += getattr(w, "_review_format_hint", "")
+        try:
+            raw = w.call("adversary", prompt, w.wt, c["steps"]["adversary"], model,
+                         avoid, c=c, attempt_budget=attempt_budget)
+            after, _ = w.snapshot()
+            if after != tree:
+                raise ModelError("reviewer modified the candidate it was asked to inspect")
+            review = parse_review(raw, tree, w.contract["acceptance"])
+        except ValueError as exc:
+            w.evidence.write(f"review-{w.role_calls:02d}-invalid.txt", raw)
+            raise ReviewFormatError(f"invalid review: {exc}") from exc
+        w.evidence.write(f"review-{w.role_calls:02d}.json", review)
+        after, _ = w.snapshot()
+        if after != tree:
+            raise ModelError("reviewer modified the candidate it was asked to inspect")
+        return review
+
+    def reviewed(self, tree, diff, tests, adv, impl, allowed, c=None, attempt_budget=None):
+        """(review, reviewer, error) for this candidate, retrying a reviewer that cannot
+        produce a readable verdict.
+
+        `parse_review` refuses a malformed, stale or unsupported review, and that refusal used
+        to end the attempt: an implementation whose tests had just passed was thrown away
+        because a third model could not emit JSON. A review that cannot be read is a fact
+        about the reviewer, not about the candidate. So the same tree, the same diff and the
+        same test output go to another reviewer, and only a run of reviewers that all fail
+        ends the attempt. It costs the repair budget nothing — no repair is warranted while
+        nothing has yet been said about the code."""
+        w, d = self.w, self.d
+        c, attempt_budget = w._attempt_inputs(c, attempt_budget)
+        tries = max(1, min(3, 1 + int(c.get("max_review_formats", 2))))
+        tried, err = set(), None
+        w._review_format_hint = ""
+        for n in range(tries):
+            try:
+                review = w.review(tree, diff, tests, adv, avoid={impl} | tried,
+                                  allow_test_changes=allowed, c=c,
+                                  attempt_budget=attempt_budget)
+                return review, (w.last_model or adv), None
+            except (ModelError, StepLimit) as exc:
+                ran, err = w.last_model or adv, exc
+                if "modified the candidate" in str(exc):
+                    # Not a formatting slip: the tree this review was about no longer exists,
+                    # so there is nothing left for another reviewer to be asked about.
+                    return None, ran, exc
+                tried.add(ran)
+                w.evidence.record("review_unreadable", reviewer=ran, tried=n + 1,
+                                  reason=str(exc)[:300])
+                nxt = w.pick(tried | {impl} | w.no_review(c), role="adversary", c=c)
+                if n == tries - 1:
+                    return None, ran, exc
+                if nxt is None:
+                    if not isinstance(exc, ReviewFormatError) or ran == impl or ran in w.no_review(c):
+                        return None, ran, exc
+                    nxt = ran  # Same independent reviewer may correct its own JSON, bounded above.
+                    tried.discard(ran)
+                w._review_format_hint = ("\nFORMAT CORRECTION: " + str(exc)
+                    + "\nReinspect the same immutable tree. Return the exact schema above, "
+                      "one evidenced check per criterion, and verification for every finding.\n")
+                d.log(f"reviewer {ran} returned no usable verdict ({str(exc)[:90]}); putting the "
+                      f"same candidate to {nxt}", w.name)
+                adv = nxt
+        return None, adv, err
+
+    def decompose(self, task, goal, avoid=(), c=None, attempt_budget=None):
+        """Split after a timeout or repeated failure, within the recursion limits.
+
+        A split that returns no subtasks strands the task and everything waiting on it, so one
+        empty answer is retried on a different model before the task is given up on."""
+        w, d = self.w, self.d
+        c, attempt_budget = w._attempt_inputs(c, attempt_budget)
+        if c.get("roadmap_file"):
+            return 0  # A coordinator must repoint dependencies before splitting a packet.
+        # Between attempts: not the last attempt's evidence, role-call budget or MIT arm.
+        w.evidence, w.mit = None, None
+        w.execution_class = "standard"
+        model = (w.ledger.pick("planner", d.pool(c, "decomposer"), exclude=set(avoid))
+                 or w.pick(set(avoid), role="decomposer", c=c))
+        if model is None:
+            return 0
+        with d.view_lock:
+            view = d.refresh_view(c)
+            try:
+                out = w.call("decomposer", DECOMPOSER.format(
+                    goal=goal, title=task["title"], detail=task["detail"], test_cmd=c["test_cmd"],
+                    notes="\n---\n".join(task.get("notes", [])) or task.get("note", "")
+                    or task.get("harness_note", "")),
+                    view, c["steps"].get("decomposer", 6), model, c=c,
+                    attempt_budget=attempt_budget)
+            except (StepLimit, ModelError, AgentTimeout) as e:
+                w.ledger.update("planner", model, 0.0)
+                d.log(f"decomposer {model} failed ({type(e).__name__}) on '{task['title']}'", w.name)
+                return w.retry_split(task, goal, model, avoid, f"{type(e).__name__}",
+                                     c, attempt_budget)
+        subtasks = json_array(out)
+        if subtasks is None:
+            w.ledger.update("planner", model, 0.0)
+            subtasks = []
+        added = 0
+        dependencies = list(task.get("depends_on", []))
+        for t in subtasks[:3]:
+            if (not isinstance(t, dict) or not isinstance(t.get("title"), str)
+                    or t.get("kind", "feature") not in d.kinds):
+                break  # Do not enqueue a dependent suffix without its prerequisite.
+            child = w.q.add(t["title"], str(t.get("detail", "")), t.get("kind", "feature"),
+                            persona=task.get("persona"), planner_model=model,
+                            parent=task["id"], priority=max(1, task.get("priority", 1)), origin="split",
+                            depends_on=dependencies, acceptance=t.get("acceptance"),
+                            depth=task.get("depth", 0) + 1)
+            if not child:
+                break
+            added += 1
+            dependencies = [child["id"]]
+        if not added:
+            return w.retry_split(task, goal, model, avoid, "no usable subtasks",
+                                 c, attempt_budget)
+        moved = w.q.repoint(task["id"], dependencies[0])
+        d.log(f"split '{task['title']}' into {added} smaller task(s)"
+              + (f"; {moved} waiting task(s) moved to the last child" if moved else ""), w.name)
+        d.journal("split", id=task["id"], title=task["title"], added=added, model=model, repointed=moved)
+        return added
+
+    def _reinforce(self, task, stage, info, c=None, attempt_budget=None):
+        w, d = self.w, self.d
+        c, attempt_budget = w._attempt_inputs(c, attempt_budget)
+        L, impl = w.ledger, info["implementer"]
+        if stage != "accepted" and failure_class(stage, info.get("note", ""),
+                                                 edited=info.get("edit_calls")) in ("harness", "review_format"):
+            # The model answered; this swarm lost the turn. Scoring it down at penalty weight
+            # teaches the bandit about our step limits, not about the model.
+            d.journal("harness_failure", id=task["id"], title=task["title"], stage=stage,
+                      implementer=impl, edit_calls=info.get("edit_calls"))
+            d.log(f"{task['id']}: {stage} — harness failure, not scored against {impl}", w.name)
+            return
+        scores = info.get("scores")
+        text = f"{task['title']} {task.get('detail', '')}"
+        nov = novelty(text, L.accepted_texts()) if stage == "accepted" else 0.0
+        if stage == "review_error" and info.get("reviewer"):
+            # A reviewer that cannot deliver a verdict wastes the implementer's work.
+            L.update("implementer", info["reviewer"], 0.0, weight=PENALTY_WEIGHT["model_error"])
+            d.log(f"reviewer {info['reviewer']} failed to deliver a verdict; penalised", w.name)
+        items = goal_items(d.read_goal(c))
+        info["goal_item"] = int((scores or {}).get("goal_item") or 0) if items else None
+        r = reward(stage, scores, nov, repairs=info.get("repairs", 0),
+                   goal_weight=goal_item_weight(info["goal_item"], items))
+        if r is None:
+            return
+        # Only the author of faulty code pays the penalty weight; the planner whose
+        # idea it was learns at normal weight. Success pays everyone at full weight.
+        rw = weight(stage)
+        credit = rw if stage == "accepted" else 1.0
+        L.update("implementer", impl, r, weight=rw)
+        if task.get("persona"):
+            L.update("persona", task["persona"], r, weight=credit)
+        if task.get("planner_model"):
+            L.update("planner", task["planner_model"], r, weight=credit)
+        L.credit(info.get("lessons", []), r)
+        breakthrough = False
+        if stage == "accepted":
+            breakthrough = is_breakthrough(r, scores, L.accepted_rewards())
+            L.record_accepted({"id": task["id"], "title": task["title"], "detail": task.get("detail", ""),
+                               "reward": r, "novelty": nov, "scores": scores, "implementer": impl,
+                               "reviewer": info.get("reviewer"), "persona": task.get("persona"),
+                               "origin": task.get("origin", "human"), "breakthrough": breakthrough,
+                               # Work order §3/§16: malformed or missing judge JSON is missing
+                               # evidence, never a neutral assessment.
+                               "quality_score": "unscored" if not scores else None})
+            if scores and scores.get("lesson"):
+                L.add_lesson(scores["lesson"], "lesson", task["id"], r, pinned=breakthrough)
+            if breakthrough:
+                # Reinforce again at full reward: the draw that produced this should come up again.
+                L.update("implementer", impl, 1.0, weight=BREAKTHROUGH_WEIGHT)
+                if task.get("persona"):
+                    L.update("persona", task["persona"], 1.0, weight=BREAKTHROUGH_WEIGHT)
+                w.celebrate(task, r, scores, impl, c)
+            w.follow_up(task, scores, r, breakthrough, c)
+        elif stage in FAULTY:
+            w.hang(task, stage, info, impl, c)
+        elif info.get("pitfall"):
+            L.add_lesson(info["pitfall"], "pitfall", task["id"], 0.5)
+        info["reward"] = r
+        d.journal("reward", id=task["id"], title=task["title"], stage=stage, reward=r, weight=rw,
+                  novelty=nov, implementer=impl, persona=task.get("persona"),
+                  goal_item=info.get("goal_item"),
+                  scores={k: v for k, v in (scores or {}).items() if k != "follow_ups"},
+                  breakthrough=breakthrough)
+        d.log(f"{task['id']}: {stage}, reward {r:.2f}{' ★ BREAKTHROUGH' if breakthrough else ''}", w.name)
