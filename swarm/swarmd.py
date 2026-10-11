@@ -49,6 +49,11 @@ try:  # one class identity for package imports; script mode keeps the historical
 except ImportError:  # pragma: no cover - exercised by bridge.py / direct swarmd.py execution
     from task_queue import (JsonlTaskStore, TaskPolicy, TaskQueue, TaskTransition)  # noqa: E402
 
+try:  # workspace resolves against the same module identity as the daemon
+    from . import workspace
+except ImportError:  # pragma: no cover - exercised by bridge.py / direct swarmd.py execution
+    import workspace
+
 # ------------------------------------------------------------------ P2 extracted leaves
 #
 # prompts / task_rules / context_builder / verification / provisioning hold the code;
@@ -616,7 +621,7 @@ def quota_exhausted(c, budget):
 
 
 def trunk_name(c):
-    return c.get("trunk", "swarm/trunk")
+    return workspace.trunk_name(c)
 
 
 def read_goal(c):
@@ -805,25 +810,12 @@ def drain(tally, stop=True):
 
 
 def sh(cmd, cwd=None, timeout=900, env=None):
-    with process(cmd, cwd=cwd, shell=isinstance(cmd, str),
-                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                 text=True, env=env) as p:
-        try:
-            out, err = p.communicate(timeout=timeout)
-        except BaseException:
-            kill_group(p)
-            p.communicate()
-            raise
-    return p.returncode, (out or "") + (err or "")
+    return workspace.sh(cmd, cwd=cwd, timeout=timeout, env=env,
+                        process=process, kill_group=kill_group)
 
 
 def git(args, cwd, check=False):
-    # Agents can write inside worktrees; never let that reach hooks the supervisor runs.
-    cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args]
-    rc, out = sh(cmd, cwd=cwd, timeout=180, env={**os.environ, **GIT_IDENT})
-    if check and rc != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {out[-500:]}")
-    return rc, out.strip()
+    return workspace.git(args, cwd, check=check, sh=sh, ident=GIT_IDENT)
 
 
 def spend_ledger_paths(c=None):
@@ -1461,8 +1453,7 @@ def run_gate(cwd, c):
 
 @contextmanager
 def trunk_locked():
-    with _trunk_lock, open(STATE / "trunk.lock", "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    with workspace.trunk_locked(thread_lock=_trunk_lock, state=STATE):
         yield
 
 
@@ -1536,37 +1527,15 @@ def run_gate_with_prov(c, wd, label):
 
 
 def ensure_trunk(c):
-    t = trunk_name(c)
-    with trunk_locked():
-        rc, _ = git(["rev-parse", "--verify", "-q", f"refs/heads/{t}"], cwd=c["repo"])
-        if rc != 0:
-            git(["branch", t, c.get("base_branch", "main")], cwd=c["repo"], check=True)
-            log(f"created {t} from {c.get('base_branch', 'main')}")
+    return workspace.ensure_trunk(c, git=git, locked=trunk_locked, log=log)
 
 
 def checked_out_at(c, branch):
-    _, out = git(["worktree", "list", "--porcelain"], cwd=c["repo"])
-    path = None
-    for line in out.splitlines():
-        if line.startswith("worktree "):
-            path = line[len("worktree "):]
-        elif line == f"branch refs/heads/{branch}":
-            return path
-    return None
+    return workspace.checked_out_at(c, branch, git=git)
 
 
 def refresh_view(c):
-    """A detached, read-only checkout of trunk for the planner and decomposer."""
-    ensure_trunk(c)
-    view = wt_root() / "_view"
-    if (view / ".git").exists():
-        git(["checkout", "-q", "--detach", "-f", trunk_name(c)], cwd=view, check=True)
-        git(["clean", "-fdq"], cwd=view)
-    else:
-        git(["worktree", "prune"], cwd=c["repo"])
-        view.parent.mkdir(parents=True, exist_ok=True)
-        git(["worktree", "add", "--detach", str(view), trunk_name(c)], cwd=c["repo"], check=True)
-    return view
+    return workspace.refresh_view(c, git=git, ensure_trunk=ensure_trunk, worktrees=wt_root)
 
 
 def refresh_view_prov(c):
@@ -1582,8 +1551,7 @@ def refresh_view_prov(c):
 
 
 def sync_refresh_view(c):
-    """The reader for sync_trunk; never needs provisioning (deps cannot affect a merge)."""
-    return refresh_view(c)
+    return workspace.sync_refresh_view(c, refresh_view=refresh_view)
 
 
 def sync_trunk(c):
