@@ -41,6 +41,8 @@ from workflow import Attempt, STRATEGIES, REVIEW, contract, criteria, parse_revi
 import sandbox                          # noqa: E402
 import swallow                          # noqa: E402
 from workflow import validate_scope, path_allowed
+from runtime_context import (RepoPaths, ConfigSnapshot, RunState, EventSink,  # noqa: E402
+                             ProcessRegistry, RuntimeContext)
 
 # ------------------------------------------------------------------ P2 extracted leaves
 #
@@ -371,13 +373,53 @@ def python_for(c):
 
 
 def use_repo(c):
-    """Queue, lessons, logs and worktrees are kept per target repository."""
+    """Queue, lessons, logs and worktrees are kept per target repository.
+
+    Builds and returns a ``RuntimeContext`` for this repository and continues to populate
+    the module compatibility globals (``STATE``/``LOGS``/``SLUG``) so every existing
+    caller and test keeps reading the same paths it always did. New modules take the
+    returned context explicitly; the globals are retired one caller at a time in later
+    packets (P5, DECOMPOSE-SWARMD.md).
+
+    Race-safety: every path is computed into locals first and the context is built from
+    those locals before the compatibility globals are assigned, so ``_build_context``
+    never re-reads the globals and two simultaneous ``use_repo`` calls cannot return
+    contexts with mixed paths.
+    """
     global STATE, LOGS, SLUG
-    SLUG = repo_slug(c["repo"])
-    STATE = HERE / "state" / SLUG
-    LOGS = HERE / "logs" / SLUG
-    STATE.mkdir(parents=True, exist_ok=True)
-    LOGS.mkdir(parents=True, exist_ok=True)
+    slug = repo_slug(c["repo"])
+    state = HERE / "state" / slug
+    logs = HERE / "logs" / slug
+    state.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    context = _build_context(c, slug, state, logs)
+    SLUG, STATE, LOGS = slug, state, logs
+    return context
+
+
+def _build_context(c, slug, state, logs):
+    """Assemble the per-repository RuntimeContext for a config dict and pre-computed
+    repo paths.
+
+    Takes ``slug``/``state``/``logs`` explicitly (never the module globals) so the
+    returned context is exactly the repository ``use_repo`` was called for, even when
+    another thread rebinds the globals between the call and the build. P3 intentionally
+    stops at construction: no attempt runs on it yet, so it does not re-read or own the
+    mutable config, and it does not apply a saved ``run.json``.
+    """
+    run_state = RunState()
+    stop = threading.Event()
+    paths = RepoPaths(
+        repo=Path(c["repo"]).expanduser().resolve(),
+        state=state, logs=logs, worktrees=HERE / "wt" / slug,
+        config=config_path_for(c["repo"]), slug=slug)
+    return RuntimeContext(
+        paths=paths,
+        config=ConfigSnapshot(values=dict(c), mtime=config_mtime()),
+        events=EventSink(paths, run_state),
+        run_state=run_state,
+        processes=ProcessRegistry(stop=stop),
+        stop=stop)
 
 
 def wt_root():
