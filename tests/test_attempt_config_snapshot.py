@@ -120,7 +120,11 @@ class AttemptConfigSnapshotTests(unittest.TestCase):
         boundary = {"__init__", "_attempt_config", "_attempt_inputs", "run"}
         forbidden_calls = {"cfg", "load_cfg", "watch_config", "config_mtime"}
         violations = []
-        for method in (n for n in tree.body if isinstance(n, ast.FunctionDef)):
+        # getsource() of a class parses to a module holding one ClassDef; its methods are in
+        # that node's body. Iterating tree.body here once checked no method at all.
+        methods = [n for n in tree.body[0].body if isinstance(n, ast.FunctionDef)]
+        self.assertGreater(len(methods), 3)
+        for method in methods:
             if method.name in boundary:
                 continue
             for node in ast.walk(method):
@@ -132,6 +136,32 @@ class AttemptConfigSnapshotTests(unittest.TestCase):
                 if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                         and node.func.id in forbidden_calls):
                     violations.append(f"{method.name}: {node.func.id}()")
+        self.assertEqual(violations, [])
+
+    def test_attempt_runner_cannot_reach_the_live_config_or_reload_it(self):
+        """The attempt helpers moved into AttemptRunner (P9), where the worker is `w` and
+        daemon services are `d.<name>`. The same boundary has to hold there, or the guard
+        above passes only because the code it was guarding has left the Worker."""
+        from swarm import attempt_runner
+        tree = ast.parse(textwrap.dedent(inspect.getsource(attempt_runner.AttemptRunner)))
+        forbidden_calls = {"cfg", "load_cfg", "watch_config", "config_mtime"}
+        violations = []
+        methods = [n for n in tree.body[0].body if isinstance(n, ast.FunctionDef)]
+        self.assertGreater(len(methods), 10)
+        for method in methods:
+            for node in ast.walk(method):
+                if (isinstance(node, ast.Attribute)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id == "w"
+                        and node.attr in {"c", "budget"}):
+                    violations.append(f"{method.name}: w.{node.attr}")
+                if isinstance(node, ast.Call):
+                    name = (node.func.id if isinstance(node.func, ast.Name) else
+                            node.func.attr if isinstance(node.func, ast.Attribute)
+                            and isinstance(node.func.value, ast.Name)
+                            and node.func.value.id == "d" else None)
+                    if name in forbidden_calls:
+                        violations.append(f"{method.name}: {name}()")
         self.assertEqual(violations, [])
 
 
