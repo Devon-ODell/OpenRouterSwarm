@@ -550,7 +550,7 @@ def queue_row(t, rows, full=False):
            "harness_failures": t.get("harness_failures", 0),
            "blocks": [{"id": r["id"], "title": r["title"]} for r in swarmd.Queue.blocked_by(t["id"], rows)],
            "scope_gap": swarmd.scope_gap(t),
-           "evidence": next((str(p / "HANDOFF.md") for p, _ in swarmd.attempts_for(t["id"])
+           "evidence": next((str(p / "HANDOFF.md") for p, _ in app().attempts(t["id"])
                              if (p / "HANDOFF.md").is_file()), None),
            "note": (t.get("notes") or [t.get("note")] or [None])[-1]}
     row["detail"] = detail if full else detail[:400]
@@ -561,8 +561,7 @@ def queue_row(t, rows, full=False):
 def _queue(repo):
     """(config, queue) for a repository, with per-repo state selected."""
     c = config_for(repo)
-    swarmd.use_repo(c)
-    return c, swarmd.Queue(c.get("max_depth", 1), c.get("max_queue", 20))
+    return c, SwarmApplication.for_config(c, daemon=swarmd).queue()
 
 
 def cmd_queue_get(a):
@@ -621,10 +620,10 @@ def cmd_queue_requeue(a):
 def cmd_import_bugs(a):
     """Turn new player bug reports into queued tasks."""
     c = config_for(a.repo)
-    swarmd.use_repo(c)
-    q = swarmd.Queue(c.get("max_depth", 1), c.get("max_queue", 20))
+    facade = SwarmApplication.for_config(c, daemon=swarmd)
+    q = facade.queue()
     try:
-        added = swarmd.import_bugs(c, q, path=a.file, limit=a.limit or 5)
+        added = facade.import_bugs(q, path=a.file, limit=a.limit or 5)
     except OSError as e:
         emit({"ok": False, "error": f"could not read the reports: {e}"})
         return 2
@@ -637,20 +636,19 @@ def cmd_import_bugs(a):
 def cmd_landed(a):
     """The swarm's own trunk commits, newest first, with model, reward and goal item."""
     c = config_for(a.repo)
-    swarmd.use_repo(c)
+    facade = SwarmApplication.for_config(c, daemon=swarmd)
     emit({"ok": True, "repo": c["repo"], "trunk": swarmd.trunk_name(c),
-          "commits": swarmd.landed_commits(c, a.limit or 20)})
+          "commits": facade.landed(a.limit or 20)})
     return 0
 
 
 def cmd_parked(a):
     """Tasks the swarm gave up on, and whose failure each was."""
     c = config_for(a.repo)
-    swarmd.use_repo(c)
-    last = {j["id"]: j for j in app().read_jsonl(app().state_dir / "journal.jsonl")
-            if j["event"] == "task"}
+    facade = SwarmApplication.for_config(c, daemon=swarmd)
+    last = {j["id"]: j for j in facade.journal() if j["event"] == "task"}
     rows = []
-    for d in reversed(app().read_jsonl(app().state_dir / "done.jsonl")):
+    for d in reversed(facade.done()):
         if d.get("status") not in ("parked", "split") or d.get("dismissed_at"):
             continue
         j = last.get(d["id"], {})
@@ -855,8 +853,8 @@ def _log_age():
 
 def cmd_status(a):
     c = config_for(a.repo)
-    swarmd.use_repo(c)
-    q = swarmd.queue_for(c)
+    facade = SwarmApplication.for_config(c, daemon=swarmd)
+    q = facade.queue()
     pending = q.pending()
     done = app().read_jsonl(q.done)
     ahead = None
@@ -873,7 +871,7 @@ def cmd_status(a):
     except (OSError, ValueError):
         run = None
     emit({"repo": c["repo"], "is_target": is_target(c["repo"]), "daemon_running": daemon_running(),
-          "now": swarmd.read_now(), "health": swarmd.health(24),
+          "now": facade.now(), "health": facade.health(24),
           "run": run,
           "config_path": str(app().config_path), "config_kind": swarmd.config_kind(),
           "config_warnings": swarmd.config_warnings(c),
@@ -886,9 +884,9 @@ def cmd_status(a):
           "trunk": swarmd.trunk_name(c), "trunk_ahead": int(ahead) if str(ahead or "").isdigit() else None,
           # A roadmap run whose packets are all held looks exactly like an idle one from the
           # queue alone. The report says which packet is held, why, and what releases it.
-          "roadmap": swarmd.read_roadmap() if c.get("roadmap_file") else None,
+          "roadmap": facade.roadmap() if c.get("roadmap_file") else None,
           # Spare-time work: what it last found, and what is standing it down right now.
-          "idle": swarmd.idle_state(),
+          "idle": facade.idle(),
           "queue": [queue_row(t, pending) for t in pending],
           "max_queue": c.get("max_queue", 20),
           "kinds": list(swarmd.KINDS),
@@ -907,7 +905,7 @@ def cmd_status(a):
 
 def cmd_task(a):
     c = config_for(a.repo)
-    swarmd.use_repo(c)
+    facade = SwarmApplication.for_config(c, daemon=swarmd)
     where, code = selection_context(c["repo"], a.file, a.start, a.end, a.selection_file)
     want = (a.detail or a.title).strip()
     detail = want
@@ -920,7 +918,7 @@ def cmd_task(a):
     # a parked task. A question typed into an editor is exactly the kind of request that
     # reaches an implementer with nothing in it to aim at.
     gap = swarmd.scope_gap(draft, c)
-    q = swarmd.Queue(c.get("max_depth", 1), c.get("max_queue", 20))
+    q = facade.queue()
     if a.preview:
         pending = q.pending()
         seen = {r["title"].strip().lower() for r in pending + app().read_jsonl(q.done)}
@@ -949,9 +947,9 @@ def cmd_evidence(a):
     `attempts/<task id>-*` and the daemon wrote `attempts/<worker>`, overwriting it on the
     next task. Both ends now agree, and this is what the link opens."""
     c = config_for(a.repo)
-    swarmd.use_repo(c)
+    facade = SwarmApplication.for_config(c, daemon=swarmd)
     rows = []
-    for path, data in swarmd.attempts_for(a.id):
+    for path, data in facade.attempts(a.id):
         files = sorted(f.name for f in path.iterdir() if f.is_file()) if path.is_dir() else []
         rows.append({
             "attempt": data.get("id") or path.name, "dir": str(path),
@@ -975,9 +973,9 @@ def cmd_study(a):
 
 def cmd_report(a):
     c = config_for(a.repo)
-    swarmd.use_repo(c)
+    facade = SwarmApplication.for_config(c, daemon=swarmd)
     try:
-        text = swarmd.build_report(c, a.hours)
+        text = facade.report(a.hours)
     except Exception as e:
         emit({"ok": False, "error": f"{type(e).__name__}: {e}"})
         return 2
@@ -1200,9 +1198,9 @@ def cmd_activity(a):
     never has to know it; it asks by repo and the bridge finds the log.
     """
     c = config_for(a.repo)
-    swarmd.use_repo(c)
+    facade = SwarmApplication.for_config(c, daemon=swarmd)
     day = a.day or dt.date.today().isoformat()
-    path = app().log_path(day)
+    path = facade.log_path(day)
     out = {"repo": c["repo"], "day": day, "path": str(path), "exists": path.exists(),
            "daemon_running": daemon_running(), "lines": [], "offset": 0, "stale_seconds": None}
     if not path.exists():
@@ -1260,9 +1258,9 @@ def cmd_stop(a):
         emit({"ok": False, "error": "stop needs --repo, or --all to stop every swarm on this machine"})
         return 2
     c = config_for(a.repo)
-    swarmd.use_repo(c)
+    facade = SwarmApplication.for_config(c, daemon=swarmd)
     repo = str(Path(c["repo"]).expanduser().resolve())
-    note = swarmd.daemon_note()          # None once the process that wrote it is gone
+    note = facade.daemon_note()          # None once the process that wrote it is gone
     if not note:
         emit({"ok": True, "repo": repo, "stopped": [],
               "reason": "no swarm daemon is running on this repository"})

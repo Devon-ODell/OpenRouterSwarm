@@ -28,6 +28,11 @@ class SwarmApplication:
             resolved = str(Path(repo).expanduser().resolve())
             if c.get("repo") != resolved:
                 c = dict(c, repo=resolved)
+        return cls.for_config(c, daemon=daemon)
+
+    @classmethod
+    def for_config(cls, c, *, daemon):
+        """Front the repository an already-resolved config names (the bridge's config_for)."""
         daemon.use_repo(c)
         return cls(daemon, c)
 
@@ -87,3 +92,34 @@ class SwarmApplication:
 
     def report(self, hours=24):
         return self._daemon.build_report(self._config(), hours)
+
+    # -- the selected repository's records ------------------------------
+    def queue(self):
+        """The repository's queue, with every recursion and capacity limit from its config."""
+        return self._daemon.queue_for(self._config())
+
+    def landed(self, limit=20):
+        return self._daemon.landed_commits(self._config(), limit)
+
+    def attempts(self, task_id):
+        """(path, record) for each retained attempt at `task_id`, newest first."""
+        return self._daemon.attempts_for(task_id)
+
+    def health(self, hours=24):
+        return self._daemon.health(hours)
+
+    def now(self):
+        return self._daemon.read_now()
+
+    def idle(self):
+        return self._daemon.idle_state()
+
+    def roadmap(self):
+        return self._daemon.read_roadmap()
+
+    def daemon_note(self):
+        """The running daemon's pid note for this repository, or None."""
+        return self._daemon.daemon_note()
+
+    def import_bugs(self, queue, path=None, limit=5):
+        return self._daemon.import_bugs(self._config(), queue, path=path, limit=limit)

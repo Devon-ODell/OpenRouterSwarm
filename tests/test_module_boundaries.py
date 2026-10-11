@@ -186,3 +186,23 @@ class ModuleBoundaryTests(unittest.TestCase):
             seen[mod] = layers[0]
         self.assertEqual(set(seen), set(ALL_SWARM_MODULES),
                          "some swarm module has no layer assignment")
+
+
+class BridgeFacadeTests(unittest.TestCase):
+    """The bridge selects repositories and reads their records through SwarmApplication. Pure
+    helpers (trunk_name, scope_gap, KINDS, ...) may still be called on the daemon module."""
+
+    STATEFUL = {"use_repo", "Queue", "queue_for", "attempts_for", "landed_commits", "health",
+                "read_now", "idle_state", "read_roadmap", "daemon_note", "import_bugs",
+                "build_report", "_read", "STATE", "LOGS", "CONFIG"}
+
+    def test_bridge_reaches_daemon_state_only_through_the_facade(self):
+        tree = ast.parse((SWARM / "bridge.py").read_text())
+        # Queue.blocked_by is a pure static helper over rows the caller already holds.
+        pure = {id(n.value) for n in ast.walk(tree)
+                if isinstance(n, ast.Attribute) and n.attr == "blocked_by"}
+        hits = sorted({f"swarmd.{n.attr} (line {n.lineno})" for n in ast.walk(tree)
+                       if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                       and n.value.id == "swarmd" and n.attr in self.STATEFUL
+                       and id(n) not in pure})
+        self.assertEqual(hits, [])
