@@ -336,6 +336,67 @@ def start(c, hours=None, max_tasks=None, awake=False, *, d):
             d.log("stopped. `swarm report` summarises the run.")
 
 
+class Periodic:
+    """A job the supervisor runs at most once per `interval` seconds.
+
+    `due()` answers and, when it says yes, records the run, exactly like the
+    `if time.time() - last > interval: last = time.time()` pairs it replaces."""
+
+    def __init__(self, interval, last=0.0):
+        self.interval, self.last = interval, last
+
+    def due(self):
+        if time.time() - self.last > self.interval:
+            self.last = time.time()
+            return True
+        return False
+
+
+class PlannerCadence:
+    """When the planner may run next: a cooldown that doubles while planning comes back
+    empty (capped at 16x), a quick redraw after a botched plan, and back-off after four."""
+
+    def __init__(self):
+        self.last_plan, self.dry_runs, self.plan_fails = 0.0, 0, 0
+
+    def tick(self, c, q, budget, ledger, stop, *, d):
+        cooldown = c.get("plan_cooldown", 600) * (2 ** min(self.dry_runs, 4))
+        if (c.get("auto_plan", True) and not c.get("roadmap_file") and len(q.ready()) < c["workers"] and time.time() - self.last_plan > cooldown
+                and d.can_take_a_turn(c, budget)):
+            self.last_plan = time.time()
+            try:
+                d.sync_trunk(c)
+                added = d.plan(c, q, budget, c.get("plan_batch", 5), ledger)
+                self.plan_fails = 0
+                self.dry_runs = 0 if added else self.dry_runs + 1
+                if not added:
+                    d.log(f"planner added nothing — next attempt in "
+                        f"{c.get('plan_cooldown', 600) * 2 ** min(self.dry_runs, 4) / 60:.0f}m")
+            except (StepLimit, ModelError) as e:
+                # A botched plan says nothing about whether work remains: redraw a
+                # (now less likely) model soon, and back off only on a losing streak.
+                self.plan_fails += 1
+                if self.plan_fails < 4:
+                    self.last_plan = time.time() - cooldown + 60
+                    d.log(f"planner failed ({type(e).__name__}: {str(e).splitlines()[0][:120]}); "
+                        "redrawing in 1m")
+                else:
+                    self.plan_fails, self.dry_runs = 0, self.dry_runs + 1
+                    d.log("planner failed 4 times in a row; backing off")
+            except CapReached:
+                d.log("cap reached while planning — sleeping")
+                stop.wait(60)
+            except ProviderDown as e:
+                d.log(f"planner: {d.rest(ledger, e)}; redrawing another model")
+                self.last_plan = 0.0
+            except NoCredits as e:
+                d.log(f"out of credits: {e}")
+                d.shutdown()
+            except Exception as e:
+                d.log(f"planner error: {e}")
+                self.dry_runs += 1
+
+
 def run_daemon(c, max_tasks=None, hours=None, *, d):
     repo = Path(c["repo"])
     budget = Budget(cap=c.get("daily_cap"), reserve=c.get("reserve", 10),
@@ -374,8 +435,8 @@ def run_daemon(c, max_tasks=None, hours=None, *, d):
     workers = [d.worker_cls(i, c, q, budget, stop, ledger, tally) for i in range(c["workers"])]
     for w in workers:
         w.start()
-    last_plan, last_sync, last_beat, dry_runs, plan_fails = 0.0, time.time(), time.time(), 0, 0
-    last_bugs = 0.0
+    usage, bugs, beat = Periodic(900, last=time.time()), Periodic(300), Periodic(3600, last=time.time())
+    cadence = PlannerCadence()
     said = {}
     try:
         while not stop.is_set():
@@ -422,11 +483,9 @@ def run_daemon(c, max_tasks=None, hours=None, *, d):
                         "task(s) in flight, then restarting into it")
                     d.journal("source_changed", changed=changed)
                     d.drain(tally, stop=False)
-            if time.time() - last_sync > 900:
-                last_sync = time.time()
+            if usage.due():
                 d.sync_usage(d.account())
-            if time.time() - last_bugs > 300:
-                last_bugs = time.time()
+            if bugs.due():
                 try:
                     new = [] if c.get("roadmap_file") else d.import_bugs(c, q)
                     if new:
@@ -436,51 +495,16 @@ def run_daemon(c, max_tasks=None, hours=None, *, d):
                     d.log(f"could not read the bug reports: {type(e).__name__}: {e}")
             d.report_progress(workers, said)
             d.write_now(workers, c)
-            if time.time() - last_beat > 3600:
-                last_beat = time.time()
+            if beat.due():
                 d.log(f"heartbeat {json.dumps(budget.snapshot())}")
             # Planning costs requests like anything else, so it is rate-limited
             # and backs off when it stops producing new work.
-            cooldown = c.get("plan_cooldown", 600) * (2 ** min(dry_runs, 4))
             if c.get("roadmap_file"):
                 try:
                     d.dispatch_roadmap(c, q)
                 except Exception as exc:
                     d.log(f"roadmap dispatch blocked: {exc}")
-            if (c.get("auto_plan", True) and not c.get("roadmap_file") and len(q.ready()) < c["workers"] and time.time() - last_plan > cooldown
-                    and d.can_take_a_turn(c, budget)):
-                last_plan = time.time()
-                try:
-                    d.sync_trunk(c)
-                    added = d.plan(c, q, budget, c.get("plan_batch", 5), ledger)
-                    plan_fails = 0
-                    dry_runs = 0 if added else dry_runs + 1
-                    if not added:
-                        d.log(f"planner added nothing — next attempt in "
-                            f"{c.get('plan_cooldown', 600) * 2 ** min(dry_runs, 4) / 60:.0f}m")
-                except (StepLimit, ModelError) as e:
-                    # A botched plan says nothing about whether work remains: redraw a
-                    # (now less likely) model soon, and back off only on a losing streak.
-                    plan_fails += 1
-                    if plan_fails < 4:
-                        last_plan = time.time() - cooldown + 60
-                        d.log(f"planner failed ({type(e).__name__}: {str(e).splitlines()[0][:120]}); "
-                            "redrawing in 1m")
-                    else:
-                        plan_fails, dry_runs = 0, dry_runs + 1
-                        d.log("planner failed 4 times in a row; backing off")
-                except CapReached:
-                    d.log("cap reached while planning — sleeping")
-                    stop.wait(60)
-                except ProviderDown as e:
-                    d.log(f"planner: {d.rest(ledger, e)}; redrawing another model")
-                    last_plan = 0.0
-                except NoCredits as e:
-                    d.log(f"out of credits: {e}")
-                    d.shutdown()
-                except Exception as e:
-                    d.log(f"planner error: {e}")
-                    dry_runs += 1
+            cadence.tick(c, q, budget, ledger, stop, d=d)
             # Last, and only into genuinely empty time: `idle_ready` stands this down for any
             # assigned work, anything in flight, any held roadmap packet, and the last half
             # hour of the shift. It spends the same allowance as every other turn.
