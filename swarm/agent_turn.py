@@ -6,6 +6,7 @@ reads its globals.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import random
 from pathlib import Path
 
@@ -197,3 +198,88 @@ class RequestBudget(RuntimeError):
 
 class ModelPoolExhausted(RuntimeError):
     """Every model in the pool is asleep or has failed enough times this run (work order §2)."""
+
+
+def read_charges(path, role, worker, model, *, journal, count_usd):
+    """Bank what a finished turn was charged, one `charge` row each, and return the total."""
+    total = 0.0
+    try:
+        rows = [json.loads(l) for l in Path(path).read_text().splitlines() if l.strip()]
+    except (OSError, ValueError):
+        return 0.0
+    for row in rows:
+        usd = round(float(row.get("usd") or 0.0), 6)
+        total = round(total + usd, 6)
+        journal("charge", role=role, worker=worker, model=row.get("model") or model, usd=usd)
+    if total:
+        count_usd(worker, total)
+    Path(path).unlink(missing_ok=True)
+    return total
+
+
+def route_to_paid(c, role, worker, model, why, *, paid_stand_in, spend_left, spend_phrase,
+                  spend_used, spend_window, log, journal, ran_on):
+    """Swap in a paid stand-in for this turn, or None when none is reachable or affordable."""
+    alt = paid_stand_in(c, model)
+    if not alt:
+        return None
+    left = spend_left(c)
+    log(f"{role}: {why} — routing this turn to paid {alt}; its cost is booked from "
+        "OpenRouter's reported charge"
+        + (f" ({spend_phrase(c)})" if left is not None else ""), worker)
+    journal("paid_fallback", role=role, worker=worker, model=model, to=alt,
+            recorded_spend_usd=round(spend_used(c), 6), spend_window=spend_window(c),
+            charge_confirmed=False, reason=why)
+    ran_on[worker] = alt
+    return alt
+
+
+def pick_model(ledger, c, exclude=(), role="implementer", *, pool, paid_pool, spend_left):
+    """Implementers by Thompson sampling. Reviewers and judges come from the
+    same posterior, excluding the implementer so nobody grades their own work.
+
+    `role` is the job this model is being drawn for, so `role_models` can keep a model
+    out of the roles it is bad at while leaving it in the ones it is good at. The
+    posterior is still the implementer's: one model's record is one record.
+
+    When every free model is resting, a paid stand-in keeps the attempt alive rather
+    than abandoning work already done — but only while the day's budget allows."""
+    m = ledger.pick("implementer", pool(c, role), exclude=exclude)
+    if m is not None:
+        return m
+    left = spend_left(c)
+    if left is not None and left <= 0:
+        return None
+    return next((p for p in paid_pool(c) if p not in set(exclude)), None)
+
+
+def excluded_models(task, role=None, *, now):
+    """Models the task/model circuit breaker has excluded from `role` on this task.
+
+    One timeout, incomplete response, length termination or no-edit exhaustion on a task
+    excludes that model from that task/role for the rest of the run or 24 hours (work
+    order §5). A provider-busy handoff before any edit stays cheap and does not poison
+    the pairing, so those failures are not recorded as exclusions. A harness timeout is
+    still an exclusion: the pairing demonstrably cannot deliver inside the budget, so the
+    next implementation attempt must use another model.
+    """
+    out = set()
+    for f in (task or {}).get("failed_models", []):
+        if not isinstance(f, dict):
+            continue
+        cls = f.get("class") or ""
+        at = f.get("at") or 0
+        if now - at > 24 * 3600:
+            continue
+        if role and f.get("role") not in (None, role):
+            continue
+        note = str(f.get("note") or "")
+        no_edit_exhaustion = ("timeout" in note.lower() or "timed out" in note.lower()
+                              or "70%" in note or "without editing" in note)
+        if cls in ("provider_busy", "review_format") or (cls == "harness" and not no_edit_exhaustion):
+            # A provider-busy handoff before edits is cheap and the pairing stays usable;
+            # a review-format failure is a fact about the reviewer's JSON; an ordinary
+            # harness loss (restart, sandbox) says nothing about the model.
+            continue
+        out.add(f.get("model"))
+    return out

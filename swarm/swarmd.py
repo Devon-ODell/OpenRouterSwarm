@@ -931,35 +931,17 @@ def all_resting(ledger, c):
 
 def read_charges(path, role, worker, model):
     """Bank what a finished turn was charged, one `charge` row each, and return the total."""
-    total = 0.0
-    try:
-        rows = [json.loads(l) for l in Path(path).read_text().splitlines() if l.strip()]
-    except (OSError, ValueError):
-        return 0.0
-    for row in rows:
-        usd = round(float(row.get("usd") or 0.0), 6)
-        total = round(total + usd, 6)
-        journal("charge", role=role, worker=worker, model=row.get("model") or model, usd=usd)
-    if total:
-        count_usd(worker, total)
-    Path(path).unlink(missing_ok=True)
-    return total
+    return agent_turn.read_charges(path, role, worker, model,
+                                   journal=journal, count_usd=count_usd)
 
 
 def route_to_paid(c, role, worker, model, why):
     """Swap in a paid stand-in for this turn, or None when none is reachable or affordable."""
-    alt = paid_stand_in(c, model)
-    if not alt:
-        return None
-    left = spend_left(c)
-    log(f"{role}: {why} — routing this turn to paid {alt}; its cost is booked from "
-        "OpenRouter's reported charge"
-        + (f" ({spend_phrase(c)})" if left is not None else ""), worker)
-    journal("paid_fallback", role=role, worker=worker, model=model, to=alt,
-            recorded_spend_usd=round(spend_used(c), 6), spend_window=spend_window(c),
-            charge_confirmed=False, reason=why)
-    _ran_on[worker] = alt
-    return alt
+    return agent_turn.route_to_paid(
+        c, role, worker, model, why,
+        paid_stand_in=paid_stand_in, spend_left=spend_left, spend_phrase=spend_phrase,
+        spend_used=spend_used, spend_window=spend_window, log=log, journal=journal,
+        ran_on=_ran_on)
 
 
 def flint(prompt, cwd, c, role, worker, budget, max_steps, model=None):
@@ -1688,13 +1670,8 @@ class Worker(threading.Thread):
         When every free model is resting, a paid stand-in keeps the attempt alive rather
         than abandoning work already done — but only while the day's budget allows."""
         c = self._attempt_config(c)
-        m = self.ledger.pick("implementer", pool(c, role), exclude=exclude)
-        if m is not None:
-            return m
-        left = spend_left(c)
-        if left is not None and left <= 0:
-            return None
-        return next((p for p in paid_pool(c) if p not in set(exclude)), None)
+        return agent_turn.pick_model(self.ledger, c, exclude, role,
+                                     pool=pool, paid_pool=paid_pool, spend_left=spend_left)
 
     def select_implementer(self, failed, c=None):
         """An implementer for this attempt, or None when none is usable.
@@ -1721,27 +1698,7 @@ class Worker(threading.Thread):
         still an exclusion: the pairing demonstrably cannot deliver inside the budget, so the
         next implementation attempt must use another model.
         """
-        now = time.time()
-        out = set()
-        for f in (self.task or {}).get("failed_models", []):
-            if not isinstance(f, dict):
-                continue
-            cls = f.get("class") or ""
-            at = f.get("at") or 0
-            if now - at > 24 * 3600:
-                continue
-            if role and f.get("role") not in (None, role):
-                continue
-            note = str(f.get("note") or "")
-            no_edit_exhaustion = ("timeout" in note.lower() or "timed out" in note.lower()
-                                  or "70%" in note or "without editing" in note)
-            if cls in ("provider_busy", "review_format") or (cls == "harness" and not no_edit_exhaustion):
-                # A provider-busy handoff before edits is cheap and the pairing stays usable;
-                # a review-format failure is a fact about the reviewer's JSON; an ordinary
-                # harness loss (restart, sandbox) says nothing about the model.
-                continue
-            out.add(f.get("model"))
-        return out
+        return agent_turn.excluded_models(self.task, role, now=time.time())
 
     def call(self, role, prompt, cwd, steps, model, avoid=(), c=None, attempt_budget=None):
         """One role turn. If the model is busy or down, the turn goes to another model (never
