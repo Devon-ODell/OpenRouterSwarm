@@ -8,7 +8,9 @@ from __future__ import annotations
 import fcntl
 import os
 import subprocess
+import uuid
 from contextlib import contextmanager
+from pathlib import Path
 
 
 def trunk_name(c):
@@ -81,3 +83,79 @@ def refresh_view(c, *, git, ensure_trunk, worktrees):
 def sync_refresh_view(c, *, refresh_view):
     """The reader for sync_trunk; never needs provisioning (deps cannot affect a merge)."""
     return refresh_view(c)
+
+
+def retained_diff(c, attempt, *, git):
+    """The work an interrupted attempt left behind, as a patch, or "".
+
+    Two places it can be. _cleanup commits unaccepted work to the attempt's branch, so usually
+    it is a commit; when the daemon was killed before cleanup ran it is still sitting in the
+    worktree. Both are read the same way, against the commit the attempt started from."""
+    base, branch = attempt.get("base_commit"), attempt.get("branch")
+    if not base or not branch:
+        return ""
+    # git() strips its output, and `git apply` rejects a patch with no trailing newline.
+    if git(["rev-parse", "--verify", "-q", f"{branch}^{{commit}}"], cwd=c["repo"])[0] == 0:
+        rc, diff = git(["diff", "--unified=3", base, branch], cwd=c["repo"])
+        if rc == 0 and diff.strip():
+            return diff + "\n"
+    wt = Path(attempt.get("worktree") or "")
+    if wt.is_dir() and (wt / ".git").exists():
+        git(["add", "-A"], cwd=wt)
+        rc, diff = git(["diff", "--cached", "--unified=3", base], cwd=wt)
+        if rc == 0 and diff.strip():
+            return diff + "\n"
+    return ""
+
+
+def refresh_view_prov(c, *, refresh_view, prov_block, run_prov_hooks, log):
+    """The fully-provisioned _view: the bare checkout plus its provisioning hooks, with a
+    note when a hook changed files so the planner's first look at the tree is accurate.
+    """
+    view = refresh_view(c)
+    if prov_block(c)["hooks"]:
+        ok, out = run_prov_hooks(c, view, "view")
+        if not ok:
+            log(f"_view provisioning failed:\n{out}")
+    return view
+
+
+def sync_trunk(c, *, git, ensure_trunk, locked, worktrees, run_gate_with_prov,
+               checked_out_at, log, sync_failed):
+    """Bring new commits from base_branch into trunk when they merge cleanly and stay green."""
+    repo, base, t = c["repo"], c.get("base_branch", "main"), trunk_name(c)
+    ensure_trunk(c)
+    rc, _ = git(["merge-base", "--is-ancestor", base, t], cwd=repo)
+    if rc == 0:
+        return "current"
+    _, base_sha = git(["rev-parse", base], cwd=repo)
+    if sync_failed.get(base) == base_sha:
+        return "skipped"
+    with locked():
+        _, old = git(["rev-parse", t], cwd=repo, check=True)
+        tmp = worktrees() / f"_sync-{uuid.uuid4().hex[:6]}"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        git(["worktree", "add", "--detach", str(tmp), old], cwd=repo, check=True)
+        try:
+            rc, out = git(["merge", "--no-edit", "-m", f"swarm: sync {base} into {t}", base], cwd=tmp)
+            if rc != 0:
+                git(["merge", "--abort"], cwd=tmp)
+                log(f"{base} has changes that conflict with {t}; continuing on {t} without them")
+                sync_failed[base] = base_sha
+                return "conflict"
+            # The sync worktree is just as bare as an attempt worktree.  Reuse the same
+            # provisioning path or repositories whose gate consumes ignored dependencies
+            # (node_modules, .venv, nested repositories) can never absorb upstream commits.
+            ok, output = run_gate_with_prov(c, tmp, "sync")
+            if not ok:
+                log(f"merging {base} into {t} fails the tests; continuing without it")
+                sync_failed[base] = base_sha
+                return "red"
+            if checked_out_at(c, t):
+                return "checked-out"
+            _, new = git(["rev-parse", "HEAD"], cwd=tmp, check=True)
+            git(["update-ref", f"refs/heads/{t}", new, old], cwd=repo, check=True)
+            log(f"synced new {base} commits into {t}")
+            return "synced"
+        finally:
+            git(["worktree", "remove", "--force", str(tmp)], cwd=repo)
