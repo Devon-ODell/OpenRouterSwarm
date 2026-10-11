@@ -8,6 +8,9 @@ effectiveness can be compared across harness versions, model pools and configs.
 
 - `<benchmark>/waveN.json` — the packets: one observable outcome each, acceptance checked by the
   target repository's own gate, path scopes from the target's backlog.
+- `<benchmark>/waveNb.json` — an amending wave (`"amends": "N"`): it repairs packets of wave N that
+  were already queued (detail, acceptance, allowed_paths) and keeps their task ids. Wave packets are
+  otherwise never edited; the ids file records which tasks were amended and when.
 - `history/<benchmark>-ids.json` — which swarm task ids belong to the benchmark.
 - `history/<benchmark>.jsonl` — one scorecard row per scoring: landed share, attempts and requests
   per landed task, minutes to land, failure classes, landings per model, harness commit.

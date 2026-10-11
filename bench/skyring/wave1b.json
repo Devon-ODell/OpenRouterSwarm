@@ -1,0 +1,61 @@
+{
+  "benchmark": "skyring",
+  "wave": "1b",
+  "amends": "1",
+  "repo": "/Users/devonodell/Desktop/internetmoney/video-games/SkyRing",
+  "base_commit": "e59b741",
+  "_comment": "Wave 1's two stamina packets could not pass as written: each appends a field to a #[repr(C)] struct whose size is pinned in three places, and allowed_paths covered only core/src/ffi.rs. plugin/src/Bridge.cpp:8-9 and tools/verify.py:197-198 were out of scope (found by the packet-defect check on attempt t76a32b90af3a-6b852669). These packets replace the wave 1 versions in place, keeping their task ids, so the scorecard still follows them; history rows before 2026-10-11 18:30 score the defective packets.",
+  "tasks": [
+    {
+      "ref": "host-stamina-pool",
+      "backlog": "skyrim-stamina-authority",
+      "kind": "feature",
+      "priority": 2,
+      "title": "Let Skyrim supply the stamina pool through ErWorld",
+      "detail": "Skyrim must own the stamina pool (AGENTS.md ownership table). Append two f32 fields to the END of the #[repr(C)] struct ErWorld in core/src/ffi.rs: stamina_current and stamina_max, documented as the actor's live stamina and maximum in Skyrim's own units. Append the same two `float` fields, in the same order, to the end of ErWorld in core/include/er_combat.h, so tools/verify.py's c_abi gate (sizes and offsets) still matches. In ErCombat::update, when world.stamina_max > 0, set the simulation's pool before stepping to (stamina_current / stamina_max).clamp(0, 1) * the core's MAX_STAMINA; when stamina_max <= 0 keep today's internal pool (so ErWorld::default() behaves exactly as now). Do not change any existing field's order, type or meaning. Add tests in core/src/sim/tests.rs or a new core/tests/host_stamina.rs: (1) with stamina_current 5 of stamina_max 100, pressing and releasing dodge does not start a roll; (2) with 100 of 100 it does; (3) with stamina_max 0 the existing behavior is unchanged (a roll starts from a fresh ErCombat). Appending the two fields makes sizeof(ErWorld) 44 (it is 36): update all three copies of that size check, and no other line of Bridge.cpp or verify.py: the layout test in core/src/ffi.rs (size_of::<ErWorld>()), the static_assert at the top of plugin/src/Bridge.cpp, and the static_assert in the C source that check_c_abi in tools/verify.py writes. The bridge keeps zero-initialising ErWorld, so stamina_max stays 0 there and the plugin's behavior does not change until a later packet reads Skyrim's stamina actor value.",
+      "acceptance": [
+        "python3 tools/verify.py --profile local passes, including its c_abi check",
+        "ErWorld in core/src/ffi.rs and core/include/er_combat.h both end with stamina_current, stamina_max",
+        "A test shows a roll is refused with a host pool of 5/100 and allowed with 100/100",
+        "A test shows ErWorld::default() (stamina_max 0) keeps the internal pool behavior",
+        "core/src/ffi.rs, plugin/src/Bridge.cpp and tools/verify.py each assert an ErWorld size of 44 and none still asserts 36 (git grep -n 'ErWorld' shows it)"
+      ],
+      "allowed_paths": [
+        "core/src/ffi.rs",
+        "core/include/er_combat.h",
+        "core/src/sim/tests.rs",
+        "core/tests/host_stamina.rs",
+        "core/src/sim/player.rs",
+        "plugin/src/Bridge.cpp",
+        "tools/verify.py"
+      ]
+    },
+    {
+      "ref": "stamina-spent-report",
+      "backlog": "skyrim-stamina-authority",
+      "kind": "feature",
+      "priority": 1,
+      "depends_on": [
+        "host-stamina-pool"
+      ],
+      "title": "Report the stamina each update spent so Skyrim can charge it",
+      "detail": "Skyrim owns the pool, so the core must report what it spent instead of keeping the debit. Append one f32 field stamina_spent to the END of the #[repr(C)] struct ErOutput in core/src/ffi.rs and the matching `float stamina_spent;` to the end of ErOutput in core/include/er_combat.h (tools/verify.py's c_abi gate checks sizes and offsets). It is the total stamina, in the same units as ErWorld.stamina_max, that the simulation spent during that update call (rolls, backsteps, jumps, attack hits, sprint drain, guard hits): scale the core's internal spend by stamina_max / MAX_STAMINA when the host supplies a pool, and report the internal amount when it does not. Track the spend inside Player (for example a per-step counter reset at the start of each update) rather than diffing the pool, so regeneration does not hide costs. Tests: (1) with a host pool of 100/100, the update in which a roll starts reports stamina_spent == ROLL_COST scaled to the host units, and the next idle update reports 0; (2) sprinting for one second with in_combat = 1 reports a total close to SPRINT_DRAIN scaled (within 5%). Appending the field makes sizeof(ErOutput) 228 (it is 224); every existing offset stays the same. Update all three copies of that size check, and no other line of Bridge.cpp or verify.py: the layout test in core/src/ffi.rs (size_of::<ErOutput>()), the static_assert at the top of plugin/src/Bridge.cpp, and the static_assert in the C source that check_c_abi in tools/verify.py writes.",
+      "acceptance": [
+        "python3 tools/verify.py --profile local passes, including its c_abi check",
+        "ErOutput in core/src/ffi.rs and core/include/er_combat.h both end with stamina_spent",
+        "A test shows the roll's update reports the roll cost and the following idle update reports 0",
+        "A test shows one second of combat sprinting reports SPRINT_DRAIN within 5%",
+        "core/src/ffi.rs, plugin/src/Bridge.cpp and tools/verify.py each assert an ErOutput size of 228 and none still asserts 224 (git grep -n 'ErOutput' shows it)"
+      ],
+      "allowed_paths": [
+        "core/src/ffi.rs",
+        "core/include/er_combat.h",
+        "core/src/sim/tests.rs",
+        "core/tests/host_stamina.rs",
+        "core/src/sim/player.rs",
+        "plugin/src/Bridge.cpp",
+        "tools/verify.py"
+      ]
+    }
+  ]
+}

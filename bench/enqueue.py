@@ -8,6 +8,10 @@ each packet's acceptance criteria, path scope and dependencies. The task id of e
 recorded in bench/history/<benchmark>-ids.json so bench/scorecard.py can score exactly these
 tasks (and anything the decomposer split them into) across runs. Re-running is safe: packets
 already recorded are skipped.
+
+A wave with `"amends": "<wave>"` repairs packets already queued instead of adding new ones: each
+packet's detail, acceptance and allowed_paths replace the queued task's (TaskQueue.edit, which also
+lifts any hold), the task keeps its id, and the ids file records which wave it now runs as.
 """
 import json
 import subprocess
@@ -35,6 +39,10 @@ def main(path):
     app = SwarmApplication.for_repo(wave["repo"], daemon=swarmd)
     added = 0
     for t in wave["tasks"]:
+        if wave.get("amends"):
+            added += amend(app, book, wave, t)
+            ids_path.write_text(json.dumps(book, indent=2) + "\n")
+            continue
         if t["ref"] in book["tasks"]:
             print(f"skip   {t['ref']}: already queued as {book['tasks'][t['ref']]['id']}")
             continue
@@ -50,8 +58,29 @@ def main(path):
         added += 1
         print(f"queued {t['ref']}: {row['id']}")
         ids_path.write_text(json.dumps(book, indent=2) + "\n")
-    print(f"{added} queued; ids in {ids_path.relative_to(ROOT)}")
+    print(f"{added} {'amended' if wave.get('amends') else 'queued'}; "
+          f"ids in {ids_path.relative_to(ROOT)}")
     return 0
+
+
+def amend(app, book, wave, t):
+    """Replace a queued packet's detail, acceptance and scope with the amending wave's."""
+    meta = book["tasks"].get(t["ref"])
+    if meta is None:
+        print(f"FAILED {t['ref']}: wave {wave['amends']} never queued it")
+        return 0
+    if meta.get("amended") == wave["wave"]:
+        print(f"skip   {t['ref']}: already amended to wave {wave['wave']}")
+        return 0
+    try:
+        app.queue().edit(meta["id"], detail=t["detail"], acceptance=t["acceptance"],
+                         allowed_paths=t.get("allowed_paths"))
+    except (KeyError, ValueError) as e:
+        print(f"FAILED {t['ref']}: {meta['id']} not amended ({e})")
+        return 0
+    meta.update(amended=wave["wave"], amended_at=time.time(), amended_harness=harness_commit())
+    print(f"amended {t['ref']}: {meta['id']} now runs as wave {wave['wave']}")
+    return 1
 
 
 if __name__ == "__main__":

@@ -154,6 +154,76 @@ The lowercase identity `skyRing-988b86` has no ledger, so running there starts w
 - Still open: bugs 3, 5–12, and the review-prompt line below. The goal-text guidance works around
   bug 7 and part of bug 11 for this repository only.
 
+## Status (updated 2026-10-11 18:10, after the run stopped at 17:12)
+
+A second pass over the whole run found more bugs, numbered N1–N7, and eight stalls, S1–S8.
+Each fix has a regression test in `tests/test_live_run_regressions.py` (or `test_context_pack.py`
+for N1). The suite was at 1067 passing. Nothing has been committed yet.
+
+- **N1, the root cause of S4. Rust files got a useless outline.** The outline pattern only knew
+  Python and JS, so Rust files were outlined as their `let` lines: `player.rs` showed 69 `let`
+  lines and none of its 61 items, and `receive_hit` wasn't in it. Both hit-arbitration attempts
+  (15 requests, 0 edits) spent their rounds searching for it. Fixed: there are now Rust and C/C++
+  outline patterns, and when a file is outlined, any definition the task names as code
+  (`ErCombat::receive_hit`) is also shown in full. `.h`, `.c` and `.cpp` paths now count as named
+  paths too.
+- **Bug 1 was only partly fixed.** The stop, quota-pause, no-credits and error paths now charge
+  requests, turn time and role turns, like the outage path does. `attempt_stopped` and
+  `attempt_error` journal rows are written, and the scorecard counts them.
+- **Bug 3 fixed.** The judge log names the model that answered.
+- **Bug 5 fixed.** With `keep_worktrees: true`, only worktrees whose branch holds unlanded work
+  are kept; `"all"` keeps every one. Branches are still deleted only under `false`.
+- **Bug 6 and N2 fixed.** Failure notes are condensed to the lines that name the failure
+  (`task_rules.condense`) instead of being cut by head or tail. The stamina note now reads
+  `abi.cpp:4:31: note: expression evaluates to '44 == 36'`, not `Bundling source/chr/…`.
+- **Bug 7 and S7 fixed.** "info", "note" and "nit" findings are filed as minor, and only blocker
+  and major findings need a verification. The review prompt says only defects go in findings.
+- **Bug 8 fixed.** Repo identity now uses the filesystem's spelling (`F_GETPATH`). A swarm that
+  already has a journal under another spelling keeps its name, so `SkyRing` and `skyRing` both
+  map to `SkyRing-24c77a`.
+- **Bug 9 fixed.** `tests/conftest.py` sends test receipts to a temp file.
+- **N3 fixed.** `other_unattributed` is computed against the local count, and `provider_at_stop`
+  is re-read at stop.
+- **N4 and S3 fixed.** A drain now ends the worker's backoff, idle and error sleeps
+  (`Worker.rest`).
+- **N5 and S6 fixed.** Judge replies go through the reviewer's `salvaged_object`. Both lost
+  replies from this run now give scores, and `acceptance_criteria` is accepted for `acceptance`.
+- **N7 fixed.** `pytest.ini` keeps collection to `tests/`.
+- **S1 fixed.** The log and journal (`role_starved`) name idle models that `role_models` keeps
+  out of a role. The worker waits for the first model that may implement. An opt-in
+  `role_fallback: true` lets a model kept out of a role stand in for it. The SkyRing config
+  doesn't set it.
+- **S2 fixed.** A model rate-limited 3 times in the hour is passed over while a calmer model is
+  free (`Ledger.busy_at`). Round lines carry the clock time.
+- **S5 fixed.** The repeat check hashes only a gate failure's failing lines, so the stamina
+  failures now match. A failure that repeats after a repair, and whose compiler-reported source
+  line exists only outside `allowed_paths`, parks as `out_of_scope` ("packet defect") without
+  blaming the model. On this run's evidence it names `plugin/src/Bridge.cpp:8` and
+  `tools/verify.py:197`. So the stamina packets need **both** files in scope (or both changed on
+  `main`), not only `verify.py`.
+- **S8 fixed.** A signal stop records `stop_reason: "Stopped (SIGTERM)"`.
+- **Stamina packets repaired (wave 1b, 18:30).** `bench/skyring/wave1b.json` adds
+  `plugin/src/Bridge.cpp` and `tools/verify.py` to both packets' `allowed_paths`. The new detail
+  names all three copies of each size check (ErWorld 36 → 44, ErOutput 224 → 228), and a fifth
+  acceptance criterion checks them. `bench/enqueue.py` applied the wave in place through
+  `TaskQueue.edit`, which can now change `allowed_paths`. The task ids are unchanged and the hold
+  on `t76a32b90af3a` is lifted. The bridge still zero-initialises ErWorld, so stamina_max stays 0
+  there until a later packet reads Skyrim's actor value.
+- **swarm/wt leak fixed.** `workspace.cleanup` removes a repository's worktree folder once its
+  last worktree is gone, and `test_attempt_stages.RepoCase` puts worktrees in its temp dir. The
+  157 empty folders and 2 orphaned test worktrees from Oct 10 were removed.
+- **N6 is an A/B test now.** `unscored_reward` takes `neutral` (default), `floor`, `impute`, `skip`
+  or `ab` (`unscored_ab_arms`, split by task id). Each reward row records `unscored_policy`.
+  `bench/unscored_ab.py` replays the policies on all journals: 45 judged and 9 unscored
+  landings, with calibration plus a seeded paired Thompson replay.
+  - First result: impute is calibrated (bias +0.002 vs −0.143 for neutral). It is never worse
+    than neutral in 6 scenarios, and better in 5, with up to 20% less regret.
+  - The pre-registered rule (v1) picked skip. Skip's win came from flaky judging landing on
+    weaker models; with the rates on the strongest models, it is 18% worse. Rule v2 (written
+    after seeing the data, and labelled so) picks impute.
+  - Both are in `bench/history/unscored_ab.jsonl`. The owner adopted impute: it is the default
+    now. `unscored_reward: "neutral"` restores the old credit.
+
 ## Recommended next changes (as originally written)
 
 - Let at least `nvidia/nemotron-3-super-120b-a12b:free` implement (`role_models.implementer`,

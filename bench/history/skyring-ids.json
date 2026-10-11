@@ -33,14 +33,20 @@
       "wave": 1,
       "backlog": "skyrim-stamina-authority",
       "queued_at": 1791747755.910937,
-      "harness": "2812f9d"
+      "harness": "2812f9d",
+      "amended": "1b",
+      "amended_at": 1791756538.125184,
+      "amended_harness": "553858c"
     },
     "stamina-spent-report": {
       "id": "t40eb13efcf88",
       "wave": 1,
       "backlog": "skyrim-stamina-authority",
       "queued_at": 1791747755.925545,
-      "harness": "2812f9d"
+      "harness": "2812f9d",
+      "amended": "1b",
+      "amended_at": 1791756538.1413498,
+      "amended_harness": "553858c"
     }
   }
 }
