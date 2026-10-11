@@ -7,24 +7,35 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from learn import (BREAKTHROUGH_WEIGHT, CRIME, FAULTY, PENALTY_WEIGHT, defect, exhibit,
-                   is_breakthrough, json_array, novelty, parse_scores, reward, weight)
+                   format_playbook, is_breakthrough, json_array, novelty, parse_scores,
+                   reward, weight)
 from metrics import ACTIVE_MODEL, REVIEWING
 from pacing import effective_steps
-from prompts import DECOMPOSER, JUDGE, PRIORITIES
-from task_rules import failure_class, goal_item_weight, goal_items
-from workflow import REVIEW, parse_review, path_allowed
+from prompts import (ARCHITECT, DECOMPOSER, FAST_IMPLEMENTER, IMPLEMENTER, JUDGE,
+                     PRIORITIES, REPAIR)
+from task_rules import failure_class, goal_item_weight, goal_items, scope_gap
+from workflow import (Attempt, REVIEW, STRATEGIES, contract, failure_signature,
+                      parse_review, path_allowed, validate_scope)
+from context_builder import named_paths
+from verification import weakened_tests
 
 try:  # one class identity with the daemon's turn errors
-    from .agent_turn import (AgentTimeout, ModelError, ProviderBusy, ProviderDown,
-                             RequestBudget, ReviewFormatError, StepLimit)
+    from .agent_turn import (AgentTimeout, ModelError, ModelPoolExhausted, ProviderBusy,
+                             ProviderDown, RequestBudget, ReviewFormatError, StepLimit)
 except ImportError:  # pragma: no cover - script mode
-    from agent_turn import (AgentTimeout, ModelError, ProviderBusy, ProviderDown,
-                            RequestBudget, ReviewFormatError, StepLimit)
+    from agent_turn import (AgentTimeout, ModelError, ModelPoolExhausted, ProviderBusy,
+                            ProviderDown, RequestBudget, ReviewFormatError, StepLimit)
+
+try:  # same module identity as the daemon's workspace
+    from . import workspace
+except ImportError:  # pragma: no cover - script mode
+    import workspace
 
 
 @dataclass(frozen=True)
@@ -48,6 +59,18 @@ class AttemptDeps:
     ran_on: dict               # = _ran_on  (the dict object; mutate/read it in place)
     run: dict                  # = _run     (the dict object)
     view_lock: Any             # = _view_lock
+    run_lock: Any              # = _run_lock
+    attempt_lines: Callable    # = attempt_lines
+    baseline_cache: Callable   # = baseline_cache
+    baseline_key: Callable     # = baseline_key
+    context_pack: Callable     # = context_pack
+    count_edits: Callable      # = count_edits
+    kin_text: Callable         # = kin_text
+    mark_progress: Callable    # = mark_progress
+    mit_arm: Callable          # = mit_arm
+    study: Callable            # = study
+    checked_out_at: Callable   # = checked_out_at
+    trunk_locked: Callable     # = trunk_locked
 
 
 class AttemptRunner:
@@ -457,3 +480,269 @@ class AttemptRunner:
                   scores={k: v for k, v in (scores or {}).items() if k != "follow_ups"},
                   breakthrough=breakthrough)
         d.log(f"{task['id']}: {stage}, reward {r:.2f}{' ★ BREAKTHROUGH' if breakthrough else ''}", w.name)
+
+    def _attempt(self, task, goal, info, c=None, attempt_budget=None):
+        w, d = self.w, self.d
+        c, attempt_budget = w._attempt_inputs(c, attempt_budget)
+        wname = w.name
+        if task.get("kind") == "harness":
+            return "refused", "target a separate harness checkout; live harness editing is disabled", info
+        try:
+            validate_scope(task)
+        except ValueError as exc:
+            return "out_of_scope", str(exc), info
+        gap = scope_gap(task, c) if c.get("scope_gate", True) else ""
+        if gap:
+            # Before the worktree, before the baseline suite, before the first request.
+            d.log(f"{task['id']} has no workable scope: {gap}", wname)
+            d.journal("out_of_scope", id=task["id"], title=task["title"],
+                      origin=task.get("origin"), gap=gap)
+            return "out_of_scope", gap, info
+        d.log(f"claim {task['id']} — {task['title']}", wname)
+        w.ensure_worktree(task, c)
+        wd = w.wt
+        # Named for the task, not the worker. `attempts/w0` was overwritten by every task that
+        # worker took, so a parked task's evidence was gone by the time anyone looked for it —
+        # and the panel's own lookup already globbed `attempts/<task id>-*`, which nothing had
+        # ever written. One directory per attempt: the link resolves and the history survives.
+        w.evidence = Attempt(d.state, f"{task['id']}-{w.branch.split('/')[-1]}-"
+                                       f"{dt.datetime.now():%Y%m%d-%H%M%S}", task, wd, w.branch)
+        info["artifact"] = str(w.evidence.path)
+        info["attempt_id"] = w.evidence.data["id"]
+        _, w.review_base = d.git(["rev-parse", "HEAD"], cwd=wd, check=True)
+        strategy = task.get("strategy") or w.ledger.pick("strategy", list(STRATEGIES)) or "regression_first"
+        if strategy not in STRATEGIES:
+            return "refused", "unknown implementation strategy", info
+        w.contract = contract(task, goal, w.review_base, strategy)
+        w.evidence.write("contract.json", w.contract)
+        w.evidence.record("baseline", strategy=strategy, base_commit=w.review_base)
+        info["strategy"] = strategy
+        # Trunk at this commit either passed its own gate recently or it did not; running the
+        # suite again proves the same thing and costs the studio 105 seconds per attempt.
+        key = d.baseline_key(c, w.review_base)
+        cached = d.baseline_cache(key, ttl=c.get("baseline_ttl", 86_400))
+        if cached:
+            ok, output = True, f"baseline: cached pass for {w.review_base[:12]}"
+            w.evidence.record("baseline_cached", base_commit=w.review_base,
+                              at=cached["at"], key=key)
+        else:
+            ok, output = w.gate("baseline", c)
+            d.baseline_cache(key, passed=ok)
+        _, dirty = d.git(["status", "--porcelain"], cwd=wd, check=True)
+        if not ok or dirty:
+            return "baseline", "baseline tests failed or changed tracked/unignored files; no model calls spent:\n" + output, info
+        fast = w.execution_class == "fast"
+        w.mit = info["mit"] = "off" if fast else d.mit_arm(c)
+        corpus = d.study(f"{task['title']} {task['detail']}", c) if w.mit == "on" else ""
+        info["mit_injected"] = bool(corpus)
+        w.evidence.record("study", mit=w.mit, injected=bool(corpus))
+        # The code the task names, read once here rather than over and over by the model.
+        kin = d.kin_text(task, w.q)
+        context = d.context_pack(task, wd, also=kin)
+        info["context_chars"] = len(context)
+        w.evidence.record("context", chars=len(context), paths=named_paths(task, kin))
+        lessons, pitfalls = ([], []) if fast else w.ledger.playbook()
+        # Lessons shown to this implementer share the attempt's reward (see Ledger.credit).
+        info["lessons"] = [l["id"] for l in lessons + pitfalls if l.get("kind") in ("lesson", "pitfall")]
+        failed = w.excluded_models(role="implementer")
+        impl = w.select_implementer(failed, c)
+        if impl is None and failed:
+            # Every candidate implementer has failed this task/role within the exclusion
+            # window. Do not cycle back to an excluded model (work order §5): park with
+            # evidence and let a human wake it or requeue it.
+            raise ModelPoolExhausted("every implementer in the pool is excluded on this task: "
+                                     + ", ".join(sorted(failed)))
+        if impl is None:
+            raise ProviderDown(None, "every model in the pool is resting after provider failures")
+        info["implementer"] = impl
+        prompt_contract = {k: v for k, v in w.contract.items() if k != "goal"}
+        prompt_contract["detail"] = task["detail"]
+        spec = json.dumps(prompt_contract, indent=2)
+        if not fast:
+            spec += "\nSTRATEGY: " + STRATEGIES[strategy]
+        if not fast and c["steps"].get("architect", 0):
+            spec += "\nARCHITECT NOTES (the contract still controls scope):\n" + w.call(
+                "architect", ARCHITECT.format(goal=goal, title=task["title"], detail=task["detail"],
+                 corpus=corpus, test_cmd=c["test_cmd"]), wd, c["steps"]["architect"],
+                 w.pick({impl}, role="architect", c=c) or impl,
+                avoid={impl}, c=c, attempt_budget=attempt_budget)
+        # What earlier attempts hit, as lines to act on. Parent handoffs stay artifacts on disk,
+        # not mutable model memory, so only their outcome is repeated here.
+        lines = d.attempt_lines(task)
+        previous = f"\nWHAT EARLIER ATTEMPTS AT THIS TASK HIT\n{lines}\n" if lines else ""
+        # Work a restart cut short, if there is any: re-apply it and go straight to the gate.
+        # It still faces the tests and the adversary; nothing is trusted, only reused.
+        resumed = w.adopt_retained(task, wd)
+        if resumed:
+            info["resumed_from"] = resumed.get("attempt")
+            impl = info["implementer"] = resumed.get("implementer") or impl
+            w.evidence.record("resumed", attempt=resumed.get("attempt"), implementer=impl,
+                              lines=resumed.get("lines"))
+        else:
+            w.evidence.record("implementing", implementer=impl)
+            try:
+                handoff = w.call("implementer", (FAST_IMPLEMENTER if fast else IMPLEMENTER).format(
+                    goal=goal, spec=spec, previous=previous, corpus=corpus, test_cmd=c["test_cmd"],
+                    context=context, title=task["title"][:200],
+                    playbook=format_playbook(lessons, pitfalls, named_paths(task, kin))),
+                    wd, c["steps"]["implementer"], impl, c=c,
+                    attempt_budget=attempt_budget)
+                w.evidence.write("implementation.txt", handoff)
+            except AgentTimeout:
+                w.evidence.record("timeout_recovery", note="verify partial implementation through normal gates")
+            except StepLimit:
+                w.evidence.record("step_limit", note="verify the partial implementation before continuing")
+            except ModelError as exc:
+                info["implementer"] = w.last_model or impl
+                return "model_error", str(exc), info
+            # After a handoff the model that actually wrote the code is its author.
+            impl = info["implementer"] = w.last_model or impl
+        adv = w.pick({impl} | w.no_review(c), role="adversary", c=c) or impl
+        info["reviewer"] = adv
+        info["same_model_review"] = adv == impl
+        seen = set()
+        repairs = max(0, min(3, int(c.get("max_repairs", 2))))
+        for cycle in range(repairs + 1):
+            w.evidence.record("candidate", repairs=cycle)
+            _, head = d.git(["rev-parse", "HEAD"], cwd=wd, check=True)
+            if head != w.review_base:
+                return "rejected", "agent changed commit history outside supervisor control", info
+            tree, diff = w.snapshot()
+            outside = w.scope_violations()
+            if outside:
+                return "rejected", "outside allowed_paths: " + ", ".join(outside), info
+            if not diff.strip():
+                info["edit_calls"] = tried = d.count_edits(wname)
+                stage = "agent_timeout" if w.agent_timed_out else "no_change"
+                how = (f"{tried} edit call(s) changed nothing" if tried
+                       else "the turn never reached an edit")
+                return stage, f"no implementation changes: {how}; evidence: {w.evidence.path}", info
+            allowed = bool(task.get("allow_test_changes"))
+            lost = weakened_tests(diff, allow_test_changes=allowed)
+            if lost:
+                return ("weakened_tests",
+                        f"{lost} existing assertion(s) removed with nothing in their place; "
+                        "manual review required", info)
+            ok, tests = w.gate(f"candidate-{cycle}", c)
+            after, _ = w.snapshot()
+            if after != tree:
+                return "rejected", "test command modified the candidate; fix test isolation/ignored files", info
+            review = None
+            if ok:
+                review, adv, exc = w.reviewed(tree, diff, tests, adv, impl, allowed,
+                                              c, attempt_budget)
+                info["reviewer"] = adv          # the model that answered, or failed to
+                if exc is not None:
+                    return ("review_format_error" if isinstance(exc, ReviewFormatError) else "review_error"), str(exc), info
+                info["same_model_review"] = adv == impl
+                if review["verdict"] == "approve":
+                    info["review"] = review
+                    break
+            failure = json.dumps(review, indent=2) if review else tests
+            stage = "rejected" if review else "tests_failed"
+            signature = failure_signature(stage, failure)
+            w.evidence.record("repair_needed", failure=signature, reason=failure[-6000:])
+            info["pitfall"] = failure[-600:]
+            if cycle == repairs or signature in seen:
+                return stage, f"repair budget/repeated failure; evidence: {w.evidence.path}\n{failure[-2500:]}", info
+            seen.add(signature)
+            w.evidence.record("repairing")
+            pre_repair_tree, _ = w.snapshot()
+            try:
+                handoff = w.call("repair", REPAIR.format(contract=json.dumps(w.contract, indent=2),
+                                    failure=failure, test_cmd=c["test_cmd"], context=context), wd,
+                                    c["steps"].get("repair", c["steps"]["implementer"]), impl,
+                                    avoid={adv}, c=c, attempt_budget=attempt_budget)
+                w.evidence.write(f"repair-{cycle + 1}.txt", handoff)
+            except AgentTimeout:
+                # Work order §6: a repair that times out may have made things worse. Keep the
+                # timed-out patch as evidence, but do not roll back useful repair work blindly:
+                # a repair that stayed inside scope and removed the failing file must still be
+                # verified and can land. Only a repair that escaped the allowed scope (wrote
+                # outside it, or deleted files it had no business touching) is reverted to the
+                # last pre-repair tree before the gates run.
+                w.evidence.record("timeout_recovery", note="verify partial repair through normal gates")
+                after_tree, repair_diff = w.snapshot()
+                if repair_diff and after_tree != pre_repair_tree:
+                    w.evidence.write(f"repair-{cycle + 1}-timed-out.diff", repair_diff)
+                    if w.scope_violations():
+                        d.git(["read-tree", pre_repair_tree], cwd=wd)
+                        d.git(["checkout-index", "-a", "-f"], cwd=wd)
+                        d.git(["clean", "-fd"], cwd=wd)
+                        d.git(["add", "-A"], cwd=wd)
+                        _, restored = d.git(["write-tree"], cwd=wd)
+                        if restored != pre_repair_tree:
+                            # The tree could not be restored byte-for-byte; keep the repair
+                            # diff and let the gate decide rather than losing the attempt.
+                            w.evidence.record("repair_restore_failed", tree=restored)
+            except StepLimit:
+                pass
+            except ModelError as exc:
+                return "model_error", str(exc), info
+        d.git(["commit", "-q", "--no-verify", "-m",
+             f"swarm: {task['title']}\n\nSwarm-Task: {task['id']}\n"
+             f"Swarm-Implementer: {impl}\nSwarm-Reviewer: {adv}\nSwarm-Strategy: {strategy}"], cwd=wd, check=True)
+        w._review_model, w._author = adv, impl
+        landed, why = w.integrate(c, attempt_budget)
+        if not landed:
+            return "conflict", why, info
+        _, info["commit"] = d.git(["rev-parse", "HEAD"], cwd=wd, check=True)
+        info["repairs"] = cycle
+        info["role_calls"] = w.role_calls
+        # Record integration before optional learning/reporting. Recovery consults Git too.
+        w.evidence.record("integrated", commit=info["commit"])
+        with d.run_lock:
+            d.run.update(last_accepted_commit=info["commit"], last_accepted_at=time.time())
+        d.mark_progress("accepted commit")
+        d.log(f"{task['id']}: landed on {d.trunk_name(c)}; evidence: {w.evidence.path}", wname)
+        # A zero judge step budget disables optional post-landing scoring entirely instead of
+        # secretly spending flint's minimum one request.
+        info["judge"], info["scores"] = None, None
+        if int(c["steps"].get("judge", 0)) > 0:
+            info["judge"] = w.pick({impl, adv}, role="judge", c=c) or adv
+            _, landed_diff = d.git(["diff", "--unified=3", w.review_base, "HEAD"], cwd=wd)
+            info["scores"] = w.judge(task, goal, landed_diff,
+                                      "APPROVE: " + str((info.get("review") or {}).get("summary", "")),
+                                      info["judge"], avoid={impl, adv}, c=c,
+                                      attempt_budget=attempt_budget)
+            info["judge"] = w.last_model or info["judge"]
+            if info["scores"]:
+                w.evidence.write("judge.json", info["scores"])
+        return "accepted", f"integrated {info['commit']} on {d.trunk_name(c)}; handoff: {w.evidence.path / 'HANDOFF.md'}", info
+
+    def integrate(self, c=None, attempt_budget=None):
+        """Review/test a rebased candidate before compare-and-swap of swarm trunk."""
+        w, d = self.w, self.d
+        c, attempt_budget = w._attempt_inputs(c, attempt_budget)
+        t = d.trunk_name(c)
+        for _ in range(2):
+            _, old = d.git(["rev-parse", t], cwd=c["repo"], check=True)
+            rc, _ = d.git(["merge-base", "--is-ancestor", old, "HEAD"], cwd=w.wt)
+            if rc != 0:
+                if not workspace.rebase_onto(w.wt, old, git=d.git):
+                    return False, f"conflicts with newer trunk; work retained on {w.branch}"
+                w.review_base = old
+                tree, diff = w.snapshot()
+                if w.scope_violations():
+                    return False, "rebased candidate changed paths outside allowed_paths"
+                ok, output = w.gate("rebased", c)
+                after, _ = w.snapshot()
+                if not ok or after != tree or weakened_tests(
+                        diff, allow_test_changes=bool(w.task.get("allow_test_changes"))):
+                    return False, "rebased candidate failed verification or changed during tests"
+                review, _, error = w.reviewed(
+                    tree, diff, output, w._review_model, w._author,
+                    bool(w.task.get("allow_test_changes")), c, attempt_budget)
+                if error:
+                    raise error
+                if review["verdict"] != "approve":
+                    return False, "rebased candidate needs changes; fresh review saved in artifacts"
+            status, note = workspace.land_on_trunk(
+                c, w.wt, old, w.evidence.data.get("reviewed_tree"),
+                git=d.git, locked=d.trunk_locked, checked_out_at=d.checked_out_at)
+            if status == "landed":
+                return True, ""
+            if status in ("checked_out", "mismatch"):
+                return False, note
+            # "moved" and "failed" fall through to the next iteration, exactly as before
+        return False, "trunk kept moving; retained candidate for a later attempt"
